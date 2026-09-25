@@ -32,13 +32,19 @@ function (cfg) {
     var ws = proto === "ws:" || proto === "wss:";
     if (!ws && proto !== "http:" && proto !== "https:") return input;
     var origin = (ws ? (proto === "wss:" ? "https:" : "http:") : proto) + "//" + url.host;
-    if (origin === here) {
-      if (url.pathname.indexOf(viewPath) === 0) return input; // Already proxied
+    // The page's own scheme: "ws://" + location.host would be mixed content on https
+    var scheme = ws ? (loc.protocol === "https:" ? "wss:" : "ws:") : loc.protocol;
+    if (url.host === loc.host) {
+      if (url.pathname.indexOf(viewPath) === 0) {
+        if (proto === scheme) return input; // Already proxied
+        url.protocol = scheme;
+        return url.href;
+      }
     } else if (origin !== site) {
       return input; // Another site entirely
     }
     var out = new URL(prefix + url.pathname + url.search + url.hash, here);
-    if (ws) out.protocol = loc.protocol === "https:" ? "wss:" : "ws:";
+    out.protocol = scheme;
     return out.href;
   }
 
@@ -195,16 +201,18 @@ function (cfg) {
   var nativePost = nativeFetch || window.fetch;
   function post(name, body) {
     try {
-      return nativePost.call(window, prefix + "/__lwu/" + name, {
-        method: "POST",
-        body: body,
-        // keepalive lets a write outlive the page, within a 64 KiB budget
-        keepalive: body.length < 60000,
-        // A CORS-safelisted type: no preflight
-        headers: { "Content-Type": "text/plain" },
-      });
+      nativePost
+        .call(window, prefix + "/__lwu/" + name, {
+          method: "POST",
+          body: body,
+          keepalive: body.length < 4096, // Outlives the page (cookies are small)
+          headers: { "Content-Type": "text/plain" },
+        })
+        .catch(function () {
+          /* Best effort */
+        });
     } catch (e) {
-      return null; // Best effort
+      /* Best effort */
     }
   }
 
@@ -217,7 +225,7 @@ function (cfg) {
       get: function () {
         return Object.keys(cookies)
           .map(function (key) {
-            return key + "=" + cookies[key];
+            return key ? key + "=" + cookies[key] : cookies[key];
           })
           .join("; ");
       },
@@ -225,10 +233,15 @@ function (cfg) {
         value = String(value);
         var pair = value.split(";")[0];
         var eq = pair.indexOf("=");
-        if (eq < 1) return;
-        var key = pair.slice(0, eq).trim();
-        if (/;\s*(max-age=(0|-)|expires=thu, 01 jan 1970)/i.test(value)) delete cookies[key];
-        else cookies[key] = pair.slice(eq + 1).trim();
+        // "flag" alone is a cookie without a name, as in browsers
+        var key = eq < 0 ? "" : pair.slice(0, eq).trim();
+        var maxAge = /;\s*max-age\s*=\s*(-?\d+)/i.exec(value);
+        var expires = /;\s*expires\s*=\s*([^;]*)/i.exec(value);
+        if (maxAge ? Number(maxAge[1]) <= 0 : expires && Date.parse(expires[1]) <= Date.now()) {
+          delete cookies[key];
+        } else {
+          cookies[key] = pair.slice(eq + 1).trim();
+        }
         post("cookie", value);
       },
     });
@@ -254,27 +267,36 @@ function (cfg) {
     /* Keep them */
   }
 
-  // localStorage is written back as changes, each with an id. The last write of
-  // a page can reach the server after the next page was already rendered (save,
-  // then reload), so the page remembers that id in window.name, which survives
-  // navigation, and the next page fetches fresh data if its copy predates it.
+  // localStorage is written back as changes. Each write has an id, and a page
+  // number and sequence number that let the server drop a write that arrives
+  // after a later one of the same page.
+  //
+  // The last write of a page can reach the server after the next page was
+  // already rendered (save, then reload), so the page remembers that write's id
+  // in window.name, which survives navigation, and the next page of the same view
+  // fetches fresh data if its copy predates it.
   var MARK = "\u0001lwu:";
-  var stored = cfg.storage || {};
-  var name = window.name;
-  if (name.indexOf(MARK) === 0 && name.indexOf("|") > 0) {
-    var marker = name.slice(MARK.length, name.indexOf("|")).split(":");
-    name = name.slice(name.indexOf("|") + 1);
+  var viewId = viewPath.split("/").slice(-2)[0];
+  function ownName(value) {
+    return value.indexOf(MARK) === 0 && value.indexOf("|") > 0 ? value.slice(value.indexOf("|") + 1) : value;
+  }
+  function setName(value) {
     try {
-      window.name = name;
+      window.name = value;
     } catch (e) {
       /* Read-only in this context */
     }
-    var writeId = marker[0];
-    var recent = Date.now() - Number(marker[1]) < 60000;
-    if (writeId && recent && (cfg.writes || []).indexOf(writeId) < 0) {
+  }
+  var stored = cfg.storage || {};
+  var initialName = window.name;
+  if (ownName(initialName) !== initialName) {
+    var marker = initialName.slice(MARK.length, initialName.indexOf("|")).split(":");
+    setName(ownName(initialName));
+    var recent = Date.now() - Number(marker[2]) < 60000;
+    if (marker[0] === viewId && marker[1] && recent && (cfg.writes || []).indexOf(marker[1]) < 0) {
       try {
         var xhr = new XMLHttpRequest();
-        xhr.open("GET", prefix + "/__lwu/storage?w=" + encodeURIComponent(writeId), false);
+        xhr.open("GET", prefix + "/__lwu/storage?w=" + encodeURIComponent(marker[1]), false);
         xhr.send();
         if (xhr.status === 200) stored = JSON.parse(xhr.responseText);
       } catch (e) {
@@ -282,24 +304,84 @@ function (cfg) {
       }
     }
   }
+  var pageId = Math.random().toString(36).slice(2, 10);
+  var sequence = 0;
   var lastWrite = null;
+  var hiding = false;
+  function rememberLastWrite() {
+    if (lastWrite) setName(MARK + viewId + ":" + lastWrite[0] + ":" + lastWrite[1] + "|" + ownName(window.name));
+  }
+  // Requests with keepalive outlive the page, within 64 KiB for all of them
+  var keepaliveBytes = 0;
+  var encoder = new TextEncoder();
 
   function makeStorage(data, persist) {
     var changes = {};
     var cleared = false;
     var dirty = false;
+    var resend = false; // A write was lost: send everything next time
+    var inFlight = 0;
+    var waiting = false;
     var timer = null;
+    function schedule(delay) {
+      if (!timer) timer = setTimeout(flush, delay);
+    }
     function flush() {
       clearTimeout(timer);
       timer = null;
       if (!dirty) return;
+      if (inFlight && !hiding) {
+        waiting = true; // One write at a time, so they arrive in order
+        return;
+      }
+      // Sent while another may still be on its way: send everything, so that
+      // it does not matter which arrives first
+      var full = resend || inFlight > 0;
       var id = Math.random().toString(36).slice(2, 12);
-      var body = JSON.stringify({ w: id, set: changes, clear: cleared });
+      var body = JSON.stringify({
+        w: id,
+        p: pageId,
+        s: ++sequence,
+        set: full ? Object.assign({}, data) : changes,
+        clear: full || cleared,
+      });
       changes = {};
       cleared = false;
       dirty = false;
+      resend = false;
       lastWrite = [id, Date.now()];
-      post("storage", body);
+      var size = encoder.encode(body).length;
+      var keepalive = keepaliveBytes + size <= 60000;
+      if (keepalive) keepaliveBytes += size;
+      inFlight++;
+      function done() {
+        inFlight--;
+        if (keepalive) keepaliveBytes -= size;
+        if (waiting) {
+          waiting = false;
+          flush();
+        }
+      }
+      function lost() {
+        done();
+        resend = true;
+        dirty = true;
+        if (!hiding) schedule(1000);
+      }
+      try {
+        nativePost
+          .call(window, prefix + "/__lwu/storage", {
+            method: "POST",
+            body: body,
+            keepalive: keepalive,
+            // A CORS-safelisted type: no preflight
+            headers: { "Content-Type": "text/plain" },
+          })
+          .then(done, lost); // An HTTP error (too large) would fail again: not resent
+      } catch (e) {
+        lost();
+      }
+      if (hiding) rememberLastWrite();
     }
     function changed(key, value) {
       if (!persist) return;
@@ -310,21 +392,23 @@ function (cfg) {
         changes[key] = value;
       }
       dirty = true;
-      if (value && value.length > 16384) {
-        flush(); // Too large to leave for the page's last moments
-      } else if (!timer) {
-        timer = setTimeout(flush, 250);
-      }
+      // After pagehide no timer will fire; large values do not wait either
+      if (hiding || (value && value.length > 16384)) flush();
+      else schedule(250);
     }
     if (persist) {
       window.addEventListener("pagehide", function () {
+        hiding = true;
         flush();
-        if (!lastWrite) return;
-        try {
-          window.name = MARK + lastWrite[0] + ":" + lastWrite[1] + "|" + name;
-        } catch (e) {
-          /* Read-only in this context */
-        }
+        rememberLastWrite();
+      });
+      window.addEventListener("pageshow", function (event) {
+        if (!event.persisted) return;
+        hiding = false; // Back from the back/forward cache
+        setName(ownName(window.name));
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "hidden") flush();
       });
     }
     var api = {
@@ -355,7 +439,9 @@ function (cfg) {
         return index < keys.length ? keys[index] : null;
       },
     };
+    // Configurable, so that the Proxy may leave it out of Object.keys() and for...in
     Object.defineProperty(api, "length", {
+      configurable: true,
       get: function () {
         return Object.keys(data).length;
       },

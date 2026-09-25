@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -122,6 +122,8 @@ class Session:
     created: float
     expires: float
     websockets: set[Callable[[], Coroutine[Any, Any, Any]]] = field(default_factory=set)
+    # Other long-lived responses (server-sent events, downloads, camera streams)
+    streams: set[Callable[[], Coroutine[Any, Any, Any]]] = field(default_factory=set)
 
 
 class SessionManager:
@@ -202,12 +204,13 @@ class SessionManager:
 
     def _end(self, session: Session) -> None:
         self._sessions.pop(session.token, None)
-        for close in list(session.websockets):
+        for close in [*session.websockets, *session.streams]:
             self._hass.async_create_task(close())
         session.websockets.clear()
+        session.streams.clear()
 
     @callback
-    def reserve_websocket(self, token: str) -> WebSocketSlot | None:
+    def reserve_websocket(self, token: str) -> SessionSlot | None:
         """Claim one of the session's WebSockets before connecting; None if all taken.
 
         The claim is made before any await, so sockets opened at the same time
@@ -216,29 +219,41 @@ class SessionManager:
         session = self._sessions.get(token)
         if session is None or len(session.websockets) >= MAX_WEBSOCKETS_PER_SESSION:
             return None
-        slot = WebSocketSlot(session)
+        slot = SessionSlot(session.websockets)
         session.websockets.add(slot.close)
         return slot
 
+    @callback
+    def track_stream(self, token: str) -> SessionSlot:
+        """Close a streamed response when its session ends."""
+        if (session := self._sessions.get(token)) is None:
+            slot = SessionSlot(set())
+            slot.ended = True
+            return slot
+        slot = SessionSlot(session.streams)
+        session.streams.add(slot.close)
+        return slot
 
-class WebSocketSlot:
-    """One proxied WebSocket of a session: closed when the session ends."""
 
-    def __init__(self, session: Session) -> None:
-        self._session = session
-        self._sockets: list[Any] = []
+class SessionSlot:
+    """A WebSocket or stream of a session: closed when the session ends."""
+
+    def __init__(self, owner: set[Callable[[], Coroutine[Any, Any, Any]]]) -> None:
+        self._owner = owner
+        self._closables: list[Any] = []
         self.ended = False
 
-    def add(self, sock: Any) -> None:
-        self._sockets.append(sock)
+    def add(self, closable: Any) -> None:
+        """Anything with an async close()."""
+        self._closables.append(closable)
 
     async def close(self) -> None:
         self.ended = True
-        for sock in self._sockets:
-            await sock.close()
+        for closable in self._closables:
+            await closable.close()
 
     def release(self) -> None:
-        self._session.websockets.discard(self.close)
+        self._owner.discard(self.close)
 
 
 @callback
@@ -281,6 +296,8 @@ class LocalWebUiHub:
         # Storage writes applied recently, so the next page load can wait for one
         self._applied_writes: dict[str, deque[str]] = {}
         self._write_waiters: dict[tuple[str, str], asyncio.Event] = {}
+        # (state key, page id) -> sequence number of the page's last applied write
+        self._page_writes: OrderedDict[tuple[str, str], int] = OrderedDict()
         self._http: dict[str | bool, aiohttp.ClientSession] = {}
         self._limiters: dict[str, asyncio.Semaphore] = {}
         self._static: dict[str, View] = {}
@@ -768,7 +785,12 @@ class LocalWebUiHub:
 
     @callback
     def async_store_cookies(
-        self, user_id: str, view: View, set_cookies: list[str], url: URL
+        self,
+        user_id: str,
+        view: View,
+        set_cookies: list[str],
+        url: URL,
+        from_script: bool = False,
     ) -> None:
         """Keep cookies a site set (Set-Cookie or document.cookie) for this user."""
         jar = self.cookie_jar(user_id, view)
@@ -778,6 +800,13 @@ class LocalWebUiHub:
             cookie = _parse_cookie(set_cookie)
             if not cookie:
                 continue
+            if from_script:
+                # As in browsers: scripts cannot set HttpOnly cookies or replace them
+                http_only = {morsel.key for morsel in jar if morsel.get("httponly")}
+                if set(cookie) & http_only:
+                    continue
+                for morsel in cookie.values():
+                    morsel["httponly"] = ""
             existing = {morsel.key for morsel in jar}
             if len(existing) >= MAX_COOKIES_PER_SITE and not set(cookie) <= existing:
                 _LOGGER.debug("%s set too many cookies; ignoring more", view.name)
@@ -803,37 +832,62 @@ class LocalWebUiHub:
         write_id: str,
         changes: dict[str, str | None],
         clear: bool,
+        page: tuple[str, int] | None = None,
     ) -> bool:
-        """Apply a page's localStorage changes; False if over the size limits."""
+        """Apply a page's localStorage changes; False if over the size limits.
+
+        page is the page's own id and the write's sequence number: a write that
+        arrives after a later one of the same page is ignored.
+        """
         key = self._state_key(user_id, view_id)
-        data = {} if clear else dict(self._shim_storage.get(key, {}))
-        for item, value in changes.items():
-            if value is None:
-                data.pop(item, None)
+        applied = True
+        if page is not None and (last := self._page_writes.get((key, page[0]))) is not None:
+            applied = page[1] > last
+        if applied:
+            data = {} if clear else dict(self._shim_storage.get(key, {}))
+            for item, value in changes.items():
+                if value is None:
+                    data.pop(item, None)
+                else:
+                    data[item] = value
+            size = sum(len(k) + len(v) for k, v in data.items())
+            if len(data) > MAX_SHIM_STORAGE_KEYS or size > MAX_SHIM_STORAGE_BYTES:
+                applied = False
             else:
-                data[item] = value
-        size = sum(len(k) + len(v) for k, v in data.items())
-        if len(data) > MAX_SHIM_STORAGE_KEYS or size > MAX_SHIM_STORAGE_BYTES:
-            return False
-        self._shim_storage[key] = data
-        self._async_schedule_save()
+                self._shim_storage[key] = data
+                self._async_schedule_save()
+                if page is not None:
+                    self._page_writes[(key, page[0])] = page[1]
+                    self._page_writes.move_to_end((key, page[0]))
+                    while len(self._page_writes) > 256:
+                        self._page_writes.popitem(last=False)
+            within_limits = applied
+        else:
+            within_limits = True  # Outdated, not too large
         if write_id:
+            # Recorded even when not applied: a page load waiting for it must not
+            # wait for a write that will never come
             self._applied_writes.setdefault(key, deque(maxlen=32)).append(write_id)
-            if (event := self._write_waiters.pop((key, write_id), None)) is not None:
-                event.set()
-        return True
+            if (waiter := self._write_waiters.pop((key, write_id), None)) is not None:
+                waiter.set()
+        return within_limits
 
     async def async_wait_for_storage_write(self, user_id: str, view_id: str, write_id: str) -> None:
         """Wait until a page's last write arrived (it may race the next page load)."""
         key = self._state_key(user_id, view_id)
         if write_id in self._applied_writes.get(key, ()):
             return
-        event = self._write_waiters.setdefault((key, write_id), asyncio.Event())
+        waiter = self._write_waiters.setdefault((key, write_id), asyncio.Event())
         try:
             async with asyncio.timeout(STORAGE_WRITE_WAIT):
-                await event.wait()
+                await waiter.wait()
         except TimeoutError:
-            self._write_waiters.pop((key, write_id), None)
+            pass
+        finally:
+            # Also when the request is cancelled; others may still wait on it
+            if self._write_waiters.get((key, write_id)) is waiter and not waiter.is_set():
+                self._write_waiters.pop((key, write_id), None)
+                waiter.set()
 
     @callback
     def async_clear_site_data(self, user_id: str, view_id: str) -> None:

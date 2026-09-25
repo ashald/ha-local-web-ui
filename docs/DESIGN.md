@@ -85,15 +85,22 @@ Views come from two sources:
 | **IndexedDB, Cache Storage, service workers** | Removed, so feature detection falls back (they would throw). | Native, except service workers, which are refused in both modes: one registered from HA's origin could intercept HA itself. |
 | **CORS** | Requests carry `Origin: null`. The proxy answers preflights itself and adds `Access-Control-Allow-Origin: null` with `Access-Control-Allow-Credentials: true` (errors included), so credentialed `fetch`/XHR work. The browser holds no site credentials for these paths; the credential is the path token. | Not needed. |
 
-**Emulated localStorage.** The data is inlined into each HTML page the proxy serves. The
-page writes back changes (not snapshots) to `POST …/__lwu/storage`
-(`{"w": write id, "set": {key: value or null}, "clear": bool}`), debounced by 250 ms,
-immediately for values over 16 KiB, and on `pagehide` with `keepalive`. The last write of a
-page can reach HA after the next page was rendered ("save, then reload"). So the page
-remembers its last write id in `window.name` (which survives navigation), the server lists
-recently applied write ids in the injected config, and a page whose copy predates that
-write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, which waits up to
-3 s for the write. Limits per (user, view): 1000 keys, 1 MiB.
+**Emulated localStorage.** The data is inlined into each HTML page the proxy serves.
+- **Writes.** The page writes back changes (not snapshots) to `POST …/__lwu/storage`:
+  `{"w": write id, "p": page id, "s": sequence number, "set": {key: value or null},
+  "clear": bool}`. They are debounced by 250 ms, sent at once for values over 16 KiB and
+  after `pagehide`, and flushed when the page is hidden. One write is in flight at a time;
+  one that must go out while another is still in flight (the page is going away) carries
+  the whole data instead, and the server ignores a write that arrives after a later one of
+  the same page. `keepalive` is used within the browser's 64 KiB budget; a write lost to
+  the network is followed by the whole data.
+- **Save, then reload.** The last write of a page can reach HA after the next page was
+  rendered. So the page remembers its view and last write id in `window.name` (which
+  survives navigation; the page's own name is kept), the server lists recently received
+  write ids in the injected config, and a page of the same view whose copy predates that
+  write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, which waits up
+  to 2 s for it.
+- **Limits** per (user, view): 1000 keys and 1 Mi characters.
 
 ## Proxy behaviour
 
@@ -101,8 +108,10 @@ write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, whic
 - Hop-by-hop headers, `Host`, `Origin` (device UIs such as ESPHome's reject HA's origin as
   cross-origin) and `Referer` (which contains the token) are dropped.
 - Credentials the browser holds for HA's origin never reach a device: `Cookie`,
-  `Authorization` (a reverse proxy's Basic auth, for example) and SSO identity headers
-  (`Remote-User`, `X-Forwarded-User`, `X-Auth-Request-*`, `Cf-Access-*`…) are dropped.
+  `Authorization` (a reverse proxy's Basic auth, for example) and the identity and token
+  headers of authenticating proxies (`Remote-*`, `X-Forwarded-*`, `X-Auth-Request-*`,
+  `Cf-Access-*`, authentik, AWS ALB OIDC, Azure App Service, Google IAP, Pomerium,
+  Tailscale, mod_auth_openidc…) are dropped.
   Site cookies come from the server-side jar and site logins from the view's settings
   (sent as Basic auth).
 - Client-sent `Forwarded`/`X-Forwarded-*`/`X-Real-IP` are dropped and replaced with HA's
@@ -110,6 +119,8 @@ write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, whic
   does.
 - `If-None-Match`/`If-Modified-Since` are dropped for document and iframe loads, so pages
   with injected per-user data are never revalidated.
+- Request bodies keep their `Content-Length`: small device web servers (ESPAsyncWebServer,
+  esp_http_server) cannot read chunked uploads.
 
 **Response headers**
 - Only an allowlist of device headers reaches the browser (`Cache-Control`, `ETag`,
@@ -124,28 +135,43 @@ write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, whic
 - The proxy sets `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` on
   every response itself, because HA's headers middleware cannot reach streamed responses.
 - A missing or generic `Content-Type` for `.js`/`.mjs`/`.css` is fixed up from the
-  extension, since `nosniff` would make browsers refuse them.
+  extension, since `nosniff` would make browsers refuse them. A missing one for a
+  directory, `.html` or a body that starts like HTML becomes `text/html`.
+- Complete responses of isolated views are sent by the proxy itself, before HA's headers
+  middleware would add `X-Frame-Options: SAMEORIGIN`, which a page's own frames can never
+  meet when its origin is opaque.
 
 **Server-side rewriting**
-- HTML: root-relative `src`/`href`/`action`/`formaction`/`poster` attributes (including
-  `<base href="/">`) and absolute or protocol-relative URLs to the target origin are
-  rewritten under the prefix. `<meta name="referrer">` tags are neutralized.
+- HTML: root-relative and same-site absolute or protocol-relative URLs in
+  `src`/`href`/`action`/`formaction`/`poster`/`data`/`background`/`manifest` attributes
+  (quoted or not, `<base href="/">` included), `srcset`, `<meta http-equiv="refresh">`, and
+  `url(...)`/`@import` in `<style>` blocks and `style` attributes are rewritten under the
+  prefix. `<meta name="referrer">` tags and `referrerpolicy` attributes are neutralized.
+- Every pattern stops at `<` and `>`, so rewriting stays linear in the size of the page
+  whatever a device sends; pages over 256 KiB are rewritten in a worker thread.
 - The script below is injected right after `<head>` (or `<html>`, or the doctype), so
   it runs before any script of the page. HTML over 4 MiB gets it too, in its first 4 MiB,
   and the rest is streamed.
-- CSS: root-relative `url(...)` and `@import`.
+- CSS: root-relative `url(...)` and `@import`, chunked stylesheets included.
+- XHTML: the script is wrapped in CDATA.
 
 **Runtime rewriting** (`inject.js`)
 - The script keeps URLs that the page builds at runtime under the prefix: `fetch`, XHR,
   `EventSource`, `WebSocket`, `history.pushState`/`replaceState`, `window.open`, `src`/`href`/
   `action` set through `setAttribute` or properties, and link clicks and form submits.
 - It handles root-relative paths, URLs built from `location.host` or `location.origin`
-  (which is HA's host even when isolated), and absolute URLs to the device.
+  (which is HA's host even when isolated), whatever their scheme (`"ws://" +
+  location.host` on an HTTPS page becomes `wss:`), and absolute URLs to the device.
+- It sets `no-referrer` on requests and elements where the page asks for another
+  policy, and `fetch(new Request(...))` with a body keeps working when its URL changes.
 - It provides the storage and cookie emulation above.
 
 **Bodies and streaming**
 - Bodies up to 4 MiB are buffered, and compressible types are compressed.
-- Larger or unknown-length bodies, and SSE (uncompressed), are streamed.
+- Larger or unknown-length bodies, and SSE, are streamed without compression, which would
+  hold data back.
+- Streams end with their session, like WebSockets. A stream the device cuts off is cut
+  off for the browser too, so a truncated download does not look complete.
 - WebSockets connect upstream first, then accept the browser with the negotiated
   subprotocol, and relay frames. At most 8 per session. A side that drops without a close
   frame is relayed as close code 1001, never as the reserved 1006.
@@ -159,11 +185,13 @@ write fetches fresh data with a synchronous `GET …/__lwu/storage?w=<id>`, whic
 - `DummyCookieJar`, because cookies are per user and view, as above.
 - At most 6 concurrent requests per site; small device web servers have few sockets.
   Streams release their slot once the headers arrive.
-- A 10 s connect timeout, 60 s until the response headers, and no overall limit.
+- A 10 s connect timeout, 60 s from the end of the upload to the response headers (an
+  upload may take as long as it needs), and no overall limit.
 
 **Safety**
 - Targets always come from view config or the device registry, never from the request.
 - Everything is admin only in v0.1.
+- Unexpected errors are answered with the same sandboxed error response as others.
 
 **Discovery filter.** A discovered URL must point at one of:
 - a private IPv4/IPv6 address, or `100.64.0.0/10` (Tailscale/CGNAT);

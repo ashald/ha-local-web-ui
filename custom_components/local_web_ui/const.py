@@ -59,4 +59,4 @@ MAX_COOKIE_BYTES: Final = 4096
 # Streams (downloads, server-sent events, WebSockets) do not hold a slot.
 MAX_REQUESTS_PER_SITE: Final = 6
 # How long a page load waits for the previous page's last storage write
-STORAGE_WRITE_WAIT: Final = 3.0
+STORAGE_WRITE_WAIT: Final = 2.0

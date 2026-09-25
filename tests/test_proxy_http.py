@@ -83,7 +83,6 @@ LAST_MODIFIED = "Wed, 21 Oct 2015 07:28:00 GMT"
 SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
 # The upstream test app removes Content-Type from responses carrying this header
 STRIP_CONTENT_TYPE = "X-Test-Strip-Content-Type"
-PREFLIGHT_METHODS = "GET, HEAD, POST, PUT, PATCH, DELETE"
 
 
 # ---- fake device UI -----------------------------------------------------------
@@ -1208,7 +1207,8 @@ async def test_preflight_from_opaque_origin_answered_by_proxy(env: Env) -> None:
     )
     assert response.status == 204
     assert_cors_null(response)
-    assert response.headers[hdrs.ACCESS_CONTROL_ALLOW_METHODS] == PREFLIGHT_METHODS
+    # The requested method is allowed (the token was checked), WebDAV-style ones too
+    assert response.headers[hdrs.ACCESS_CONTROL_ALLOW_METHODS] == "PUT"
     assert response.headers[hdrs.ACCESS_CONTROL_MAX_AGE] == "600"
     assert response.headers[hdrs.ACCESS_CONTROL_ALLOW_HEADERS] == "content-type, x-requested-with"
     assert_security_headers(response)
@@ -1287,7 +1287,7 @@ async def test_opaque_origin_error_responses_readable(env: Env) -> None:
     prefix = await env.prefix(ISO)
     trusted = await env.prefix(TRUSTED)
     down = await env.prefix(DOWN)
-    too_big = b'{"set": {}}' + b" " * MAX_SHIM_STORAGE_BYTES
+    too_big = b'{"set": {}}' + b" " * 4 * MAX_SHIM_STORAGE_BYTES
     checks: list[tuple[int, Callable[[], Awaitable[aiohttp.ClientResponse]]]] = [
         (404, lambda: env.client.get(f"{PROXY_URL_PREFIX}/{ISO}/bogus/echo", headers=null)),
         (502, lambda: env.client.get(down + "/", headers=null)),
@@ -1622,7 +1622,8 @@ async def test_storage_size_limit(env: Env) -> None:
     assert env.upstream.requests == []
     config = await env.page_config(prefix)
     assert config["storage"] == {"a": a_value, "b": b_value}
-    assert config["writes"] == ["w1", "w2"]
+    # Recorded although rejected: the next page load must not wait for it
+    assert config["writes"] == ["w1", "w2", "over"]
 
     # What a write removes makes room for what it adds
     fits = {"w": "w3", "set": {"a": None, "c": "c" * half}}
@@ -1639,7 +1640,7 @@ async def test_storage_key_limit(env: Env) -> None:
     assert response.status == 413
     config = await env.page_config(prefix)
     assert config["storage"] == keys
-    assert config["writes"] == ["w1"]
+    assert config["writes"] == ["w1", "w2"]
 
     response = await env.post_storage(prefix, {"w": "w3", "set": {"k0000": None, "extra": ""}})
     assert response.status == 204
@@ -1648,9 +1649,10 @@ async def test_storage_key_limit(env: Env) -> None:
 
 async def test_storage_body_size_limit(env: Env) -> None:
     prefix = await env.prefix(ISO)
+    # The data limit counts characters; the body may use up to 4 UTF-8 bytes each
     small = json.dumps({"w": "big", "set": {"x": "1"}}).encode()
-    body = small + b" " * (MAX_SHIM_STORAGE_BYTES + 1 - len(small))
-    assert len(body) == MAX_SHIM_STORAGE_BYTES + 1
+    body = small + b" " * (4 * MAX_SHIM_STORAGE_BYTES + 1 - len(small))
+    assert len(body) == 4 * MAX_SHIM_STORAGE_BYTES + 1
     assert (await env.post_storage(prefix, body)).status == 413
     config = await env.page_config(prefix)
     assert config["storage"] == {}
