@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 import json
 import re
-from types import MappingProxyType
 from typing import Any
 
 import aiohttp
@@ -17,11 +16,14 @@ from aiohttp.test_utils import TestClient, TestServer
 from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_USER
 from homeassistant.auth.models import Credentials, RefreshToken
 from homeassistant.config_entries import (
+    SOURCE_IGNORE,
+    SOURCE_INTEGRATION_DISCOVERY,
+    SOURCE_USER,
+    ConfigEntryDisabler,
     ConfigEntryState,
-    ConfigSubentry,
-    ConfigSubentryDataWithId,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import area_registry as ar, device_registry as dr
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -42,43 +44,68 @@ from pytest_homeassistant_custom_component.typing import (
 )
 
 from custom_components.local_web_ui import hub as hub_module
+from custom_components.local_web_ui.config_flow import HUB_DEFAULTS
 from custom_components.local_web_ui.const import (
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
     CONF_ICON,
+    CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
-    CONF_LINKED_DEVICES,
     CONF_MODE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
     CONF_URL,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
+    CONF_VISIT_LINK,
     DOMAIN,
+    HUB_UNIQUE_ID,
+    KIND_HUB,
+    KIND_VIEW,
     MAX_WEBSOCKETS_PER_SESSION,
     MODE_ISOLATED,
     MODE_TRUSTED,
     SESSION_MAX_AGE,
     SESSION_TTL,
-    SUBENTRY_TYPE_VIEW,
+    VISIT_DEFAULT,
+    VISIT_DEVICE,
+    VISIT_HERE,
 )
-from custom_components.local_web_ui.hub import LocalWebUiHub, pinned_unique_id
+from custom_components.local_web_ui.hub import LocalWebUiHub, device_unique_id
 
 OWNER_DOMAIN = "fake_ws_devices"
 PORCH_URL = "http://192.168.1.50/"
+GARAGE_URL = "http://192.168.1.70/"
 KITCHEN_URL = "http://wled-kitchen.local/settings?page=1"
 PRINTER_URL = "http://192.168.1.60:8080/"
 ROUTER_URL = "http://192.168.1.1:8080/admin?tab=wifi"
+KITCHEN_MAC = "aa:bb:cc:dd:ee:01"
 
+# Web UI entries: the view id is the entry id
 ROUTER_ID = "router"
 PRINTER_VIEW_ID = "printer"
+KITCHEN_VIEW_ID = "kitchen"
+HUB_ID = "hub_entry"
+
+VIEW_KEYS = {
+    "view_id",
+    "entry_id",
+    "name",
+    "subtitle",
+    "url",
+    "mode",
+    "source",
+    "device_id",
+    "area",
+    "icon",
+    "show_in_sidebar",
+    "device_link",
+    "linked_device_id",
+}
 
 ALL_COMMANDS: list[dict[str, Any]] = [
     {"type": f"{DOMAIN}/views"},
     {"type": f"{DOMAIN}/session", "view_id": ROUTER_ID},
-    {"type": f"{DOMAIN}/pin", "view_id": ROUTER_ID},
-    {"type": f"{DOMAIN}/set_hidden", "view_id": "d_abc", "hidden": True},
-    {"type": f"{DOMAIN}/set_device_link", "device_id": "abc", "enabled": False},
     {"type": f"{DOMAIN}/clear_site_data", "view_id": ROUTER_ID},
 ]
 COMMAND_IDS = [c["type"].split("/", 1)[1] for c in ALL_COMMANDS]
@@ -104,18 +131,54 @@ def link_for(view_id: str) -> str:
     return f"homeassistant://local-web-ui/{view_id}"
 
 
-def link_state(enabled: bool, active: bool, override: bool | None = None) -> dict[str, Any]:
+def link_state(enabled: bool, active: bool, choice: str = VISIT_DEFAULT) -> dict[str, Any]:
     """The device_link part of a view, as the panel gets it."""
-    return {"enabled": enabled, "override": override, "active": active}
+    return {"enabled": enabled, "choice": choice, "active": active}
 
 
-def view_subentry(subentry_id: str, url: str, title: str, **data: Any) -> ConfigSubentryDataWithId:
-    return ConfigSubentryDataWithId(
-        data={CONF_URL: url, CONF_MODE: MODE_ISOLATED, **data},
-        subentry_id=subentry_id,
-        subentry_type=SUBENTRY_TYPE_VIEW,
+def hub_config_entry(options: dict[str, Any] | None = None) -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        entry_id=HUB_ID,
+        title="Local Web UIs",
+        data={CONF_KIND: KIND_HUB},
+        options={**HUB_DEFAULTS, **(options or {})},
+        unique_id=HUB_UNIQUE_ID,
+    )
+
+
+def manual_entry(entry_id: str, title: str, url: str, **options: Any) -> MockConfigEntry:
+    """A web UI added by URL."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        entry_id=entry_id,
         title=title,
-        unique_id=None,
+        data={CONF_KIND: KIND_VIEW},
+        options={
+            CONF_URL: url,
+            CONF_MODE: MODE_ISOLATED,
+            CONF_VERIFY_SSL: True,
+            CONF_SHOW_IN_SIDEBAR: False,
+            **options,
+        },
+    )
+
+
+def device_entry(
+    entry_id: str, title: str, device: dr.DeviceEntry, **options: Any
+) -> MockConfigEntry:
+    """The web UI of a device, as added from a discovery."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        entry_id=entry_id,
+        title=title,
+        source=SOURCE_INTEGRATION_DISCOVERY,
+        unique_id=device_unique_id(device.id),
+        data={CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: device.id},
+        options={CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: False, **options},
     )
 
 
@@ -155,26 +218,45 @@ def url_of(hass: HomeAssistant, device_id: str) -> str | None:
     return device.configuration_url
 
 
-async def setup_lwu(
-    hass: HomeAssistant,
-    options: dict[str, Any] | None = None,
-    subentries: list[ConfigSubentryDataWithId] | None = None,
-) -> MockConfigEntry:
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        title="Local Web UIs",
-        options=options if options is not None else {},
-        subentries_data=subentries,
-    )
-    entry.add_to_hass(hass)
-    assert await hass.config_entries.async_setup(entry.entry_id)
+async def setup_entries(hass: HomeAssistant, *entries: MockConfigEntry) -> None:
+    """Set up entries; the first call sets up the integration with all added ones."""
+    for entry in entries:
+        entry.add_to_hass(hass)
+    if DOMAIN not in hass.config.components:
+        assert await async_setup_component(hass, DOMAIN, {})
+    else:
+        for entry in entries:
+            assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state is ConfigEntryState.LOADED
-    return entry
+    for entry in entries:
+        assert entry.state is ConfigEntryState.LOADED, entry.title
+
+
+async def unload_all(hass: HomeAssistant) -> None:
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.state is ConfigEntryState.LOADED:
+            assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 def hub_of(hass: HomeAssistant) -> LocalWebUiHub:
     return hass.data[DOMAIN]
+
+
+def discovery_flows(hass: HomeAssistant) -> list[dict[str, Any]]:
+    return list(
+        hass.config_entries.flow.async_progress_by_handler(
+            DOMAIN, match_context={"source": SOURCE_INTEGRATION_DISCOVERY}
+        )
+    )
+
+
+def flow_for(hass: HomeAssistant, device_id: str) -> dict[str, Any]:
+    return next(
+        flow
+        for flow in discovery_flows(hass)
+        if flow["context"]["unique_id"] == device_unique_id(device_id)
+    )
 
 
 async def ws_call(client: MockHAClientWebSocket, **msg: Any) -> dict[str, Any]:
@@ -256,10 +338,18 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
 
 @dataclass
 class Home:
-    """Devices, an area and a config entry with two static views."""
+    """Devices, an area, the hub entry and three web UI entries.
 
-    entry: MockConfigEntry
+    Router: added by URL. Printer and kitchen: web UIs of devices. Porch and
+    garage: local web pages still offered through discovery. Cloud: not local.
+    """
+
+    hub: MockConfigEntry
+    router: MockConfigEntry
+    printer_entry: MockConfigEntry
+    kitchen_entry: MockConfigEntry
     porch: dr.DeviceEntry
+    garage: dr.DeviceEntry
     kitchen: dr.DeviceEntry
     printer: dr.DeviceEntry
     cloud: dr.DeviceEntry
@@ -267,41 +357,61 @@ class Home:
 
 
 async def build_home(
-    hass: HomeAssistant, owner: MockConfigEntry, options: dict[str, Any] | None = None
+    hass: HomeAssistant,
+    owner: MockConfigEntry,
+    hub_options: dict[str, Any] | None = None,
+    *,
+    with_hub: bool = True,
 ) -> Home:
+    registry = dr.async_get(hass)
+    porch = add_device(hass, owner, "porch", PORCH_URL, "Porch light")
     area = ar.async_get(hass).async_create("Porch")
-    porch = add_device(hass, owner, "porch", PORCH_URL, "Porch light", suggested_area=None)
-    dr.async_get(hass).async_update_device(porch.id, area_id=area.id)
-    kitchen = add_device(hass, owner, "kitchen", KITCHEN_URL, "Kitchen WLED")
+    registry.async_update_device(porch.id, area_id=area.id)
+    garage = add_device(hass, owner, "garage", GARAGE_URL, "Garage door")
+    kitchen = add_device(
+        hass,
+        owner,
+        "kitchen",
+        KITCHEN_URL,
+        "Kitchen WLED",
+        connections={(dr.CONNECTION_NETWORK_MAC, KITCHEN_MAC)},
+    )
     printer = add_device(hass, owner, "printer", PRINTER_URL, "Printer")
+    office = ar.async_get(hass).async_create("Office")
+    registry.async_update_device(printer.id, area_id=office.id)
     cloud = add_device(hass, owner, "cloud", "https://example.com/device", "Cloud thing")
     bare = add_device(hass, owner, "bare", None, "No UI")
-    entry = await setup_lwu(
-        hass,
-        options=options,
-        subentries=[
-            view_subentry(
-                ROUTER_ID,
-                ROUTER_URL,
-                "Router",
-                **{
-                    CONF_MODE: MODE_TRUSTED,
-                    CONF_VERIFY_SSL: False,
-                    CONF_SHOW_IN_SIDEBAR: True,
-                    CONF_ICON: "mdi:router-wireless",
-                    CONF_USERNAME: "rootuser",
-                    CONF_PASSWORD: "hunter2",
-                },
-            ),
-            view_subentry(
-                PRINTER_VIEW_ID,
-                PRINTER_URL,
-                "Office printer",
-                **{CONF_DEVICE_ID: printer.id},
-            ),
-        ],
+
+    hub = hub_config_entry(hub_options)
+    router = manual_entry(
+        ROUTER_ID,
+        "Router",
+        ROUTER_URL,
+        **{
+            CONF_MODE: MODE_TRUSTED,
+            CONF_VERIFY_SSL: False,
+            CONF_SHOW_IN_SIDEBAR: True,
+            CONF_ICON: "mdi:router-wireless",
+            CONF_USERNAME: "rootuser",
+            CONF_PASSWORD: "hunter2",
+        },
     )
-    return Home(entry, porch, kitchen, printer, cloud, bare)
+    printer_entry = device_entry(PRINTER_VIEW_ID, "Office printer", printer)
+    kitchen_entry = device_entry(KITCHEN_VIEW_ID, "Kitchen WLED", kitchen)
+    entries = [router, printer_entry, kitchen_entry]
+    await setup_entries(hass, *([hub, *entries] if with_hub else entries))
+    return Home(
+        hub,
+        router,
+        printer_entry,
+        kitchen_entry,
+        porch,
+        garage,
+        registry.async_get(kitchen.id) or kitchen,
+        registry.async_get(printer.id) or printer,
+        cloud,
+        bare,
+    )
 
 
 @pytest.fixture
@@ -319,103 +429,123 @@ async def ws(home: Home, hass_ws_client: WebSocketGenerator) -> MockHAClientWebS
 # ---------------------------------------------------------------------------
 
 
-async def test_views_lists_static_and_discovered(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
+async def test_views_json(hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket) -> None:
     result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert set(result) == {
+        "views",
+        "discovered",
+        "discovery",
+        "link_device_pages",
+        "hub_entry_id",
+    }
     assert result["discovery"] is True
     assert result["link_device_pages"] is True
-    assert result["linked_devices"] is False
-    assert result["entry_id"] == home.entry.entry_id
+    assert result["hub_entry_id"] == HUB_ID
+    # The porch and the garage wait to be added; the cloud device is not local, and
+    # the printer and kitchen have entries
+    assert result["discovered"] == 2
+    assert {flow["context"]["unique_id"] for flow in discovery_flows(hass)} == {
+        device_unique_id(home.porch.id),
+        device_unique_id(home.garage.id),
+    }
 
     views = {view["view_id"]: view for view in result["views"]}
-    porch_id = f"d_{home.porch.id}"
-    kitchen_id = f"d_{home.kitchen.id}"
-    # The printer is pinned by a static view; the cloud device is not local
-    assert set(views) == {ROUTER_ID, PRINTER_VIEW_ID, porch_id, kitchen_id}
-    # Static views come first
-    assert [v["view_id"] for v in result["views"]][:2] == [ROUTER_ID, PRINTER_VIEW_ID]
+    # Only web UI entries are views: not the hub, not discovered devices
+    assert set(views) == {ROUTER_ID, PRINTER_VIEW_ID, KITCHEN_VIEW_ID}
+    for view in views.values():
+        assert set(view) == VIEW_KEYS
 
+    hub = hub_of(hass)
     assert views[ROUTER_ID] == {
         "view_id": ROUTER_ID,
+        "entry_id": ROUTER_ID,
         "name": "Router",
         "subtitle": "192.168.1.1",
         "url": ROUTER_URL,
         "mode": MODE_TRUSTED,
-        "source": "static",
+        "source": "manual",
         "device_id": None,
         "area": None,
         "icon": "mdi:router-wireless",
         "show_in_sidebar": True,
-        "hidden": False,
         "device_link": None,
-        "linked_device_id": None,
+        "linked_device_id": hub.linked_device_id(ROUTER_ID),
     }
+    assert views[ROUTER_ID]["linked_device_id"] is not None
     # Credentials never reach the panel
     assert "hunter2" not in json.dumps(result)
     assert "rootuser" not in json.dumps(result)
 
-    printer = views[PRINTER_VIEW_ID]
-    assert printer["source"] == "static"
-    assert printer["device_id"] == home.printer.id
-    assert printer["url"] == PRINTER_URL
-    assert printer["mode"] == MODE_ISOLATED
-    assert printer["show_in_sidebar"] is False
-    assert printer["device_link"] == link_state(enabled=True, active=True)
+    assert views[PRINTER_VIEW_ID] == {
+        "view_id": PRINTER_VIEW_ID,
+        "entry_id": PRINTER_VIEW_ID,
+        "name": "Office printer",
+        "subtitle": "192.168.1.60",
+        "url": PRINTER_URL,
+        "mode": MODE_ISOLATED,
+        "source": "device",
+        "device_id": home.printer.id,
+        "area": "Office",
+        "icon": None,
+        "show_in_sidebar": False,
+        "device_link": link_state(enabled=True, active=True),
+        "linked_device_id": hub.linked_device_id(PRINTER_VIEW_ID),
+    }
     assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
 
-    porch = views[porch_id]
-    assert porch["source"] == "discovered"
-    assert porch["name"] == "Porch light"
-    assert porch["url"] == PORCH_URL
-    assert porch["mode"] == MODE_ISOLATED
-    assert porch["device_id"] == home.porch.id
-    assert porch["area"] == "Porch"
-    assert porch["hidden"] is False
-    assert porch["icon"] is None
-    assert porch["show_in_sidebar"] is False
-    assert porch["subtitle"].endswith("192.168.1.50")
-    assert porch["device_link"] == link_state(enabled=True, active=True)
-
-    kitchen = views[kitchen_id]
+    kitchen = views[KITCHEN_VIEW_ID]
     assert kitchen["url"] == KITCHEN_URL
     assert kitchen["area"] is None
-    assert kitchen["subtitle"].endswith("wled-kitchen.local")
+    assert kitchen["subtitle"] == "wled-kitchen.local"
+    assert kitchen["source"] == "device"
+    assert kitchen["device_link"] == link_state(enabled=True, active=True)
 
 
-async def test_views_hidden_views_are_listed_and_flagged(
+async def test_views_linked_device_is_the_entrys_own_device(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    porch_id = f"d_{home.porch.id}"
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=True)
-
+    registry = dr.async_get(hass)
     views = await list_views(ws)
-    assert views[porch_id]["hidden"] is True
-    assert views[f"d_{home.kitchen.id}"]["hidden"] is False
-    # Hiding also stops sending the device page here
-    assert views[porch_id]["device_link"] == link_state(enabled=True, active=False)
-    assert url_of(hass, home.porch.id) == PORCH_URL
-    # A hidden view can still be opened (the panel shows it under "hidden")
-    session = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=porch_id)
-    assert session["view"]["hidden"] is True
-
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=False)
-    views = await list_views(ws)
-    assert views[porch_id]["hidden"] is False
-    assert views[porch_id]["device_link"] == link_state(enabled=True, active=True)
-    assert url_of(hass, home.porch.id) == link_for(porch_id)
+    targets = {
+        ROUTER_ID: None,
+        PRINTER_VIEW_ID: home.printer.id,
+        KITCHEN_VIEW_ID: home.kitchen.id,
+    }
+    titles = {
+        ROUTER_ID: "Router",
+        PRINTER_VIEW_ID: "Office printer",
+        KITCHEN_VIEW_ID: "Kitchen WLED",
+    }
+    linked_ids = set()
+    for view_id, target in targets.items():
+        linked_id = views[view_id]["linked_device_id"]
+        assert linked_id is not None
+        assert linked_id != target
+        linked_ids.add(linked_id)
+        device = registry.async_get(linked_id)
+        assert device is not None
+        assert device.config_entries == {view_id}
+        assert (DOMAIN, view_id) in device.identifiers
+        assert device.name == f"{titles[view_id]} web UI"
+        assert device.configuration_url == link_for(view_id)
+    assert len(linked_ids) == 3
+    # The target devices are untouched apart from their "Visit" link
+    printer = registry.async_get(home.printer.id)
+    assert printer is not None
+    assert printer.name == "Printer"
+    assert printer.config_entries == {home.printer.primary_config_entry}
 
 
 @pytest.mark.parametrize(
-    ("options", "discovery", "link", "linked"),
+    ("options", "discovery", "link", "discovered"),
     [
-        ({}, True, True, False),
-        ({CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: False}, True, False, False),
-        ({CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: True}, False, True, False),
-        ({CONF_LINKED_DEVICES: True}, True, True, True),
+        ({}, True, True, 2),
+        ({CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: False}, True, False, 2),
+        ({CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: True}, False, True, 0),
+        ({CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False}, False, False, 0),
     ],
 )
-async def test_views_reports_discovery_flags(
+async def test_views_reports_hub_options(
     hass: HomeAssistant,
     http: None,
     owner: MockConfigEntry,
@@ -423,37 +553,287 @@ async def test_views_reports_discovery_flags(
     options: dict[str, Any],
     discovery: bool,
     link: bool,
-    linked: bool,
+    discovered: int,
 ) -> None:
     home = await build_home(hass, owner, options)
     ws = await hass_ws_client()
     result = await ws_ok(ws, type=f"{DOMAIN}/views")
     assert result["discovery"] is discovery
     assert result["link_device_pages"] is link
-    assert result["linked_devices"] is linked
+    assert result["discovered"] == discovered
+    assert result["hub_entry_id"] == HUB_ID
 
     views = {view["view_id"]: view for view in result["views"]}
-    discovered = {vid for vid, v in views.items() if v["source"] == "discovered"}
-    if discovery:
-        assert discovered == {f"d_{home.porch.id}", f"d_{home.kitchen.id}"}
-        assert views[f"d_{home.porch.id}"]["device_link"] == link_state(enabled=link, active=link)
-    else:
-        assert discovered == set()
+    assert set(views) == {ROUTER_ID, PRINTER_VIEW_ID, KITCHEN_VIEW_ID}
     assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=link, active=link)
-    expected_printer_url = link_for(PRINTER_VIEW_ID) if link else PRINTER_URL
-    assert url_of(hass, home.printer.id) == expected_printer_url
+    assert url_of(hass, home.printer.id) == (link_for(PRINTER_VIEW_ID) if link else PRINTER_URL)
 
 
-async def test_views_skip_disabled_devices(
+async def test_views_follow_hub_option_changes(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    dr.async_get(hass).async_update_device(home.kitchen.id, disabled_by=dr.DeviceEntryDisabler.USER)
+    hub = hub_of(hass)
+    hass.config_entries.async_update_entry(
+        home.hub,
+        options={**home.hub.options, CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False},
+    )
+    await hass.async_block_till_done()
+    assert hub_of(hass) is hub
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    # Turning discovery off drops the pending discoveries
+    assert result["discovery"] is False
+    assert result["discovered"] == 0
+    assert result["link_device_pages"] is False
+    views = {view["view_id"]: view for view in result["views"]}
+    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=False, active=False)
+    assert url_of(hass, home.printer.id) == PRINTER_URL
+
+    hass.config_entries.async_update_entry(
+        home.hub,
+        options={**home.hub.options, CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True},
+    )
+    await hass.async_block_till_done()
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert result["discovered"] == 2
+    views = {view["view_id"]: view for view in result["views"]}
+    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=True, active=True)
+    assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
+
+
+async def test_views_discovered_counts_pending_discoveries(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    """Adding or ignoring a discovered device takes it off the count."""
+    assert (await ws_ok(ws, type=f"{DOMAIN}/views"))["discovered"] == 2
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_for(hass, home.porch.id)["flow_id"], {}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    porch_entry = result["result"]
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert result["discovered"] == 1
+    views = {view["view_id"]: view for view in result["views"]}
+    # The view id is the new entry's id
+    porch = views[porch_entry.entry_id]
+    assert porch["entry_id"] == porch_entry.entry_id
+    assert porch["name"] == "Porch light"
+    assert porch["source"] == "device"
+    assert porch["device_id"] == home.porch.id
+    assert porch["url"] == PORCH_URL
+    assert porch["area"] == "Porch"
+    assert porch["mode"] == MODE_ISOLATED
+    assert porch["device_link"] == link_state(enabled=True, active=True)
+    assert url_of(hass, home.porch.id) == link_for(porch_entry.entry_id)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_IGNORE},
+        data={"unique_id": device_unique_id(home.garage.id), "title": "Garage door"},
+    )
+    await hass.async_block_till_done()
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert result["discovered"] == 0
+    # An ignored discovery is not a web UI
+    assert len(result["views"]) == 4
+    assert home.garage.id not in {view["device_id"] for view in result["views"]}
+
+
+async def test_views_include_manual_entries_added_by_flow(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    assert result["step_id"] == "web_ui"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "name": "NAS",
+            CONF_URL: "http://192.168.1.5:5000/",
+            CONF_MODE: MODE_ISOLATED,
+            "trusted_acknowledged": False,
+            CONF_VERIFY_SSL: True,
+            CONF_SHOW_IN_SIDEBAR: False,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    entry_id = result["result"].entry_id
+    views = await list_views(ws)
+    assert views[entry_id] == {
+        "view_id": entry_id,
+        "entry_id": entry_id,
+        "name": "NAS",
+        "subtitle": "192.168.1.5",
+        "url": "http://192.168.1.5:5000/",
+        "mode": MODE_ISOLATED,
+        "source": "manual",
+        "device_id": None,
+        "area": None,
+        "icon": None,
+        "show_in_sidebar": False,
+        "device_link": None,
+        "linked_device_id": hub_of(hass).linked_device_id(entry_id),
+    }
+
+
+async def test_views_follow_entry_changes_in_place(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    hub = hub_of(hass)
+    first = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
+    hass.config_entries.async_update_entry(
+        home.router,
+        title="Main router",
+        options={**home.router.options, CONF_MODE: MODE_ISOLATED, CONF_ICON: "mdi:wifi"},
+    )
+    await hass.async_block_till_done()
+    assert hub_of(hass) is hub
+    router = (await list_views(ws))[ROUTER_ID]
+    assert router["name"] == "Main router"
+    assert router["mode"] == MODE_ISOLATED
+    assert router["icon"] == "mdi:wifi"
+    device = dr.async_get(hass).async_get(router["linked_device_id"])
+    assert device is not None
+    assert device.name == "Main router web UI"
+    # Applied without a reload: the open session keeps working
+    again = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID, token=first["token"])
+    assert again["token"] == first["token"]
+    assert again["view"]["name"] == "Main router"
+
+
+@pytest.mark.parametrize("link_default", [True, False])
+@pytest.mark.parametrize("visit_link", [None, VISIT_DEFAULT, VISIT_HERE, VISIT_DEVICE])
+async def test_views_device_link_follows_visit_link_option(
+    hass: HomeAssistant,
+    http: None,
+    owner: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    link_default: bool,
+    visit_link: str | None,
+) -> None:
+    home = await build_home(hass, owner, {CONF_LINK_DEVICE_PAGES: link_default})
+    ws = await hass_ws_client()
+    options = dict(home.printer_entry.options)
+    if visit_link is not None:
+        options[CONF_VISIT_LINK] = visit_link
+    hass.config_entries.async_update_entry(home.printer_entry, options=options)
+    await hass.async_block_till_done()
+
+    effective = link_default if visit_link in (None, VISIT_DEFAULT) else visit_link == VISIT_HERE
+    views = await list_views(ws)
+    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(
+        enabled=effective, active=effective, choice=visit_link or VISIT_DEFAULT
+    )
+    assert url_of(hass, home.printer.id) == (
+        link_for(PRINTER_VIEW_ID) if effective else PRINTER_URL
+    )
+    # Other web UIs keep following the hub's option
+    assert views[KITCHEN_VIEW_ID]["device_link"] == link_state(
+        enabled=link_default, active=link_default
+    )
+    assert views[ROUTER_ID]["device_link"] is None
+
+
+async def test_views_device_link_inactive_when_device_url_changed(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    """active tells whether the device's link really points here right now."""
+    hub = hub_of(hass)
+    # Written behind the hub's back, as if the registry event were not handled yet
+    hub._writing += 1
+    try:
+        dr.async_get(hass).async_update_device(home.printer.id, configuration_url=PRINTER_URL)
+        views = await list_views(ws)
+    finally:
+        hub._writing -= 1
+    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=True, active=False)
+
+
+async def test_views_skip_web_uis_whose_device_has_no_local_page(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    registry = dr.async_get(hass)
+    registry.async_update_device(home.kitchen.id, disabled_by=dr.DeviceEntryDisabler.USER)
     await hass.async_block_till_done()
     views = await list_views(ws)
-    assert f"d_{home.kitchen.id}" not in views
-    assert f"d_{home.porch.id}" in views
-    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=f"d_{home.kitchen.id}")
+    # The entry stays, but there is nothing to open
+    assert home.kitchen_entry.state is ConfigEntryState.LOADED
+    assert KITCHEN_VIEW_ID not in views
+    assert PRINTER_VIEW_ID in views
+    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=KITCHEN_VIEW_ID)
     assert error["code"] == "not_found"
+
+    registry.async_update_device(home.kitchen.id, disabled_by=None)
+    await hass.async_block_till_done()
+    assert KITCHEN_VIEW_ID in await list_views(ws)
+
+    registry.async_update_device(home.printer.id, configuration_url="https://example.com/p")
+    await hass.async_block_till_done()
+    assert PRINTER_VIEW_ID not in await list_views(ws)
+
+
+async def test_views_without_hub_entry(
+    hass: HomeAssistant,
+    http: None,
+    owner: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+) -> None:
+    home = await build_home(hass, owner, with_hub=False)
+    ws = await hass_ws_client()
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert result["hub_entry_id"] is None
+    assert result["discovery"] is False
+    assert result["discovered"] == 0
+    assert result["link_device_pages"] is True
+    views = {view["view_id"]: view for view in result["views"]}
+    assert set(views) == {ROUTER_ID, PRINTER_VIEW_ID, KITCHEN_VIEW_ID}
+    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=True, active=True)
+    assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
+
+
+async def test_views_not_loaded_before_any_entry(
+    hass: HomeAssistant, http: None, hass_ws_client: WebSocketGenerator
+) -> None:
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+    ws = await hass_ws_client()
+    for command in ALL_COMMANDS:
+        error = await ws_error(ws, **command)
+        assert error["code"] == "not_loaded", command
+
+
+async def test_views_until_the_last_entry_is_unloaded(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+) -> None:
+    config_entries = hass.config_entries
+    assert await config_entries.async_unload(home.hub.entry_id)
+    await hass.async_block_till_done()
+    # Web UI entries alone keep it working, with the hub's defaults
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert result["hub_entry_id"] is None
+    assert result["discovery"] is False
+    assert result["discovered"] == 0
+    assert len(result["views"]) == 3
+
+    assert await config_entries.async_unload(home.router.entry_id)
+    await hass.async_block_till_done()
+    assert set(await list_views(ws)) == {PRINTER_VIEW_ID, KITCHEN_VIEW_ID}
+    assert await config_entries.async_unload(home.printer_entry.entry_id)
+    await hass.async_block_till_done()
+    assert set(await list_views(ws)) == {KITCHEN_VIEW_ID}
+
+    assert await config_entries.async_unload(home.kitchen_entry.entry_id)
+    await hass.async_block_till_done()
+    error = await ws_error(ws, type=f"{DOMAIN}/views")
+    assert error["code"] == "not_loaded"
+
+    # And back
+    assert await config_entries.async_setup(home.router.entry_id)
+    await hass.async_block_till_done()
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert [view["view_id"] for view in result["views"]] == [ROUTER_ID]
+    assert result["hub_entry_id"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +843,7 @@ async def test_views_skip_disabled_devices(
 
 async def test_session_create(hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket) -> None:
     result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
+    assert set(result) == {"token", "url", "view", "expires_in"}
     token = result["token"]
     assert result["url"] == f"/api/local_web_ui/{ROUTER_ID}/{token}/admin?tab=wifi"
     match = TOKEN_URL.match(result["url"])
@@ -470,26 +851,23 @@ async def test_session_create(hass: HomeAssistant, home: Home, ws: MockHAClientW
     assert match["view"] == ROUTER_ID
     assert match["token"] == token
     assert result["expires_in"] == SESSION_TTL
-    assert result["view"]["view_id"] == ROUTER_ID
-    assert result["view"]["name"] == "Router"
-    assert result["view"]["mode"] == MODE_TRUSTED
+    # The same JSON as in the list
+    assert result["view"] == (await list_views(ws))[ROUTER_ID]
 
     # Each call without a token makes a new session
     again = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
     assert again["token"] != token
 
 
-async def test_session_url_for_discovered_view_keeps_entry_path_and_query(
+async def test_session_url_for_device_web_ui_keeps_entry_path_and_query(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    kitchen_id = f"d_{home.kitchen.id}"
-    result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=kitchen_id)
-    assert result["url"] == f"/api/local_web_ui/{kitchen_id}/{result['token']}/settings?page=1"
-    assert result["view"]["source"] == "discovered"
+    result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=KITCHEN_VIEW_ID)
+    assert result["url"] == f"/api/local_web_ui/{KITCHEN_VIEW_ID}/{result['token']}/settings?page=1"
+    assert result["view"]["source"] == "device"
 
-    porch_id = f"d_{home.porch.id}"
-    result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=porch_id)
-    assert result["url"] == f"/api/local_web_ui/{porch_id}/{result['token']}/"
+    result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=PRINTER_VIEW_ID)
+    assert result["url"] == f"/api/local_web_ui/{PRINTER_VIEW_ID}/{result['token']}/"
 
 
 async def test_session_extend_returns_same_token(
@@ -548,12 +926,36 @@ async def test_session_has_an_absolute_lifetime(
 async def test_session_survives_entry_reload(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    """Open views keep working when the entry reloads."""
+    """Open views keep working when their entry or the hub reloads."""
     first = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
-    assert await hass.config_entries.async_reload(home.entry.entry_id)
+    for entry in (home.router, home.hub):
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID, token=first["token"])
+        assert result["token"] == first["token"]
+
+
+@pytest.mark.parametrize("how", ["disable", "remove"])
+async def test_session_ends_when_its_entry_is_disabled_or_removed(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, how: str
+) -> None:
+    router = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
+    printer = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=PRINTER_VIEW_ID)
+    sessions = hub_of(hass).sessions
+    if how == "disable":
+        assert await hass.config_entries.async_set_disabled_by(ROUTER_ID, ConfigEntryDisabler.USER)
+    else:
+        assert await hass.config_entries.async_remove(ROUTER_ID)
     await hass.async_block_till_done()
-    result = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID, token=first["token"])
-    assert result["token"] == first["token"]
+    assert sessions.get(router["token"]) is None
+    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
+    assert error["code"] == "not_found"
+    # Other web UIs are not affected
+    assert sessions.get(printer["token"]) is not None
+    again = await ws_ok(
+        ws, type=f"{DOMAIN}/session", view_id=PRINTER_VIEW_ID, token=printer["token"]
+    )
+    assert again["token"] == printer["token"]
 
 
 async def test_session_unknown_token_creates_new_session(
@@ -652,7 +1054,7 @@ async def test_session_ends_when_its_login_is_revoked(
     assert result["token"] == mine["token"]
 
 
-@pytest.mark.parametrize("view_id", ["nope", "d_nope", ""])
+@pytest.mark.parametrize("view_id", ["nope", "d_nope", "", HUB_ID])
 async def test_session_unknown_view(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, view_id: str
 ) -> None:
@@ -660,368 +1062,14 @@ async def test_session_unknown_view(
     assert error["code"] == "not_found"
 
 
-async def test_session_for_pinned_device_discovered_id_is_not_found(
+async def test_session_for_devices_without_web_ui_entry_is_not_found(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    """The printer's discovered id is superseded by its static view."""
-    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=f"d_{home.printer.id}")
-    assert error["code"] == "not_found"
-    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=f"d_{home.cloud.id}")
-    assert error["code"] == "not_found"
-
-
-# ---------------------------------------------------------------------------
-# local_web_ui/pin
-# ---------------------------------------------------------------------------
-
-
-async def test_pin_discovered_view(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    kitchen_id = f"d_{home.kitchen.id}"
-    old_hub = hub_of(hass)
-    result = await ws_ok(ws, type=f"{DOMAIN}/pin", view_id=kitchen_id)
-    await hass.async_block_till_done()
-    subentry_id = result["view_id"]
-
-    subentry = home.entry.subentries[subentry_id]
-    assert subentry.subentry_type == SUBENTRY_TYPE_VIEW
-    assert subentry.title == "Kitchen WLED"
-    assert subentry.unique_id == pinned_unique_id(home.kitchen.id)
-    assert isinstance(subentry.data, MappingProxyType)
-    assert dict(subentry.data) == {
-        CONF_URL: KITCHEN_URL,
-        CONF_MODE: MODE_ISOLATED,
-        CONF_VERIFY_SSL: False,
-        CONF_SHOW_IN_SIDEBAR: False,
-        CONF_DEVICE_ID: home.kitchen.id,
-    }
-    # Applied in place: the entry was not reloaded
-    assert home.entry.state is ConfigEntryState.LOADED
-    assert hub_of(hass) is old_hub
-    assert home.entry.runtime_data is old_hub
-
-    views = await list_views(ws)
-    assert kitchen_id not in views
-    pinned = views[subentry_id]
-    assert pinned["source"] == "static"
-    assert pinned["name"] == "Kitchen WLED"
-    assert pinned["url"] == KITCHEN_URL
-    assert pinned["device_id"] == home.kitchen.id
-    assert pinned["device_link"] == link_state(enabled=True, active=True)
-    # The device's "Visit" link follows the view to its new id
-    assert url_of(hass, home.kitchen.id) == link_for(subentry_id)
-    # Other discovered views are untouched
-    assert f"d_{home.porch.id}" in views
-
-    # The old id is gone for sessions too, the new one works
-    error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=kitchen_id)
-    assert error["code"] == "not_found"
-    session = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=subentry_id)
-    assert session["url"] == f"/api/local_web_ui/{subentry_id}/{session['token']}/settings?page=1"
-
-    # Pinning again: the discovered view no longer exists
-    error = await ws_error(ws, type=f"{DOMAIN}/pin", view_id=kitchen_id)
-    assert error["code"] == "not_found"
-    assert len(home.entry.subentries) == 3
-
-
-async def test_pinned_view_is_listed_as_soon_as_pin_returns(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    """The panel lists views right after pinning; nothing may still be pending."""
-    kitchen_id = f"d_{home.kitchen.id}"
-    hub = hub_of(hass)
-    # Sent back to back: the views request is handled right after the pin
-    await ws.send_json_auto_id({"type": f"{DOMAIN}/pin", "view_id": kitchen_id})
-    await ws.send_json_auto_id({"type": f"{DOMAIN}/views"})
-    await ws.send_json_auto_id({"type": f"{DOMAIN}/session", "view_id": kitchen_id})
-    pin = await ws.receive_json()
-    views = await ws.receive_json()
-    old_id_session = await ws.receive_json()
-    assert pin["success"], pin
-    assert views["success"], views
-    subentry_id = pin["result"]["view_id"]
-
-    listed = {view["view_id"]: view for view in views["result"]["views"]}
-    assert kitchen_id not in listed
-    assert listed[subentry_id]["source"] == "static"
-    assert listed[subentry_id]["device_link"] == link_state(enabled=True, active=True)
-    assert not old_id_session["success"]
-    assert old_id_session["error"]["code"] == "not_found"
-    assert url_of(hass, home.kitchen.id) == link_for(subentry_id)
-    session = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=subentry_id)
-    assert session["view"]["view_id"] == subentry_id
-
-    await hass.async_block_till_done()
-    assert hub_of(hass) is hub
-    assert home.entry.runtime_data is hub
-    assert set(await list_views(ws)) == set(listed)
-
-
-async def test_pin_twice_adds_one_web_ui(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    kitchen_id = f"d_{home.kitchen.id}"
-    # A double click: both requests arrive before either reply
-    await ws.send_json_auto_id({"type": f"{DOMAIN}/pin", "view_id": kitchen_id})
-    await ws.send_json_auto_id({"type": f"{DOMAIN}/pin", "view_id": kitchen_id})
-    first = await ws.receive_json()
-    second = await ws.receive_json()
-    await hass.async_block_till_done()
-    assert first["success"], first
-    # The first pin replaced the discovered view at once, so there is nothing left
-    # to pin (already_pinned is for a device still discovered; see the next test)
-    assert not second["success"]
-    assert second["error"]["code"] == "not_found", second
-    pinned = [
-        s
-        for s in home.entry.subentries.values()
-        if s.unique_id == pinned_unique_id(home.kitchen.id)
-    ]
-    assert [s.subentry_id for s in pinned] == [first["result"]["view_id"]]
-    assert len(home.entry.subentries) == 3
-
-
-async def test_pin_device_that_already_has_a_web_ui_is_already_pinned(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    """The device's web UI id is taken while its discovered view is still offered.
-
-    Here a web UI holds the device's unique id without naming the device (as if
-    added by an earlier version), so the device is still discovered.
-    """
-    kitchen_id = f"d_{home.kitchen.id}"
-    hass.config_entries.async_add_subentry(
-        home.entry,
-        ConfigSubentry(
-            data=MappingProxyType({CONF_URL: "http://192.168.1.99/", CONF_MODE: MODE_ISOLATED}),
-            subentry_type=SUBENTRY_TYPE_VIEW,
-            title="Kitchen (old)",
-            unique_id=pinned_unique_id(home.kitchen.id),
-        ),
-    )
-    await hass.async_block_till_done()
-    assert kitchen_id in await list_views(ws)
-
-    error = await ws_error(ws, type=f"{DOMAIN}/pin", view_id=kitchen_id)
-    assert error["code"] == "already_pinned"
-    await hass.async_block_till_done()
-    assert len(home.entry.subentries) == 3
-    assert [
-        s.title
-        for s in home.entry.subentries.values()
-        if s.unique_id == pinned_unique_id(home.kitchen.id)
-    ] == ["Kitchen (old)"]
-    # Nothing else changed: the discovered view is still there and still linked
-    views = await list_views(ws)
-    assert views[kitchen_id]["source"] == "discovered"
-    assert url_of(hass, home.kitchen.id) == link_for(kitchen_id)
-
-
-@pytest.mark.parametrize("view_id", [ROUTER_ID, PRINTER_VIEW_ID, "nope", "d_nope", ""])
-async def test_pin_static_or_unknown_view(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, view_id: str
-) -> None:
-    error = await ws_error(ws, type=f"{DOMAIN}/pin", view_id=view_id)
-    assert error["code"] == "not_found"
-    await hass.async_block_till_done()
-    assert set(home.entry.subentries) == {ROUTER_ID, PRINTER_VIEW_ID}
-
-
-async def test_pin_with_discovery_off_is_not_found(
-    hass: HomeAssistant,
-    http: None,
-    owner: MockConfigEntry,
-    hass_ws_client: WebSocketGenerator,
-) -> None:
-    home = await build_home(hass, owner, {CONF_DISCOVERY: False})
-    ws = await hass_ws_client()
-    error = await ws_error(ws, type=f"{DOMAIN}/pin", view_id=f"d_{home.porch.id}")
-    assert error["code"] == "not_found"
-    assert len(home.entry.subentries) == 2
-
-
-# ---------------------------------------------------------------------------
-# local_web_ui/set_hidden and local_web_ui/set_device_link
-# ---------------------------------------------------------------------------
-
-
-async def test_set_hidden_persists_without_reload(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    porch_id = f"d_{home.porch.id}"
-    hub = hub_of(hass)
-    assert await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=True) is None
-    await hass.async_block_till_done()
-    assert hub_of(hass) is hub  # No reload
-    assert porch_id in hub.hidden
-    # Idempotent
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=True)
-    assert hub.hidden == {porch_id}
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=False)
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=False)
-    assert hub.hidden == set()
-
-    # Survives a reload
-    await ws_ok(ws, type=f"{DOMAIN}/set_hidden", view_id=porch_id, hidden=True)
-    assert await hass.config_entries.async_reload(home.entry.entry_id)
-    await hass.async_block_till_done()
-    views = await list_views(ws)
-    assert views[porch_id]["hidden"] is True
-    assert url_of(hass, home.porch.id) == PORCH_URL
-
-
-@pytest.mark.parametrize("view_id", [ROUTER_ID, PRINTER_VIEW_ID, "nope", ""])
-@pytest.mark.parametrize("hidden", [True, False])
-async def test_set_hidden_only_accepts_discovered_views(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, view_id: str, hidden: bool
-) -> None:
-    """Web UIs added by hand are removed, not hidden."""
-    error = await ws_error(ws, type=f"{DOMAIN}/set_hidden", view_id=view_id, hidden=hidden)
-    assert error["code"] == "not_found"
-    await hass.async_block_till_done()
-    assert hub_of(hass).hidden == set()
-    views = await list_views(ws)
-    assert views[PRINTER_VIEW_ID]["hidden"] is False
-    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=True, active=True)
-    assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        {"view_id": "d_x"},
-        {"hidden": True},
-        {"view_id": "d_x", "hidden": "yes"},
-        {"view_id": 5, "hidden": True},
-    ],
-)
-async def test_set_hidden_validates_arguments(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, args: dict[str, Any]
-) -> None:
-    error = await ws_error(ws, type=f"{DOMAIN}/set_hidden", **args)
-    assert error["code"] == "invalid_format"
-    assert hub_of(hass).hidden == set()
-
-
-async def test_set_device_link_overrides_global_default(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    porch_id = f"d_{home.porch.id}"
-    hub = hub_of(hass)
-    assert url_of(hass, home.porch.id) == link_for(porch_id)
-
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=False)
-    assert hub_of(hass) is hub  # No reload
-    assert hub.link_overrides == {home.porch.id: False}
-    assert url_of(hass, home.porch.id) == PORCH_URL
-    views = await list_views(ws)
-    assert views[porch_id]["device_link"] == link_state(enabled=False, active=False, override=False)
-    # Only that device
-    assert views[f"d_{home.kitchen.id}"]["device_link"] == link_state(enabled=True, active=True)
-    assert url_of(hass, home.kitchen.id) == link_for(f"d_{home.kitchen.id}")
-
-    # Works for static views linked to a device as well
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.printer.id, enabled=False)
-    assert url_of(hass, home.printer.id) == PRINTER_URL
-    views = await list_views(ws)
-    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(
-        enabled=False, active=False, override=False
-    )
-
-    # Explicitly on is an override too, even though it matches the global option
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=True)
-    assert hub.link_overrides == {home.porch.id: True, home.printer.id: False}
-    assert url_of(hass, home.porch.id) == link_for(porch_id)
-
-    # None goes back to following the global option
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=None)
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.printer.id, enabled=None)
-    assert hub.link_overrides == {}
-    assert url_of(hass, home.porch.id) == link_for(porch_id)
-    assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
-    views = await list_views(ws)
-    assert views[porch_id]["device_link"] == link_state(enabled=True, active=True)
-    assert views[PRINTER_VIEW_ID]["device_link"] == link_state(enabled=True, active=True)
-
-
-async def test_set_device_link_with_global_default_off(
-    hass: HomeAssistant,
-    http: None,
-    owner: MockConfigEntry,
-    hass_ws_client: WebSocketGenerator,
-) -> None:
-    home = await build_home(hass, owner, {CONF_LINK_DEVICE_PAGES: False})
-    ws = await hass_ws_client()
-    porch_id = f"d_{home.porch.id}"
-    assert url_of(hass, home.porch.id) == PORCH_URL
-
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=True)
-    assert hub_of(hass).link_overrides == {home.porch.id: True}
-    assert url_of(hass, home.porch.id) == link_for(porch_id)
-    views = await list_views(ws)
-    assert views[porch_id]["device_link"] == link_state(enabled=True, active=True, override=True)
-    assert views[f"d_{home.kitchen.id}"]["device_link"] == link_state(enabled=False, active=False)
-
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=False)
-    assert hub_of(hass).link_overrides == {home.porch.id: False}
-    assert url_of(hass, home.porch.id) == PORCH_URL
-
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=None)
-    assert hub_of(hass).link_overrides == {}
-    assert url_of(hass, home.porch.id) == PORCH_URL
-    views = await list_views(ws)
-    assert views[porch_id]["device_link"] == link_state(enabled=False, active=False)
-
-
-@pytest.mark.parametrize("link_default", [True, False])
-async def test_views_device_link_override_follows_set_device_link(
-    hass: HomeAssistant,
-    http: None,
-    owner: MockConfigEntry,
-    hass_ws_client: WebSocketGenerator,
-    link_default: bool,
-) -> None:
-    home = await build_home(hass, owner, {CONF_LINK_DEVICE_PAGES: link_default})
-    ws = await hass_ws_client()
-    porch_id = f"d_{home.porch.id}"
-
-    async def porch_link() -> dict[str, Any]:
-        return (await list_views(ws))[porch_id]["device_link"]
-
-    assert await porch_link() == link_state(enabled=link_default, active=link_default)
-    for enabled in (True, False, None, False, True, None):
-        await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=enabled)
-        effective = link_default if enabled is None else enabled
-        assert await porch_link() == link_state(
-            enabled=effective, active=effective, override=enabled
-        )
-        assert url_of(hass, home.porch.id) == (link_for(porch_id) if effective else PORCH_URL)
-        # Other devices keep following the global option
-        views = await list_views(ws)
-        assert views[f"d_{home.kitchen.id}"]["device_link"] == link_state(
-            enabled=link_default, active=link_default
-        )
-
-
-async def test_set_device_link_unknown_device_is_harmless(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
-) -> None:
-    await ws_ok(ws, type=f"{DOMAIN}/set_device_link", device_id="no-such-device", enabled=False)
-    views = await list_views(ws)
-    assert views[f"d_{home.porch.id}"]["device_link"] == link_state(enabled=True, active=True)
-
-
-@pytest.mark.parametrize("enabled", ["yes", 1, "null"])
-async def test_set_device_link_validates_enabled(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, enabled: Any
-) -> None:
-    error = await ws_error(
-        ws, type=f"{DOMAIN}/set_device_link", device_id=home.porch.id, enabled=enabled
-    )
-    assert error["code"] == "invalid_format"
-    assert hub_of(hass).link_overrides == {}
+    """Discovered devices, by any id, have no view until they are added."""
+    for device in (home.porch, home.cloud, home.printer):
+        for view_id in (device.id, f"d_{device.id}", device_unique_id(device.id)):
+            error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=view_id)
+            assert error["code"] == "not_found", view_id
 
 
 # ---------------------------------------------------------------------------
@@ -1035,19 +1083,25 @@ async def test_commands_reject_non_admin(
     home: Home,
     hass_ws_client: WebSocketGenerator,
     hass_read_only_access_token: str,
+    hass_read_only_user: MockUser,
     command: dict[str, Any],
 ) -> None:
-    ws = await hass_ws_client(access_token=hass_read_only_access_token)
     hub = hub_of(hass)
+    view = hub.get_view(ROUTER_ID)
+    assert view is not None
+    hub.async_store_cookies(hass_read_only_user.id, view, ["sid=kept"], view.origin)
+    entries = {e.entry_id: (e.title, dict(e.options)) for e in hass.config_entries.async_entries()}
+    ws = await hass_ws_client(access_token=hass_read_only_access_token)
     error = await ws_error(ws, **command)
     assert error["code"] == "unauthorized"
     await hass.async_block_till_done()
     # Nothing changed
     assert hub_of(hass) is hub
-    assert hub.hidden == set()
-    assert hub.link_overrides == {}
-    assert set(home.entry.subentries) == {ROUTER_ID, PRINTER_VIEW_ID}
     assert not hub.sessions._sessions
+    assert [m.value for m in hub.cookie_jar(hass_read_only_user.id, view)] == ["kept"]
+    assert {
+        e.entry_id: (e.title, dict(e.options)) for e in hass.config_entries.async_entries()
+    } == entries
 
 
 async def test_commands_reject_non_admin_user_with_own_group(
@@ -1075,6 +1129,23 @@ async def test_commands_reject_non_admin_user_with_own_group(
     for command in ALL_COMMANDS:
         error = await ws_error(ws, **dict(command))
         assert error["code"] == "unauthorized", command
+    assert not hub_of(hass).sessions._sessions
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        {"type": f"{DOMAIN}/pin", "view_id": ROUTER_ID},
+        {"type": f"{DOMAIN}/set_hidden", "view_id": "d_abc", "hidden": True},
+        {"type": f"{DOMAIN}/set_device_link", "device_id": "abc", "enabled": False},
+    ],
+    ids=["pin", "set_hidden", "set_device_link"],
+)
+async def test_removed_commands_are_unknown(
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, command: dict[str, Any]
+) -> None:
+    error = await ws_error(ws, **command)
+    assert error["code"] == "unknown_command"
 
 
 @pytest.mark.parametrize("command", ALL_COMMANDS, ids=COMMAND_IDS)
@@ -1084,9 +1155,8 @@ async def test_commands_not_loaded(
     hass_ws_client: WebSocketGenerator,
     command: dict[str, Any],
 ) -> None:
-    assert await hass.config_entries.async_unload(home.entry.entry_id)
-    await hass.async_block_till_done()
-    assert home.entry.state is ConfigEntryState.NOT_LOADED
+    await unload_all(hass)
+    assert not hub_of(hass).active
     ws = await hass_ws_client()
     error = await ws_error(ws, **command)
     assert error["code"] == "not_loaded"
@@ -1095,14 +1165,21 @@ async def test_commands_not_loaded(
 async def test_commands_work_again_after_reload(
     hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
 ) -> None:
-    assert await hass.config_entries.async_unload(home.entry.entry_id)
-    await hass.async_block_till_done()
+    await unload_all(hass)
     error = await ws_error(ws, type=f"{DOMAIN}/views")
     assert error["code"] == "not_loaded"
-    assert await hass.config_entries.async_setup(home.entry.entry_id)
+    for entry in (home.hub, home.router, home.printer_entry, home.kitchen_entry):
+        assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    views = await list_views(ws)
-    assert ROUTER_ID in views
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert {view["view_id"] for view in result["views"]} == {
+        ROUTER_ID,
+        PRINTER_VIEW_ID,
+        KITCHEN_VIEW_ID,
+    }
+    assert result["hub_entry_id"] == HUB_ID
+    assert result["discovered"] == 2
+    await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -1110,38 +1187,109 @@ async def test_commands_work_again_after_reload(
 # ---------------------------------------------------------------------------
 
 
-async def test_diagnostics_redacts_credentials(
-    hass: HomeAssistant,
-    home: Home,
-    hass_client: ClientSessionGenerator,
+async def test_diagnostics_hub_entry(
+    hass: HomeAssistant, home: Home, hass_client: ClientSessionGenerator
 ) -> None:
-    porch_id = f"d_{home.porch.id}"
-    hub = hub_of(hass)
-    hub.async_set_hidden(porch_id, True)
-    hub.async_set_device_link(home.kitchen.id, False)
-
-    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.entry)
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.hub)
+    assert diagnostics == {
+        "data": {CONF_KIND: KIND_HUB},
+        "options": dict(HUB_DEFAULTS),
+        "web_uis": 3,
+        # The devices whose "Visit" link points here now
+        "device_page_links": sorted([home.printer.id, home.kitchen.id]),
+    }
     dumped = json.dumps(diagnostics)
     assert "hunter2" not in dumped
     assert "rootuser" not in dumped
 
-    static = {view["title"]: view for view in diagnostics["static_views"]}
-    assert static["Router"][CONF_USERNAME] == "**REDACTED**"
-    assert static["Router"][CONF_PASSWORD] == "**REDACTED**"
-    # Query strings can hold tokens
-    assert static["Router"][CONF_URL] == ROUTER_URL.partition("?")[0] + "?**REDACTED**"
-    assert static["Router"][CONF_MODE] == MODE_TRUSTED
-    assert CONF_USERNAME not in static["Office printer"]
-    assert static["Office printer"][CONF_DEVICE_ID] == home.printer.id
+    options = dict(home.printer_entry.options)
+    options[CONF_VISIT_LINK] = VISIT_DEVICE
+    hass.config_entries.async_update_entry(home.printer_entry, options=options)
+    await hass.async_block_till_done()
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.hub)
+    assert diagnostics["device_page_links"] == [home.kitchen.id]
 
-    discovered = {view["view_id"]: view for view in diagnostics["discovered_views"]}
-    assert set(discovered) == {porch_id, f"d_{home.kitchen.id}"}
-    assert discovered[porch_id]["url"] == PORCH_URL
-    assert diagnostics["hidden"] == [porch_id]
-    assert diagnostics["link_overrides"] == {home.kitchen.id: False}
-    # Only the devices whose "Visit" link currently points here: the porch is
-    # hidden and the kitchen's link is off
-    assert diagnostics["device_page_links"] == [home.printer.id]
+
+async def test_diagnostics_manual_web_ui_redacts_credentials_and_query(
+    hass: HomeAssistant, home: Home, hass_client: ClientSessionGenerator
+) -> None:
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.router)
+    dumped = json.dumps(diagnostics)
+    assert "hunter2" not in dumped
+    assert "rootuser" not in dumped
+    assert "tab=wifi" not in dumped
+    redacted_url = ROUTER_URL.partition("?")[0] + "?**REDACTED**"
+    assert diagnostics["data"] == {CONF_KIND: KIND_VIEW}
+    assert diagnostics["options"] == {
+        CONF_URL: redacted_url,
+        CONF_MODE: MODE_TRUSTED,
+        CONF_VERIFY_SSL: False,
+        CONF_SHOW_IN_SIDEBAR: True,
+        CONF_ICON: "mdi:router-wireless",
+        CONF_USERNAME: "**REDACTED**",
+        CONF_PASSWORD: "**REDACTED**",
+    }
+    view = diagnostics["view"]
+    assert view["url"] == redacted_url
+    assert view["source"] == "manual"
+    assert view["mode"] == MODE_TRUSTED
+    assert set(view) == {"url", "source", "mode", "device_page_link"}
+
+
+async def test_diagnostics_manual_web_ui_has_no_device_page_link(
+    hass: HomeAssistant, home: Home, hass_client: ClientSessionGenerator
+) -> None:
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.router)
+    assert diagnostics["view"]["device_page_link"] is None
+
+
+async def test_diagnostics_device_web_ui(
+    hass: HomeAssistant, home: Home, hass_client: ClientSessionGenerator
+) -> None:
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.printer_entry)
+    assert diagnostics == {
+        "data": {CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: home.printer.id},
+        "options": {CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: False},
+        "view": {
+            "url": PRINTER_URL,
+            "source": "device",
+            "mode": MODE_ISOLATED,
+            "device_page_link": True,
+        },
+    }
+
+    # Credentials of a device web UI, and the query of its device's URL
+    options = {
+        **home.kitchen_entry.options,
+        CONF_USERNAME: "admin",
+        CONF_PASSWORD: "p4ssw0rd",
+        CONF_VISIT_LINK: VISIT_DEVICE,
+    }
+    hass.config_entries.async_update_entry(home.kitchen_entry, options=options)
+    await hass.async_block_till_done()
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.kitchen_entry)
+    dumped = json.dumps(diagnostics)
+    assert "p4ssw0rd" not in dumped
+    assert "page=1" not in dumped
+    assert diagnostics["options"][CONF_USERNAME] == "**REDACTED**"
+    assert diagnostics["options"][CONF_PASSWORD] == "**REDACTED**"
+    assert diagnostics["options"][CONF_VISIT_LINK] == VISIT_DEVICE
+    assert diagnostics["view"] == {
+        "url": "http://wled-kitchen.local/settings?**REDACTED**",
+        "source": "device",
+        "mode": MODE_ISOLATED,
+        "device_page_link": False,
+    }
+
+
+async def test_diagnostics_device_web_ui_without_local_page(
+    hass: HomeAssistant, home: Home, hass_client: ClientSessionGenerator
+) -> None:
+    dr.async_get(hass).async_update_device(home.printer.id, disabled_by=dr.DeviceEntryDisabler.USER)
+    await hass.async_block_till_done()
+    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.printer_entry)
+    assert diagnostics["view"] is None
+    assert diagnostics["data"] == {CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: home.printer.id}
 
 
 async def test_diagnostics_never_contain_session_tokens_or_site_data(
@@ -1162,12 +1310,13 @@ async def test_diagnostics_never_contain_session_tokens_or_site_data(
     hub.async_store_cookies(
         hass_admin_user.id, router, ["sid=c00kie-value; HttpOnly"], router.origin
     )
-    diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, home.entry)
-    dumped = json.dumps(diagnostics)
-    assert session["token"] not in dumped
-    assert "s3cr3t" not in dumped
-    assert "c00kie-value" not in dumped
-    assert "write-1" not in dumped
+    for entry in (home.hub, home.router, home.printer_entry, home.kitchen_entry):
+        diagnostics = await get_diagnostics_for_config_entry(hass, hass_client, entry)
+        dumped = json.dumps(diagnostics)
+        assert session["token"] not in dumped
+        assert "s3cr3t" not in dumped
+        assert "c00kie-value" not in dumped
+        assert "write-1" not in dumped
 
 
 # ---------------------------------------------------------------------------
@@ -1225,10 +1374,30 @@ async def test_clear_site_data_forgets_cookies_and_storage(
     assert (await relay.client.get(prefixes[view_id] + "/whoami")).status == 200
 
 
+@pytest.mark.parametrize("view_id", ["nope", "", HUB_ID])
 async def test_clear_site_data_unknown_view_is_harmless(
-    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket
+    hass: HomeAssistant, home: Home, ws: MockHAClientWebSocket, view_id: str
 ) -> None:
-    assert await ws_ok(ws, type=f"{DOMAIN}/clear_site_data", view_id="nope") is None
+    assert await ws_ok(ws, type=f"{DOMAIN}/clear_site_data", view_id=view_id) is None
+    assert set(await list_views(ws)) == {ROUTER_ID, PRINTER_VIEW_ID, KITCHEN_VIEW_ID}
+
+
+async def test_clear_site_data_of_web_ui_without_view(
+    hass: HomeAssistant,
+    home: Home,
+    ws: MockHAClientWebSocket,
+    hass_admin_user: MockUser,
+) -> None:
+    """Data of a device web UI can be cleared while its device has no local page."""
+    hub = hub_of(hass)
+    assert hub.async_apply_storage_write(
+        hass_admin_user.id, KITCHEN_VIEW_ID, "w1", {"a": "1"}, clear=False
+    )
+    dr.async_get(hass).async_update_device(home.kitchen.id, disabled_by=dr.DeviceEntryDisabler.USER)
+    await hass.async_block_till_done()
+    assert hub.get_view(KITCHEN_VIEW_ID) is None
+    await ws_ok(ws, type=f"{DOMAIN}/clear_site_data", view_id=KITCHEN_VIEW_ID)
+    assert hub.shim_storage(hass_admin_user.id, KITCHEN_VIEW_ID) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1335,7 +1504,7 @@ async def upstream(socket_enabled: None) -> AsyncGenerator[Upstream]:
 @dataclass
 class Relay:
     hass: HomeAssistant
-    entry: MockConfigEntry
+    entries: list[MockConfigEntry]
     ws: MockHAClientWebSocket
     client: TestClient
     upstream: Upstream
@@ -1359,25 +1528,21 @@ async def relay(
     hass_ws_client: WebSocketGenerator,
     hass_client_no_auth: ClientSessionGenerator,
 ) -> AsyncGenerator[Relay]:
-    entry = await setup_lwu(
-        hass,
-        subentries=[
-            view_subentry("echo", upstream.url, "Echo"),
-            view_subentry(
-                "echo_trusted",
-                upstream.url + "deep/path/",
-                "Echo trusted",
-                **{CONF_MODE: MODE_TRUSTED, CONF_USERNAME: "u", CONF_PASSWORD: "p"},
-            ),
-        ],
-    )
+    entries = [
+        manual_entry("echo", "Echo", upstream.url),
+        manual_entry(
+            "echo_trusted",
+            "Echo trusted",
+            upstream.url + "deep/path/",
+            **{CONF_MODE: MODE_TRUSTED, CONF_USERNAME: "u", CONF_PASSWORD: "p"},
+        ),
+    ]
+    await setup_entries(hass, *entries)
     ws = await hass_ws_client()
     client = await hass_client_no_auth()
-    yield Relay(hass, entry, ws, client, upstream)
-    if entry.state is ConfigEntryState.LOADED:
-        # Closes the upstream client sessions
-        assert await hass.config_entries.async_unload(entry.entry_id)
-        await hass.async_block_till_done()
+    yield Relay(hass, entries, ws, client, upstream)
+    # Closes the upstream client sessions
+    await unload_all(hass)
 
 
 async def _receive(ws: aiohttp.ClientWebSocketResponse) -> aiohttp.WSMessage:

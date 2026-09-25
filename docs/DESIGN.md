@@ -24,27 +24,38 @@ Requires Home Assistant 2026.9 or newer (tested with 2026.9.3).
 - an optional device link;
 - an optional "show in sidebar" flag.
 
-Views come from two sources:
-- **Static views** are config subentries (type `view`) of the single config entry. You add
-  and edit them in the UI under Settings → Devices & services → Local Web UIs → Add web UI.
-  The view id is the subentry id. Credentials typed into the URL
-  (`http://user:pass@host/`) are moved into the username and password fields.
-- **Discovered views** are derived live from the device registry. Any device whose
-  `configuration_url` is `http(s)` to a local host qualifies (see the discovery filter
-  below). Examples:
+**Entries.** Since 0.3 there are two kinds of config entry (entry version 2):
+- **The hub** (`data {kind: hub}`, `unique_id` `hub`, at most one) holds the global
+  options: discovery, the default for device page links, and the sidebar entry of the main
+  panel (shown or not, its title and icon).
+- **A web UI**, one entry per view. The view id is the entry id. Its settings are the
+  entry's options, edited with the entry's *Configure* button.
+
+Web UIs come from two sources:
+- **Device web UIs** (`data {device_id}`, `unique_id` `device:<device_id>`) come from
+  discovery. Any device whose `configuration_url` is `http(s)` to a local host qualifies
+  (see the discovery filter below). Examples:
   - ESPHome sets this to `http://<host>:<web_server port>` whenever `web_server` is enabled;
   - WLED, SMLIGHT, many printers and routers set it too.
 
-  The view id is `d_<device_id>`, and the view is named after the device. There is one view
-  per URL: since 2026.8 a device known to several integrations is one device per
-  integration, each with the same link, so the first device keeps the view and the others
-  map to it. A static view with the same URL wins over discovery. Discovery can be turned
-  off in options. Child devices (2026.9) are ignored; they share their parent's link.
+  The hub starts an `integration_discovery` flow for each such device, once per HA run, so
+  it shows under *Discovered* with **Add** and **Ignore**; ignoring is HA's own
+  `SOURCE_IGNORE` entry. There is one offer per URL: since 2026.8 a device known to several
+  integrations is one device per integration, each with the same link, so only the first is
+  offered. Child devices (2026.9) are ignored; they share their parent's link. Turning
+  discovery off aborts pending offers. The URL follows the device's current link, so a
+  device that moves to a new address keeps working.
+- **Manual web UIs** (`data {}`) are added with *Add entry*. Credentials typed into the URL
+  (`http://user:pass@host/`) are moved into the username and password fields.
 
-  A discovered view can be **pinned**, which creates a static subentry pre-filled from it
-  and linked to the device (subentry `unique_id` `device:<device_id>`, so pinning twice is
-  refused), so you can rename it or change its mode, and the discovered duplicate
-  disappears. It can also be **hidden**.
+All entries share one `LocalWebUiHub`, created in `async_setup` and kept in
+`hass.data[DOMAIN]`. It is active while any entry is loaded.
+
+**Migration from 0.2** (entry version 1, one entry with a `view` subentry per web UI):
+each subentry is re-created as a web UI entry through an import flow, keeping its
+settings; its per-device link choice becomes the `visit_link` option; its cookies and
+storage move to the new id. Hidden discovered views become ignored entries. The old entry
+becomes the hub.
 
 **Session.** Grants one HA user's browser access to one view:
 - a random 256-bit token, created over the WebSocket API by admins only;
@@ -177,9 +188,9 @@ Views come from two sources:
   frame is relayed as close code 1001, never as the reserved 1006.
 
 **Upstream connections**
-- Static views use HA's shared aiohttp connectors (so `.local` names resolve over mDNS),
+- Manual web UIs use HA's shared aiohttp connectors (so `.local` names resolve over mDNS),
   one per `verify_ssl` value.
-- Discovered views use their own connector with a resolver that only returns LAN
+- Device web UIs use their own connector with a resolver that only returns LAN
   addresses (it wraps HA's resolver, so mDNS still works), so a device-supplied host name
   cannot resolve to something else.
 - `DummyCookieJar`, because cookies are per user and view, as above.
@@ -202,24 +213,26 @@ It excludes loopback, link-local, multicast, cloud metadata addresses and names,
 Supervisor's `172.30.32.0/23` network, `*.localhost`, app hostnames (`core-*`, `local-*`,
 `a0d7b954-*`, `supervisor`, `homeassistant`) and Home Assistant's own URLs. IPv4-mapped
 IPv6 addresses are checked as IPv4. Discovered views skip TLS verification, because LAN
-devices rarely have trusted certificates. Static views are not filtered.
+devices rarely have trusted certificates. Manual web UIs are not filtered.
 
 ## Storage
 
 Two private stores (`private=True`, `atomic_writes=True`):
-- `.storage/local_web_ui`: original device links, hidden views, per-device link choices;
+- `.storage/local_web_ui`: original device links;
 - `.storage/local_web_ui.jar`: site cookies and emulated localStorage per (user, view).
 
 A removed user's data and a removed web UI's data (every user's) are dropped. Removing the
-integration deletes both stores.
+last entry deletes both stores.
 
 ## Lifecycle
 
 - The proxy route, the static path of the panel and the WebSocket commands are registered
   once, in `async_setup`; they cannot be unregistered, and they look the hub up per call.
-- Options and web UI (subentry) changes are applied in place by the update listener:
-  views are reloaded from the subentries, device links and linked devices re-synced, and
-  sidebar panels added, replaced or removed. Open views keep working.
+- Option changes are applied in place by the update listener: views are rebuilt from the
+  entries, device links and linked devices re-synced, and sidebar panels added, replaced
+  or removed. Open views keep working.
+- The main panel stays registered while any entry is loaded, even when hidden from the
+  sidebar, because it serves the device pages' "Visit" links.
 - Sessions live in `hass.data`, outside the entry, so they also survive a reload.
 - The panel module URL carries a hash of its content, so it can be cached for long.
 
@@ -227,12 +240,12 @@ integration deletes both stores.
 
 A panel is registered with `panel_custom` at `/local-web-ui`. It is a plain web component
 with no build step.
-- **List view:** "Devices" (discovered, with device name and area) and "Sites" (static).
-  Actions: open, open in new tab, customize (pin), edit, device link on/off/follow global,
-  open device page, forget saved logins and data, hide/unhide.
+- **List view:** "Devices" (with device name and area) and "Sites" (manual), plus a
+  notice when discoveries wait to be added. Actions: open, open in new tab, settings (the
+  entry's page), device page, web UI device page, forget saved logins and data.
 - **View page:** a toolbar with back, title, a mode badge, reload and open in new tab,
   plus the iframe (with `sandbox` when isolated).
-- **Sidebar entries:** static views flagged "show in sidebar" get their own entry at
+- **Sidebar entries:** web UIs flagged "show in sidebar" get their own entry at
   `/local-web-ui-<view_id>`, using the same component in single-view mode.
 
 **Device page "Visit" link** (optional, on by default)
@@ -240,23 +253,21 @@ with no build step.
   `homeassistant://local-web-ui/<view_id>`, so the device page's "Visit" button opens the
   view here.
 - It is controlled at two levels:
-  - a **global switch** in the integration options, `link_device_pages`;
-  - a **per-device choice** (on, off, or follow the global switch) from the panel's menu,
-    stored in `.storage/local_web_ui`.
+  - a **global switch** in the hub options, `link_device_pages`;
+  - a **per web UI choice** in its options, `visit_link`: `default` (follow the global
+    switch), `here` or `device`.
 - The original URL is remembered for linked devices only. It is refreshed whenever the
   owning integration rewrites it (for example on ESPHome reconnect), and restored when
-  linking is turned off for that device, globally, when the view is hidden, or when the
-  integration is disabled or removed.
+  linking is turned off, when the web UI is disabled or removed, or when the last entry
+  is removed.
 
-**Linked devices** (optional, off by default)
-- For each device with a web UI, the integration keeps a device of its own named
-  "<name> web UI". It shares the device's connections (MAC address and so on), or its
-  identifiers when it has no connections, so HA 2026.9 shows it in the "Linked devices"
-  card of the device's page. Its "Visit" button opens the web UI here.
+**Linked devices**
+- Each device web UI entry owns a device named "<name> web UI". It shares the device's
+  connections (MAC address and so on), or its identifiers when it has no connections, so
+  HA 2026.9 shows it in the "Linked devices" card of the device's page. Its "Visit"
+  button opens the web UI here.
 - The device itself is not changed, so this works alongside, or instead of, the "Visit"
   link above.
-- Connections are unique within a config entry: when two views' devices share one, the
-  second linked device uses identifiers instead.
 
 **Standalone access.** Every view is reachable without the device page:
 - from the panel list;
@@ -269,12 +280,11 @@ with no build step.
 
 | command | purpose |
 |---|---|
-| `local_web_ui/views` | list the views, hidden ones flagged, plus the global options |
+| `local_web_ui/views` | list the views, the number of pending discoveries and the global options |
 | `local_web_ui/session {view_id, token?}` | create a session, or extend the caller's own; returns `{url, token, view, expires_in}` |
-| `local_web_ui/pin {view_id}` | turn a discovered view into a static subentry (`already_pinned` if the device has one) |
-| `local_web_ui/set_hidden {view_id, hidden}` | hide or unhide a discovered view |
-| `local_web_ui/set_device_link {device_id, enabled}` | per-device Visit link: `true`, `false`, or `null` to follow the global option |
 | `local_web_ui/clear_site_data {view_id}` | forget the caller's cookies and stored data for a view ("log out") |
+
+Adding, ignoring and editing web UIs go through HA's own config entry flows.
 
 ## Known limitations
 
@@ -285,7 +295,7 @@ with no build step.
 - `Storage.prototype.getItem.call(localStorage, k)` throws with the emulated storage.
 - Iframes a page creates with script (`about:blank`) get their own opaque origin.
 
-## Out of scope for v0.1 (designed for)
+## Out of scope (designed for)
 
 - A pluggable transport, for example the ESPHome native-API tunnel from variant 1.
 - Non-admin users with per-view allow lists.

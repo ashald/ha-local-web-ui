@@ -56,6 +56,8 @@ const STYLE = `
   .message { padding: 32px 16px; text-align: center; color: var(--secondary-text-color); line-height: 1.5; }
   .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin: 4px 0 8px; }
   .actions a.button { border: 1px solid var(--divider-color); color: var(--primary-color); }
+  a.notice { display: flex; gap: 8px; align-items: center; padding: 10px 14px; margin: 0 0 8px;
+             border-radius: 8px; background: rgba(3,169,244,.12); color: inherit; text-decoration: none; }
   .actions .hint { flex: 1; align-self: center; font-size: 13px; color: var(--secondary-text-color); }
   details summary { cursor: pointer; color: var(--secondary-text-color); margin: 24px 4px 8px; }
   code { background: rgba(127,127,127,.18); padding: 1px 4px; border-radius: 4px; }
@@ -63,6 +65,7 @@ const STYLE = `
 
 // For text and for quoted attribute values: names come from devices, not only admins
 const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const SETTINGS_PATH = "/config/integrations/integration/local_web_ui";
 const esc = (text) => String(text ?? "").replace(/[&<>"']/g, (c) => ESCAPES[c]);
 const icon = (name, fallback = "") =>
   customElements.get("ha-icon") ? `<ha-icon icon="${esc(name)}"></ha-icon>` : fallback;
@@ -161,34 +164,32 @@ class LocalWebUiPanel extends HTMLElement {
   _inner() { return this.shadowRoot.querySelector(".inner"); }
 
   _renderList() {
-    const { views, discovery } = this._views;
-    const visible = views.filter((v) => !v.hidden);
-    const devices = visible.filter((v) => v.device_id);
-    const sites = visible.filter((v) => !v.device_id);
-    const hidden = views.filter((v) => v.hidden);
+    const { views, discovery, discovered } = this._views;
+    const devices = views.filter((v) => v.device_id);
+    const sites = views.filter((v) => !v.device_id);
     const section = (title, list) =>
       list.length ? `<h2>${esc(title)}</h2>${list.map((v) => this._row(v)).join("")}` : "";
-    let html = `<div class="actions"><span class="hint">⋮ on a row: settings of that web UI.
-      Settings at the top: options for all of them, and web UIs you added.</span>
-      <a class="button" href="/config/integrations/integration/local_web_ui">
-      ${icon("mdi:plus", "+")} Add a web UI</a></div>`;
+    let html = `<div class="actions"><span class="hint">Each web UI is an entry of the integration:
+      its settings are behind ⋮ on its row.</span>
+      <a class="button" href="${SETTINGS_PATH}">${icon("mdi:plus", "+")} Add a web UI</a></div>`;
+    if (discovered) {
+      html += `<a class="notice" href="${SETTINGS_PATH}">${icon("mdi:magnify", "🔍")}
+        <span>${discovered === 1 ? "1 discovered web UI is" : `${discovered} discovered web UIs are`}
+        waiting to be added or ignored.</span></a>`;
+    }
     html += section("Devices", devices) + section("Sites", sites);
-    if (!visible.length) {
+    if (!views.length) {
       html += `<div class="message">No web UIs yet.<br>${
         discovery
-          ? "Devices whose integration links to a local web page (for example ESPHome with <code>web_server</code>) show up here automatically."
+          ? "Devices whose integration links to a local web page (for example ESPHome with <code>web_server</code>) are offered under Discovered, on the integration's page."
           : "Discovery is off in the integration options."
-      }<br>You can also add any local site by hand.</div>`;
-    }
-    if (hidden.length) {
-      html += `<details><summary>Hidden (${hidden.length})</summary>${hidden.map((v) => this._row(v)).join("")}</details>`;
+      }<br>You can also add any local site with "Add a web UI".</div>`;
     }
     this._inner().innerHTML = html;
     this._inner().querySelectorAll(".row").forEach((row) => {
       const view = views.find((v) => v.view_id === row.dataset.id);
       row.addEventListener("click", (ev) => {
         if (ev.target.closest("button, a")) return;
-        if (view.hidden) return;
         this._fromList = true;
         this._navigate(`${PANEL_PATH}/${view.view_id}`);
       });
@@ -201,12 +202,9 @@ class LocalWebUiPanel extends HTMLElement {
 
   _row(v) {
     const desc = [v.area, v.subtitle].filter(Boolean).join(" · ");
-    const chips = [
-      v.source === "discovered" ? `<span class="badge">Discovered</span>` : "",
-      v.mode === "trusted" ? `<span class="badge trusted">Trusted</span>` : "",
-    ].join("");
+    const chips = v.mode === "trusted" ? `<span class="badge trusted">Trusted</span>` : "";
     const glyph = v.icon || (v.device_id ? "mdi:devices" : "mdi:web");
-    return `<div class="row ${v.hidden ? "" : "clickable"}" data-id="${esc(v.view_id)}">
+    return `<div class="row clickable" data-id="${esc(v.view_id)}">
       ${icon(glyph)}
       <div class="text"><div class="name">${esc(v.name)}</div><div class="desc">${esc(desc)}</div></div>
       <div class="chips">${chips}</div>
@@ -216,21 +214,13 @@ class LocalWebUiPanel extends HTMLElement {
 
   _openMenu(row, view) {
     this._closePopups();
-    const items = [];
-    if (!view.hidden) items.push(["open-tab", "mdi:open-in-new", "Open in a new tab"]);
-    if (view.source === "discovered" && !view.hidden) items.push(["pin", "mdi:pin", "Customize (name, mode, login)…"]);
-    if (view.source === "static") items.push(["edit", "mdi:pencil", "Edit…"]);
-    if (view.device_link && !view.hidden) {
-      items.push(view.device_link.enabled
-        ? ["link-off", "mdi:link-off", "Device page's Visit button: open the device directly"]
-        : ["link-on", "mdi:link", "Device page's Visit button: open it here"]);
-      if (view.device_link.override !== null && view.device_link.override !== undefined) {
-        items.push(["link-default", "mdi:link-variant", "Device page's Visit button: follow the integration option"]);
-      }
-    }
+    const items = [
+      ["open-tab", "mdi:open-in-new", "Open in a new tab"],
+      ["settings", "mdi:cog", "Settings (mode, login, Visit button…)"],
+    ];
     if (view.device_id) items.push(["device", "mdi:devices", "Open device page"]);
-    if (!view.hidden) items.push(["forget", "mdi:cookie-remove", "Forget saved logins and data"]);
-    if (view.source === "discovered") items.push(view.hidden ? ["unhide", "mdi:eye", "Unhide"] : ["hide", "mdi:eye-off", "Hide"]);
+    if (view.linked_device_id) items.push(["linked", "mdi:link-variant", "Open web UI device page"]);
+    items.push(["forget", "mdi:cookie-remove", "Forget my saved logins and data"]);
     const popup = document.createElement("div");
     popup.className = "popup";
     popup.innerHTML = items.map(([act, ic, label]) => `<button data-act="${act}">${icon(ic)} ${esc(label)}</button>`).join("");
@@ -258,30 +248,16 @@ class LocalWebUiPanel extends HTMLElement {
         }
         return;
       }
-      if (act === "edit") return this._navigate("/config/integrations/integration/local_web_ui");
+      if (act === "settings") return this._navigate(`${SETTINGS_PATH}#config_entry=${view.entry_id}`);
       if (act === "device") return this._navigate(`/config/devices/device/${view.device_id}`);
-      if (act === "pin") {
-        await ws({ type: "local_web_ui/pin", view_id: view.view_id });
-        // The pinned web UI is edited on the integration's settings page
-        return this._navigate("/config/integrations/integration/local_web_ui");
-      }
+      if (act === "linked") return this._navigate(`/config/devices/device/${view.linked_device_id}`);
       if (act === "forget") {
         if (!confirm(`Forget the cookies and stored data ${view.name} keeps for you? You may have to log in to it again.`)) return;
         await ws({ type: "local_web_ui/clear_site_data", view_id: view.view_id });
-        return;
-      }
-      if (act === "hide" || act === "unhide") {
-        await ws({ type: "local_web_ui/set_hidden", view_id: view.view_id, hidden: act === "hide" });
-      }
-      if (act === "link-on" || act === "link-off" || act === "link-default") {
-        const enabled = act === "link-default" ? null : act === "link-on";
-        await ws({ type: "local_web_ui/set_device_link", device_id: view.device_id, enabled });
       }
     } catch (err) {
       alert(err.message || err);
     }
-    this._key = null;
-    this._update();
   }
 
   // ---- one view ------------------------------------------------------------

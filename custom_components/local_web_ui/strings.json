@@ -1,97 +1,102 @@
 {
   "config": {
+    "flow_title": "{name}",
     "step": {
-      "user": {
+      "hub": {
         "title": "Local Web UIs",
-        "description": "Open the web UIs of local devices and sites inside Home Assistant. Devices that link to a local web page (for example ESPHome with web_server) are discovered automatically; other sites can be added afterwards with \"Add web UI\"."
+        "description": "Open the web UIs of local devices and sites inside Home Assistant. This entry holds the options for all of them. Devices that link to a local web page (for example ESPHome with web_server) will be offered under Discovered; other sites are added with \"Add entry\"."
+      },
+      "web_ui": {
+        "title": "Add a web UI",
+        "description": "Any web page your Home Assistant server can reach: a device, a router, a printer, another server.",
+        "data": {
+          "name": "Name",
+          "url": "URL",
+          "mode": "Mode",
+          "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
+          "visit_link": "The device page's \"Visit\" button",
+          "verify_ssl": "Verify SSL certificate",
+          "username": "Username",
+          "password": "Password",
+          "show_in_sidebar": "Show in sidebar",
+          "icon": "Icon"
+        },
+        "data_description": {
+          "url": "The full address of the page, including http or https and the port if it is not the default.",
+          "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you, while its logins and storage still work. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
+          "trusted_acknowledged": "Required for trusted mode.",
+          "verify_ssl": "Turn off for devices with self-signed certificates.",
+          "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
+          "password": "Optional. When editing, leave empty to keep the stored password.",
+          "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
+        }
+      },
+      "discovery_confirm": {
+        "title": "Web UI of {name}",
+        "description": "Open the web UI of {name} ({url}) inside Home Assistant? {subtitle}"
       }
     },
+    "error": {
+      "name_required": "Enter a name.",
+      "invalid_url": "Enter an http:// or https:// URL with a host.",
+      "trusted_not_acknowledged": "Trusted mode needs your confirmation."
+    },
     "abort": {
-      "single_instance_allowed": "Local Web UIs is already set up."
+      "already_configured": "This web UI is already set up.",
+      "already_in_progress": "This is already being set up."
     }
   },
   "options": {
     "step": {
-      "init": {
+      "hub": {
         "title": "Local Web UIs options",
+        "description": "Options for all web UIs. Each web UI has settings of its own: the gear of its entry. The list of web UIs is at [Local Web UIs]({panel_url}).",
         "data": {
           "discovery": "Discover device web UIs",
-          "link_device_pages": "Open device \"Visit\" links here",
-          "linked_devices": "Add a \"web UI\" linked device",
+          "link_device_pages": "Open device \"Visit\" buttons here",
+          "show_panel": "Show the list of web UIs in the sidebar",
           "panel_title": "Sidebar name",
           "panel_icon": "Sidebar icon"
         },
         "data_description": {
-          "discovery": "List devices whose integration links to a local web page (their \"Visit\" link), such as ESPHome devices with web_server, WLED or printers.",
-          "link_device_pages": "Point the \"Visit\" button of devices with a web UI at their web UI here, so it also works away from home. To change it for one device, use ⋮ on its row in the Local Web UIs panel. Turning it off restores the original links.",
-          "linked_devices": "Next to each device with a web UI, add a device named after it with \"web UI\" appended. It appears in the \"Linked devices\" card of the device's page, and its \"Visit\" button opens the web UI here. The device itself is not changed.",
-          "panel_title": "Name of the Local Web UIs entry in the sidebar. Leave empty for \"Local Web UIs\".",
-          "panel_icon": "Icon of the Local Web UIs entry in the sidebar."
-        },
-        "description": "These settings apply to all web UIs. Settings of one web UI (hiding it, its device's \"Visit\" button, forgetting its saved logins) are in the [Local Web UIs panel]({panel_url}): open ⋮ on its row. Web UIs you add (\"Add web UI\") are edited here, on the integration page."
-      }
-    }
-  },
-  "config_subentries": {
-    "view": {
-      "entry_type": "Web UI",
-      "initiate_flow": {
-        "user": "Add web UI",
-        "reconfigure": "Edit web UI"
-      },
-      "step": {
-        "user": {
-          "title": "Add a web UI",
-          "description": "Any web page your Home Assistant server can reach: a device, a router, a printer, another server.",
-          "data": {
-            "name": "Name",
-            "url": "URL",
-            "mode": "Mode",
-            "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
-            "verify_ssl": "Verify SSL certificate",
-            "username": "Username",
-            "password": "Password",
-            "show_in_sidebar": "Show in sidebar",
-            "icon": "Icon"
-          },
-          "data_description": {
-            "url": "The full address of the page, including http or https and the port if it is not the default.",
-            "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
-            "trusted_acknowledged": "Required for trusted mode.",
-            "verify_ssl": "Turn off for devices with self-signed certificates.",
-            "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
-            "password": "Optional. When editing, leave empty to keep the stored password.",
-            "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
-          }
-        },
-        "reconfigure": {
-          "title": "Edit web UI",
-          "data": {
-            "name": "Name",
-            "url": "URL",
-            "mode": "Mode",
-            "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
-            "verify_ssl": "Verify SSL certificate",
-            "username": "Username",
-            "password": "Password",
-            "show_in_sidebar": "Show in sidebar",
-            "icon": "Icon"
-          },
-          "data_description": {
-            "mode": "Isolated (recommended) keeps the page away from Home Assistant. Trusted runs it with Home Assistant's own origin: its scripts get full administrator control of Home Assistant.",
-            "password": "Leave empty to keep the stored password."
-          }
+          "discovery": "Offer devices whose integration links to a local web page (their \"Visit\" button), such as ESPHome devices with web_server, WLED or printers. They appear under Discovered, where you add or ignore each.",
+          "link_device_pages": "The default for each web UI of a device: point the device's own \"Visit\" button at its web UI here, so it also works away from home. Each web UI can choose otherwise in its settings. Turning it off restores the original links.",
+          "show_panel": "The web UIs' own pages keep working when the list is hidden.",
+          "panel_title": "Leave empty for \"Local Web UIs\".",
+          "panel_icon": "Icon of the list in the sidebar."
         }
       },
-      "error": {
-        "name_required": "Enter a name.",
-        "invalid_url": "Enter an http:// or https:// URL with a host.",
-        "trusted_not_acknowledged": "Trusted mode needs your confirmation."
-      },
-      "abort": {
-        "reconfigure_successful": "Web UI updated.",
-        "already_configured": "This device already has a configured web UI."
+      "web_ui": {
+        "title": "Web UI settings",
+        "description": "[Open this web UI]({panel_url})",
+        "data": {
+          "name": "Name",
+          "url": "URL",
+          "mode": "Mode",
+          "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
+          "visit_link": "The device page's \"Visit\" button",
+          "verify_ssl": "Verify SSL certificate",
+          "username": "Username",
+          "password": "Password",
+          "show_in_sidebar": "Show in sidebar",
+          "icon": "Icon"
+        },
+        "data_description": {
+          "url": "The full address of the page, including http or https and the port if it is not the default.",
+          "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you, while its logins and storage still work. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
+          "trusted_acknowledged": "Required for trusted mode.",
+          "visit_link": "Open this web UI from the device's own \"Visit\" button, or leave that button pointing at the device. The web UI's own device (in this entry) always opens it here.",
+          "verify_ssl": "Turn off for devices with self-signed certificates.",
+          "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
+          "password": "Optional. When editing, leave empty to keep the stored password.",
+          "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
+        }
       }
+    },
+    "error": {
+      "name_required": "Enter a name.",
+      "invalid_url": "Enter an http:// or https:// URL with a host.",
+      "trusted_not_acknowledged": "Trusted mode needs your confirmation."
     }
   },
   "selector": {
@@ -99,6 +104,13 @@
       "options": {
         "isolated": "Isolated (recommended)",
         "trusted": "Trusted"
+      }
+    },
+    "visit_link": {
+      "options": {
+        "default": "As set in the Local Web UIs options",
+        "here": "Open the web UI here",
+        "device": "Open the device directly"
       }
     }
   }

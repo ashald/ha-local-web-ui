@@ -52,8 +52,8 @@ await page.waitForFunction(() => document.querySelector("home-assistant")?.hass?
 let { views } = await ws(page, { type: "local_web_ui/views" });
 const porch = views.find((v) => v.name === "Porch Light");
 const router = views.find((v) => v.name === "Router");
-check("Porch Light discovered from ESPHome", porch?.source === "discovered", porch?.url);
-check("Router added by hand", router?.source === "static", router?.url);
+check("Porch Light added from discovery (ESPHome)", porch?.source === "device", porch?.url);
+check("Router added by URL", router?.source === "manual", router?.url);
 await page.waitForTimeout(1500);
 await page.screenshot({ path: `${outDir}/1-list.png` });
 
@@ -143,28 +143,26 @@ check("Standalone tab: logged in, still isolated", tabState.origin === "null", J
 await tab.screenshot({ path: `${outDir}/5-router-standalone.png` });
 await tab.close();
 
-// 4) Per-device link switch: off restores the original Visit URL, on re-links
-const deviceUrl = async () => (await ws(page, { type: "config/device_registry/list" })).find((d) => d.id === porch.device_id).configuration_url;
-await ws(page, { type: "local_web_ui/set_device_link", device_id: porch.device_id, enabled: false });
-const restored = await deviceUrl();
-check("Link switch off restores the original Visit URL", restored.replace(/\/$/, "") === porch.url.replace(/\/$/, ""), restored);
-await ws(page, { type: "local_web_ui/set_device_link", device_id: porch.device_id, enabled: true });
-const relinked = await deviceUrl();
-check("Link switch on points Visit back at the view", relinked === `homeassistant://local-web-ui/${porch.view_id}`, relinked);
-
-// 5) Optional "<device> web UI" linked device on the device page
+// 4) The web UI's own settings (its entry's options): the device's Visit button
 const api = async (path, body) => (await fetch(`${HA}${path}`, {
   method: "POST",
   headers: { Authorization: `Bearer ${hassTokens.access_token}`, "Content-Type": "application/json" },
   body: JSON.stringify(body),
 })).json();
-const setOptions = async (changes) => {
-  const entry = (await ws(page, { type: "config_entries/get", domain: "local_web_ui" }))[0];
-  const flow = await api("/api/config/config_entries/options/flow", { handler: entry.entry_id });
+const setOptions = async (entryId, changes) => {
+  const flow = await api("/api/config/config_entries/options/flow", { handler: entryId });
   const current = Object.fromEntries(flow.data_schema.map((f) => [f.name, f.default]));
   return api(`/api/config/config_entries/options/flow/${flow.flow_id}`, { ...current, ...changes });
 };
-await setOptions({ linked_devices: true });
+const deviceUrl = async () => (await ws(page, { type: "config/device_registry/list" })).find((d) => d.id === porch.device_id).configuration_url;
+await setOptions(porch.entry_id, { visit_link: "device" });
+const restored = await deviceUrl();
+check("Visit button set to the device restores the original URL", restored.replace(/\/$/, "") === porch.url.replace(/\/$/, ""), restored);
+await setOptions(porch.entry_id, { visit_link: "default" });
+const relinked = await deviceUrl();
+check("Visit button back to the default points at the web UI", relinked === `homeassistant://local-web-ui/${porch.view_id}`, relinked);
+
+// 5) The entry's own "<name> web UI" device, in the device page's Linked devices card
 await page.goto(`${HA}/config/devices/device/${porch.device_id}`);
 await page.waitForTimeout(3000);
 const linkedCard = await page.evaluate(() => {
@@ -178,7 +176,11 @@ const linkedCard = await page.evaluate(() => {
 });
 check("Linked devices card shows the Porch Light web UI device", linkedCard);
 await page.screenshot({ path: `${outDir}/7-linked-device.png` });
-await setOptions({ linked_devices: false });
+
+// The integration page: one entry per web UI, each with its device
+await page.goto(`${HA}/config/integrations/integration/local_web_ui`);
+await page.waitForTimeout(3000);
+await page.screenshot({ path: `${outDir}/8-integration-page.png` });
 
 // 6) Phone width list
 const phone = await newPage({ width: 390, height: 844 });

@@ -15,31 +15,34 @@ You don't need to open ports or change any firmware.
 
 ## Features
 
+- **One entry per web UI.** Each web UI is an entry of the integration, like the areas of
+  Adaptive Lighting or the servers of Matter. Its settings (name, URL, mode, login, icon,
+  sidebar entry, Visit link) are under the entry's **Configure** button. A separate
+  *Local Web UIs* entry holds the global settings.
 - **Discovery.** Devices whose integration links to a local web page (the device page's
-  **Visit** button) appear automatically under the device's name. That covers ESPHome
-  devices with `web_server`, WLED, many printers and routers.
+  **Visit** button) are offered under *Discovered* on the integrations page, like any other
+  discovered device. That covers ESPHome devices with `web_server`, WLED, many printers and
+  routers. Choose **Add** to get a web UI for it, or **Ignore** to stop seeing it.
+  Discovery can be switched off in the global settings.
 - **Your own sites.** Add any page your Home Assistant server can reach under
-  *Settings → Devices & services → Local Web UIs → Add web UI*. For each one you can set:
+  *Settings → Devices & services → Local Web UIs → Add entry*. For each one you can set:
   - a name, URL and icon;
   - a stored login, sent as HTTP Basic auth so you are never prompted;
   - whether to verify the SSL certificate;
   - its own sidebar entry.
-- **Customize discovered devices.** Use ⋮ → *Customize* to rename a discovered UI or change
-  its mode or login.
-- **Device page "Visit" links (optional, on by default).** The **Visit** button of
-  discovered devices opens their web UI here instead of the LAN address, which fails away
-  from home. You can switch this globally in the integration options, and per device from
-  the panel (on, off, or follow the global setting). The original links are restored when
-  you switch it off or remove the integration.
-- **Linked devices (optional, off by default).** Instead of, or as well as, changing the
-  Visit button, Local Web UIs can add a "*device* web UI" device next to each device. Home
+- **Linked devices.** Each device web UI has a device of its own, "*device* web UI". Home
   Assistant shows it in the **Linked devices** card of the device's page, and its Visit
   button opens the web UI here. The device itself is left alone.
+- **Device page "Visit" links (optional, on by default).** The **Visit** button of the
+  device itself can open its web UI here instead of the LAN address, which fails away from
+  home. Switch it globally in the global settings, and per web UI in its settings (follow
+  the global setting, always here, or always the device's address). The original links are
+  restored when you switch it off or remove the web UI.
 - **Standalone pages.** Every web UI has its own address (`/local-web-ui/<id>`), an optional
   sidebar entry, and *open in a new tab* for a full-page view. A web UI opened from a device
   page has buttons back to that device page (and to its linked device).
-- **Your sidebar.** The name and icon of the Local Web UIs entry can be changed in the
-  integration's options.
+- **Your sidebar.** The name and icon of the Local Web UIs entry can be changed, or the
+  entry hidden, in the global settings.
 - **Isolated by default.** See the next section.
 
 ## Isolated and trusted
@@ -75,8 +78,13 @@ Requires Home Assistant 2026.9 or newer.
 1. In HACS: ⋮ → *Custom repositories* → add `https://github.com/ashald/ha-local-web-ui` with
    type *Integration*.
 2. Install **Local Web UIs** and restart Home Assistant.
-3. *Settings → Devices & services → Add integration → Local Web UIs.*
-4. Open **Local Web UIs** in the sidebar. It is visible to admin users only.
+3. *Settings → Devices & services → Add integration → Local Web UIs.* This creates the
+   entry for the global settings; add it again for each site of your own.
+4. Add the discovered devices you want from *Discovered* on the integrations page.
+5. Open **Local Web UIs** in the sidebar. It is visible to admin users only.
+
+**Upgrading from 0.2.** Your web UIs move to entries of their own on the first start, with
+their settings, logins and saved site data. Hidden devices become ignored discoveries.
 
 ## How it works
 
@@ -111,7 +119,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the details.
   not load. The same goes for a page that builds URLs from `location.origin` while isolated,
   because an isolated page's origin is `null`. Trusted mode usually fixes the second case.
 - **No browser login prompts.** For HTTP Basic auth, store the login in the web UI's
-  settings (*Customize* for a discovered device). The browser's own prompt is not used,
+  settings (its entry's *Configure* button). The browser's own prompt is not used,
   and credentials the browser holds are never sent to devices. HTTP Digest auth is not
   supported.
 - **Home Assistant's request filter.** Home Assistant rejects URLs that look like attacks

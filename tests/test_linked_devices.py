@@ -1,11 +1,12 @@
-"""The optional "<device> web UI" linked devices."""
+"""The "<title> web UI" device every web UI entry owns."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.config_entries import ConfigSubentryData
+from homeassistant.config_entries import SOURCE_INTEGRATION_DISCOVERY, ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
 import pytest
@@ -15,17 +16,26 @@ from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 from custom_components.local_web_ui.const import (
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
+    CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
-    CONF_LINKED_DEVICES,
     CONF_MODE,
+    CONF_SHOW_IN_SIDEBAR,
+    CONF_SHOW_PANEL,
+    CONF_TRUSTED_ACK,
     CONF_URL,
+    CONF_VERIFY_SSL,
     DEVICE_LINK_PREFIX,
     DOMAIN,
+    HUB_UNIQUE_ID,
+    KIND_HUB,
+    KIND_VIEW,
     MODE_ISOLATED,
-    SUBENTRY_TYPE_VIEW,
 )
+from custom_components.local_web_ui.hub import device_unique_id
 
 MAC = "aa:bb:cc:dd:ee:ff"
+OWNER_DOMAIN = "fake_devices"
+PORCH_URL = "http://192.168.1.50/"
 
 
 @pytest.fixture
@@ -34,50 +44,82 @@ async def setup(hass: HomeAssistant) -> None:
     assert await async_setup_component(hass, "config", {})
 
 
-async def _load(
-    hass: HomeAssistant,
-    linked: bool,
-    subentries: list[ConfigSubentryData] | None = None,
-    link_pages: bool = False,
-) -> MockConfigEntry:
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        options={
-            CONF_DISCOVERY: True,
-            CONF_LINK_DEVICE_PAGES: link_pages,
-            CONF_LINKED_DEVICES: linked,
-        },
-        subentries_data=subentries,
-    )
+@pytest.fixture
+def owner(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(domain=OWNER_DOMAIN)
     entry.add_to_hass(hass)
-    assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
     return entry
 
 
 def _owner_device(
-    hass: HomeAssistant, connections: set[tuple[str, str]] | None = None
+    hass: HomeAssistant,
+    owner: MockConfigEntry,
+    connections: set[tuple[str, str]] | None = None,
+    key: str = "porch",
+    url: str = PORCH_URL,
 ) -> dr.DeviceEntry:
-    owner = MockConfigEntry(domain="fake_devices")
-    owner.add_to_hass(hass)
     return dr.async_get(hass).async_get_or_create(
         config_entry_id=owner.entry_id,
-        identifiers={("fake_devices", "porch")},
+        identifiers={(OWNER_DOMAIN, key)},
         connections={(dr.CONNECTION_NETWORK_MAC, MAC)} if connections is None else connections,
         name="Porch Light",
-        configuration_url="http://192.168.1.50/",
+        configuration_url=url,
     )
 
 
-def _pinned(
-    device_id: str, url: str = "http://192.168.1.50/admin", title: str = "Porch admin"
-) -> ConfigSubentryData:
-    """A web UI added by hand for a device (as the panel's "pin" does)."""
-    return ConfigSubentryData(
-        data={CONF_URL: url, CONF_MODE: MODE_ISOLATED, CONF_DEVICE_ID: device_id},
-        subentry_type=SUBENTRY_TYPE_VIEW,
-        title=title,
-        unique_id=f"device:{device_id}",
+async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> MockConfigEntry:
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    return entry
+
+
+def _hub_entry(**options: Any) -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        title="Local Web UIs",
+        unique_id=HUB_UNIQUE_ID,
+        data={CONF_KIND: KIND_HUB},
+        options={
+            CONF_DISCOVERY: False,
+            CONF_LINK_DEVICE_PAGES: True,
+            CONF_SHOW_PANEL: True,
+            **options,
+        },
+    )
+
+
+async def _device_web_ui(
+    hass: HomeAssistant, device: dr.DeviceEntry, title: str = "Porch Light"
+) -> MockConfigEntry:
+    return await _setup(
+        hass,
+        MockConfigEntry(
+            domain=DOMAIN,
+            version=2,
+            title=title,
+            unique_id=device_unique_id(device.id),
+            source=SOURCE_INTEGRATION_DISCOVERY,
+            data={CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: device.id},
+            options={CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: False},
+        ),
+    )
+
+
+async def _manual_web_ui(
+    hass: HomeAssistant, title: str = "NAS", url: str = "http://nas.lan:5000/"
+) -> MockConfigEntry:
+    return await _setup(
+        hass,
+        MockConfigEntry(
+            domain=DOMAIN,
+            version=2,
+            title=title,
+            data={CONF_KIND: KIND_VIEW},
+            options={CONF_URL: url, CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: True},
+        ),
     )
 
 
@@ -85,77 +127,12 @@ def _ours(hass: HomeAssistant, entry: MockConfigEntry) -> list[dr.DeviceEntry]:
     return dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
 
 
-@pytest.mark.usefixtures("setup")
-async def test_linked_device_shares_connections(
-    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
-) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True)
-
-    [linked] = _ours(hass, entry)
-    view_id = f"d_{device.id}"
-    assert linked.name == "Porch Light web UI"
-    assert linked.configuration_url == f"{DEVICE_LINK_PREFIX}{view_id}"
-    assert linked.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
-    assert linked.identifiers == {(DOMAIN, view_id)}
-    assert linked.entry_type is dr.DeviceEntryType.SERVICE
-    # The device itself is left alone
-    device = dr.async_get(hass).async_get(device.id)
-    assert device.configuration_url == "http://192.168.1.50/"
-    assert device.config_entry_id != entry.entry_id
-
-    # Home Assistant shows it in the device page's "Linked devices" card
-    client = await hass_ws_client(hass)
-    await client.send_json_auto_id(
-        {"type": "config/device_registry/list_linked_devices", "device_id": device.id}
-    )
-    result = await client.receive_json()
-    assert result["success"], result
-    assert result["result"]["linked_devices"] == [linked.id]
-
-
-@pytest.mark.usefixtures("setup")
-async def test_linked_device_without_connections_uses_identifiers(hass: HomeAssistant) -> None:
-    device = _owner_device(hass, connections=set())
-    entry = await _load(hass, linked=True)
-
-    [linked] = _ours(hass, entry)
-    assert linked.identifiers == {(DOMAIN, f"d_{device.id}"), ("fake_devices", "porch")}
-    assert linked.connections == set()
-
-
-@pytest.mark.usefixtures("setup")
-async def test_linked_devices_follow_the_option_and_the_device(hass: HomeAssistant) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=False)
-    assert _ours(hass, entry) == []
-
-    hass.config_entries.async_update_entry(
-        entry, options={**entry.options, CONF_LINKED_DEVICES: True}
-    )
-    await hass.async_block_till_done()
-    assert len(_ours(hass, entry)) == 1
-
-    # Renamed with the device
-    dr.async_get(hass).async_update_device(device.id, name_by_user="Front Porch")
-    await hass.async_block_till_done()
-    [linked] = _ours(hass, entry)
-    assert linked.name == "Front Porch web UI"
-
-    # Gone with the device's web UI
-    dr.async_get(hass).async_update_device(device.id, configuration_url=None)
-    await hass.async_block_till_done()
-    assert _ours(hass, entry) == []
-
-    dr.async_get(hass).async_update_device(device.id, configuration_url="http://192.168.1.50/")
-    await hass.async_block_till_done()
-    assert len(_ours(hass, entry)) == 1
-
-    hass.config_entries.async_update_entry(
-        entry, options={**entry.options, CONF_LINKED_DEVICES: False}
-    )
-    await hass.async_block_till_done()
-    assert _ours(hass, entry) == []
+def _all_ours(hass: HomeAssistant) -> list[dr.DeviceEntry]:
+    return [
+        device
+        for device in dr.async_get(hass).devices
+        if any(domain == DOMAIN for domain, _ in device.identifiers)
+    ]
 
 
 async def _list_linked(client: Any, device_id: str) -> list[str]:
@@ -168,89 +145,152 @@ async def _list_linked(client: Any, device_id: str) -> list[str]:
 
 
 @pytest.mark.usefixtures("setup")
-async def test_hidden_views_get_no_linked_device(hass: HomeAssistant) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True)
-    hub = entry.runtime_data
-    assert len(_ours(hass, entry)) == 1
-
-    hub.async_set_hidden(f"d_{device.id}", True)
-    assert _ours(hass, entry) == []
-
-    hub.async_set_hidden(f"d_{device.id}", False)
-    [linked] = _ours(hass, entry)
-    assert linked.identifiers == {(DOMAIN, f"d_{device.id}")}
-
-
-@pytest.mark.usefixtures("setup")
-async def test_disabled_target_gets_no_linked_device(hass: HomeAssistant) -> None:
-    registry = dr.async_get(hass)
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True)
-    assert len(_ours(hass, entry)) == 1
-
-    registry.async_update_device(device.id, disabled_by=dr.DeviceEntryDisabler.USER)
-    await hass.async_block_till_done()
-    assert _ours(hass, entry) == []
-
-    registry.async_update_device(device.id, disabled_by=None)
-    await hass.async_block_till_done()
-    assert len(_ours(hass, entry)) == 1
-
-
-@pytest.mark.usefixtures("setup")
-async def test_disabled_target_of_pinned_view_gets_no_linked_device(hass: HomeAssistant) -> None:
-    """A web UI added by hand for a device stays, but its linked device goes."""
-    registry = dr.async_get(hass)
-    device = _owner_device(hass)
-    registry.async_update_device(device.id, disabled_by=dr.DeviceEntryDisabler.USER)
-    entry = await _load(hass, linked=True, subentries=[_pinned(device.id)])
-    [view] = entry.runtime_data.static_views.values()
-    assert entry.runtime_data.get_view(view.view_id) is not None
-    assert _ours(hass, entry) == []
-
-    registry.async_update_device(device.id, disabled_by=None)
-    await hass.async_block_till_done()
-    [linked] = _ours(hass, entry)
-    assert linked.identifiers == {(DOMAIN, view.view_id)}
-
-
-@pytest.mark.usefixtures("setup")
-async def test_pinned_view_gets_linked_device_named_after_it(
-    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+async def test_web_ui_device_shares_the_target_connections(
+    hass: HomeAssistant, owner: MockConfigEntry, hass_ws_client: WebSocketGenerator
 ) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True, subentries=[_pinned(device.id)])
-    [view] = entry.runtime_data.static_views.values()
+    device = _owner_device(hass, owner)
+    await _setup(hass, _hub_entry())
+    entry = await _device_web_ui(hass, device)
 
-    [linked] = _ours(hass, entry)
-    assert linked.name == "Porch admin web UI"
-    assert linked.identifiers == {(DOMAIN, view.view_id)}
-    assert linked.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
-    assert linked.configuration_url == f"{DEVICE_LINK_PREFIX}{view.view_id}"
-    assert linked.manufacturer == "Local Web UIs"
-    assert linked.model == "Web UI"
-    # No second one for the device's discovered web UI
-    assert entry.runtime_data.discovered_views(include_hidden=True) == {}
+    [ours] = _ours(hass, entry)
+    assert ours.name == "Porch Light web UI"
+    assert ours.identifiers == {(DOMAIN, entry.entry_id)}
+    assert ours.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
+    assert ours.entry_type is dr.DeviceEntryType.SERVICE
+    assert ours.manufacturer == "Local Web UIs"
+    assert ours.model == "Web UI"
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+    assert ours.id != device.id
+    assert entry.runtime_data.linked_device_id(entry.entry_id) == ours.id
 
     client = await hass_ws_client(hass)
-    assert await _list_linked(client, device.id) == [linked.id]
-
-    # Renaming the web UI renames its linked device, in place
-    hass.config_entries.async_update_subentry(entry, entry.subentries[view.view_id], title="Porch")
-    await hass.async_block_till_done()
-    [renamed] = _ours(hass, entry)
-    assert renamed.id == linked.id
-    assert renamed.name == "Porch web UI"
+    assert await _list_linked(client, device.id) == [ours.id]
 
 
 @pytest.mark.usefixtures("setup")
-async def test_targets_sharing_a_mac_get_separate_linked_devices(
-    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+async def test_web_ui_device_without_connections_uses_identifiers(
+    hass: HomeAssistant, owner: MockConfigEntry, hass_ws_client: WebSocketGenerator
 ) -> None:
-    """One physical device, two integrations, two web UIs: two linked devices."""
+    device = _owner_device(hass, owner, connections=set())
+    entry = await _device_web_ui(hass, device)
+
+    [ours] = _ours(hass, entry)
+    assert ours.connections == set()
+    assert ours.identifiers == {(DOMAIN, entry.entry_id), (OWNER_DOMAIN, "porch")}
+
+    client = await hass_ws_client(hass)
+    assert await _list_linked(client, device.id) == [ours.id]
+
+
+@pytest.mark.usefixtures("setup")
+async def test_web_ui_device_follows_the_target(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    """Its connections follow the target's; one device per entry all along."""
     registry = dr.async_get(hass)
-    first = _owner_device(hass)
+    device = _owner_device(hass, owner, connections=set())
+    entry = await _device_web_ui(hass, device)
+
+    registry.async_update_device(device.id, new_connections={(dr.CONNECTION_NETWORK_MAC, MAC)})
+    await hass.async_block_till_done()
+    [ours] = _ours(hass, entry)
+    assert ours.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
+    assert ours.identifiers == {(DOMAIN, entry.entry_id)}
+
+    # Target gone: the entry stays, with a device of its own
+    registry.async_remove_device(device.id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    [ours] = _ours(hass, entry)
+    assert ours.connections == set()
+    assert ours.identifiers == {(DOMAIN, entry.entry_id)}
+    assert ours.name == "Porch Light web UI"
+
+
+@pytest.mark.usefixtures("setup")
+async def test_disabled_target_keeps_the_web_ui_device(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    registry = dr.async_get(hass)
+    device = _owner_device(hass, owner)
+    entry = await _device_web_ui(hass, device)
+    [ours] = _ours(hass, entry)
+
+    registry.async_update_device(device.id, disabled_by=dr.DeviceEntryDisabler.USER)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.get_view(entry.entry_id) is None
+    assert [d.id for d in _ours(hass, entry)] == [ours.id]
+
+    registry.async_update_device(device.id, disabled_by=None)
+    await hass.async_block_till_done()
+    assert [d.id for d in _ours(hass, entry)] == [ours.id]
+
+
+@pytest.mark.usefixtures("setup")
+async def test_web_ui_device_is_renamed_with_the_entry(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    device = _owner_device(hass, owner)
+    entry = await _device_web_ui(hass, device)
+    [ours] = _ours(hass, entry)
+
+    hass.config_entries.async_update_entry(entry, title="Porch")
+    await hass.async_block_till_done()
+    [renamed] = _ours(hass, entry)
+    assert renamed.id == ours.id
+    assert renamed.name == "Porch web UI"
+    assert entry.runtime_data.get_view(entry.entry_id).name == "Porch"
+
+    # A web UI added by URL is renamed in its options
+    manual = await _manual_web_ui(hass)
+    [nas] = _ours(hass, manual)
+    assert nas.name == "NAS web UI"
+    result = await hass.config_entries.options.async_init(manual.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            "name": "Storage",
+            CONF_URL: "http://nas.lan:5000/",
+            CONF_MODE: MODE_ISOLATED,
+            CONF_TRUSTED_ACK: False,
+            CONF_VERIFY_SSL: True,
+            CONF_SHOW_IN_SIDEBAR: False,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert manual.title == "Storage"
+    [renamed] = _ours(hass, manual)
+    assert renamed.id == nas.id
+    assert renamed.name == "Storage web UI"
+
+
+@pytest.mark.usefixtures("setup")
+async def test_manual_web_ui_gets_a_standalone_device(
+    hass: HomeAssistant, owner: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    # A device at the same address is not its target
+    device = _owner_device(hass, owner, url="http://nas.lan:5000/")
+    entry = await _manual_web_ui(hass)
+
+    [ours] = _ours(hass, entry)
+    assert ours.name == "NAS web UI"
+    assert ours.identifiers == {(DOMAIN, entry.entry_id)}
+    assert ours.connections == set()
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+    assert ours.entry_type is dr.DeviceEntryType.SERVICE
+
+    client = await hass_ws_client(hass)
+    assert await _list_linked(client, device.id) == []
+
+
+@pytest.mark.usefixtures("setup")
+async def test_targets_sharing_a_mac_get_separate_web_ui_devices(
+    hass: HomeAssistant, owner: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    """One physical device, two integrations, two web UIs: two devices of ours."""
+    registry = dr.async_get(hass)
+    first = _owner_device(hass, owner)
     other = MockConfigEntry(domain="other_devices")
     other.add_to_hass(hass)
     second = registry.async_get_or_create(
@@ -261,73 +301,102 @@ async def test_targets_sharing_a_mac_get_separate_linked_devices(
         configuration_url="http://192.168.1.50:8080/",
     )
     assert first.id != second.id
-    entry = await _load(hass, linked=True)
+    first_entry = await _device_web_ui(hass, first)
+    second_entry = await _device_web_ui(hass, second, title="Porch Light (other)")
 
-    linked = {
-        next(i for d, i in device.identifiers if d == DOMAIN): device
-        for device in _ours(hass, entry)
-    }
-    assert set(linked) == {f"d_{first.id}", f"d_{second.id}"}
-    first_linked = linked[f"d_{first.id}"]
-    second_linked = linked[f"d_{second.id}"]
-    assert first_linked.id != second_linked.id
-    assert first_linked.name == "Porch Light web UI"
-    assert second_linked.name == "Porch Light (other) web UI"
-    # The first one takes the shared connection; the second is matched by identifiers
-    assert first_linked.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
-    assert second_linked.connections == set()
-    assert second_linked.identifiers == {
-        (DOMAIN, f"d_{second.id}"),
-        ("other_devices", "porch"),
-    }
+    [first_ours] = _ours(hass, first_entry)
+    [second_ours] = _ours(hass, second_entry)
+    assert first_ours.id != second_ours.id
+    assert first_ours.name == "Porch Light web UI"
+    assert second_ours.name == "Porch Light (other) web UI"
 
     client = await hass_ws_client(hass)
-    assert first_linked.id in await _list_linked(client, first.id)
-    assert second_linked.id in await _list_linked(client, second.id)
+    assert first_ours.id in await _list_linked(client, first.id)
+    assert second_ours.id in await _list_linked(client, second.id)
 
-    # Stable across re-syncs: nothing is removed and created again
-    entry.runtime_data.async_update_config()
-    assert {device.id for device in _ours(hass, entry)} == {first_linked.id, second_linked.id}
+    # Stable across refreshes: nothing is removed and created again
+    first_entry.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert {device.id for device in _all_ours(hass)} == {first_ours.id, second_ours.id}
 
 
 @pytest.mark.usefixtures("setup")
-async def test_removing_the_entry_leaves_no_linked_devices(hass: HomeAssistant) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True, subentries=[_pinned(device.id, url="http://nas.lan/")])
-    assert len(_ours(hass, entry)) == 1
+async def test_deleting_the_entry_removes_its_device(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    registry = dr.async_get(hass)
+    device = _owner_device(hass, owner)
+    await _setup(hass, _hub_entry())
+    entry = await _device_web_ui(hass, device)
+    manual = await _manual_web_ui(hass)
+    assert len(_all_ours(hass)) == 2
 
     await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
-
-    registry = dr.async_get(hass)
     assert _ours(hass, entry) == []
-    assert not [d for d in registry.devices if any(domain == DOMAIN for domain, _ in d.identifiers)]
+    assert [d.name for d in _all_ours(hass)] == ["NAS web UI"]
     # The target is still there, with its own URL
-    assert registry.async_get(device.id).configuration_url == "http://192.168.1.50/"
+    assert registry.async_get(device.id).configuration_url == PORCH_URL
+
+    await hass.config_entries.async_remove(manual.entry_id)
+    await hass.async_block_till_done()
+    assert _all_ours(hass) == []
 
 
 @pytest.mark.usefixtures("setup")
-async def test_linked_devices_are_never_visit_linked(hass: HomeAssistant) -> None:
-    device = _owner_device(hass)
-    entry = await _load(hass, linked=True, link_pages=True)
-    hub = entry.runtime_data
-    view_id = f"d_{device.id}"
-
-    [linked] = _ours(hass, entry)
+async def test_hub_owns_no_devices(hass: HomeAssistant, owner: MockConfigEntry) -> None:
+    """The hub has no device; linked devices it kept before 0.3 are removed."""
     registry = dr.async_get(hass)
-    # The target's page is linked; the linked device's own link is its view, untouched
-    assert registry.async_get(device.id).configuration_url == f"{DEVICE_LINK_PREFIX}{view_id}"
-    assert linked.configuration_url == f"{DEVICE_LINK_PREFIX}{view_id}"
-    assert set(hub.originals) == {device.id}
-    assert hub.view_for_device(linked.id) is None
-    assert set(hub.discovered_views(include_hidden=True)) == {view_id}
-
-    # Even after re-syncs and changes to it
-    hub.async_sync_device_links()
-    hub.async_set_device_link(linked.id, True)
-    registry.async_update_device(linked.id, name_by_user="Porch page")
+    device = _owner_device(hass, owner)
+    hub_entry = _hub_entry()
+    hub_entry.add_to_hass(hass)
+    old = registry.async_get_or_create(
+        config_entry_id=hub_entry.entry_id,
+        identifiers={(DOMAIN, f"d_{device.id}")},
+        connections={(dr.CONNECTION_NETWORK_MAC, MAC)},
+        name="Porch Light web UI",
+    )
+    assert await hass.config_entries.async_setup(hub_entry.entry_id)
     await hass.async_block_till_done()
-    linked = registry.async_get(linked.id)
-    assert linked.configuration_url == f"{DEVICE_LINK_PREFIX}{view_id}"
-    assert linked.id not in hub.originals
-    assert set(hub.discovered_views(include_hidden=True)) == {view_id}
+
+    assert registry.async_get(old.id) is None
+    assert _ours(hass, hub_entry) == []
+
+    entry = await _device_web_ui(hass, device)
+    await _manual_web_ui(hass)
+    assert _ours(hass, hub_entry) == []
+    assert {d.name for d in _all_ours(hass)} == {"Porch Light web UI", "NAS web UI"}
+    assert len(_ours(hass, entry)) == 1
+
+
+@pytest.mark.usefixtures("setup")
+async def test_web_ui_devices_are_never_visit_linked(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    registry = dr.async_get(hass)
+    device = _owner_device(hass, owner)
+    entry = await _device_web_ui(hass, device)
+    hub_entry = await _setup(hass, _hub_entry(**{CONF_DISCOVERY: True}))
+    hub = entry.runtime_data
+    link = f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+
+    [ours] = _ours(hass, entry)
+    # The target's page is linked; our device's own link is the web UI, untouched
+    assert registry.async_get(device.id).configuration_url == link
+    assert ours.configuration_url == link
+    assert set(hub.originals) == {device.id}
+    assert hub.view_for_device(ours.id) is None
+
+    # Even after refreshes and changes to it
+    registry.async_update_device(ours.id, name_by_user="Porch page")
+    hass.config_entries.async_update_entry(
+        hub_entry, options={**hub_entry.options, CONF_LINK_DEVICE_PAGES: False}
+    )
+    await hass.async_block_till_done()
+    assert registry.async_get(device.id).configuration_url == PORCH_URL
+    ours = registry.async_get(ours.id)
+    assert ours.configuration_url == link
+    assert ours.name_by_user == "Porch page"
+    assert hub.originals == {}
+    assert set(hub.views) == {entry.entry_id}
+    assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []

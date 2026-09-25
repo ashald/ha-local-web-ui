@@ -25,7 +25,11 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.test_utils import TestClient, TestServer
 from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_USER
 from homeassistant.auth.models import RefreshToken
-from homeassistant.config_entries import ConfigEntryState, ConfigSubentry
+from homeassistant.config_entries import (
+    SOURCE_INTEGRATION_DISCOVERY,
+    ConfigEntryDisabler,
+    ConfigEntryState,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client, device_registry as dr
 from homeassistant.setup import async_setup_component
@@ -39,9 +43,15 @@ from pytest_homeassistant_custom_component.typing import (
 )
 from yarl import URL
 
-from custom_components.local_web_ui import hub as hub_module, proxy as proxy_module
+from custom_components.local_web_ui import (
+    discovery as discovery_module,
+    hub as hub_module,
+    proxy as proxy_module,
+)
 from custom_components.local_web_ui.const import (
+    CONF_DEVICE_ID,
     CONF_DISCOVERY,
+    CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_MODE,
     CONF_PASSWORD,
@@ -50,8 +60,9 @@ from custom_components.local_web_ui.const import (
     CONF_URL,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
-    DISCOVERED_PREFIX,
     DOMAIN,
+    KIND_HUB,
+    KIND_VIEW,
     MAX_REQUESTS_PER_SITE,
     MAX_SHIM_STORAGE_BYTES,
     MAX_SHIM_STORAGE_KEYS,
@@ -62,9 +73,8 @@ from custom_components.local_web_ui.const import (
     SESSION_MAX_AGE,
     SESSION_TTL,
     STORAGE_KEY_JAR,
-    SUBENTRY_TYPE_VIEW,
 )
-from custom_components.local_web_ui.hub import LocalWebUiHub
+from custom_components.local_web_ui.hub import LocalWebUiHub, device_unique_id
 from custom_components.local_web_ui.proxy import ISOLATION_CSP, https_upgrade
 
 ISO = "isoview"
@@ -106,6 +116,8 @@ class Upstream:
         self.redirects: dict[str, str] = {}
         self.sse_release = asyncio.Event()
         self.sse_done = False
+        # Set when the device's end of a WebSocket to /ws is closed
+        self.ws_closed = asyncio.Event()
         # /hold?id=<id> answers once release(<id>) is called
         self.held: list[str] = []
         self._held_changed = asyncio.Condition()
@@ -179,12 +191,26 @@ class Upstream:
         await response.write_eof()
         return response
 
+    async def _websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """Echoes text messages until closed."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        try:
+            async for msg in ws:
+                if msg.type is aiohttp.WSMsgType.TEXT:
+                    await ws.send_str(msg.data)
+        finally:
+            self.ws_closed.set()
+        return ws
+
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         body = await request.read()
         self.requests.append(
             Recorded(request.method, request.raw_path, request.headers.copy(), body)
         )
         path = request.path
+        if path == "/ws":
+            return await self._websocket(request)
         if path == "/page":
             return web.Response(text=self.page_html(), content_type="text/html")
         if path == "/page-cached":
@@ -347,13 +373,17 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _view(view_id: str, title: str, url: str, mode: str = MODE_ISOLATED, **extra: Any) -> Any:
-    return {
-        "subentry_id": view_id,
-        "subentry_type": SUBENTRY_TYPE_VIEW,
-        "title": title,
-        "unique_id": None,
-        "data": {
+def _web_ui(
+    view_id: str, title: str, url: str, mode: str = MODE_ISOLATED, **extra: Any
+) -> MockConfigEntry:
+    """A web UI added by hand; its view_id is its entry_id."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        entry_id=view_id,
+        title=title,
+        data={CONF_KIND: KIND_VIEW},
+        options={
             CONF_URL: url,
             CONF_MODE: mode,
             CONF_TRUSTED_ACK: mode == MODE_TRUSTED,
@@ -361,7 +391,20 @@ def _view(view_id: str, title: str, url: str, mode: str = MODE_ISOLATED, **extra
             CONF_SHOW_IN_SIDEBAR: False,
             **extra,
         },
-    }
+    )
+
+
+def _device_web_ui(device: dr.DeviceEntry, title: str) -> MockConfigEntry:
+    """A device's web UI, as the discovery confirm step creates it."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        source=SOURCE_INTEGRATION_DISCOVERY,
+        unique_id=device_unique_id(device.id),
+        title=title,
+        data={CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: device.id},
+        options={CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: False},
+    )
 
 
 @pytest.fixture
@@ -381,7 +424,9 @@ def http_config() -> dict[str, Any]:
 @dataclass
 class Env:
     hass: HomeAssistant
-    entry: MockConfigEntry
+    hub_entry: MockConfigEntry
+    # Web UI entries by view_id (= entry_id)
+    web_uis: dict[str, MockConfigEntry]
     client: TestClient
     ws: MockHAClientWebSocket
     upstream: Upstream
@@ -389,6 +434,30 @@ class Env:
     @property
     def hub(self) -> LocalWebUiHub:
         return self.hass.data[DOMAIN]
+
+    @property
+    def entries(self) -> list[MockConfigEntry]:
+        return [self.hub_entry, *self.web_uis.values()]
+
+    async def add_web_ui(self, entry: MockConfigEntry) -> None:
+        entry.add_to_hass(self.hass)
+        assert await self.hass.config_entries.async_setup(entry.entry_id)
+        await self.hass.async_block_till_done()
+        self.web_uis[entry.entry_id] = entry
+
+    async def unload_all(self) -> None:
+        """Unload every entry of the integration; the hub stops once none is left."""
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.state is ConfigEntryState.LOADED:
+                assert await self.hass.config_entries.async_unload(entry.entry_id)
+        await self.hass.async_block_till_done()
+        assert not self.hub.active
+
+    async def setup_all(self) -> None:
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.state is ConfigEntryState.NOT_LOADED:
+                assert await self.hass.config_entries.async_setup(entry.entry_id)
+        await self.hass.async_block_till_done()
 
     async def session(
         self, view_id: str, ws: MockHAClientWebSocket | None = None
@@ -430,33 +499,39 @@ async def env(
     hass_ws_client: WebSocketGenerator,
 ) -> AsyncGenerator[Env]:
     assert await async_setup_component(hass, "http", {"http": http_config})
-    entry = MockConfigEntry(
+    hub_entry = MockConfigEntry(
         domain=DOMAIN,
+        version=2,
+        unique_id="hub",
         title=NAME,
+        data={CONF_KIND: KIND_HUB},
         options={CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False},
-        subentries_data=[
-            _view(ISO, "Isolated site", f"{upstream.origin}/page?start=1"),
-            _view(TRUSTED, "Trusted site", f"{upstream.origin}/", MODE_TRUSTED),
-            _view(
-                AUTH,
-                "Site with login",
-                f"{upstream.origin}/",
-                **{CONF_USERNAME: "admin", CONF_PASSWORD: "s3cret"},
-            ),
-            _view(DOWN, "Unplugged", f"http://127.0.0.1:{_free_port()}/"),
-        ],
     )
-    entry.add_to_hass(hass)
-    assert await hass.config_entries.async_setup(entry.entry_id)
+    web_uis = [
+        _web_ui(ISO, "Isolated site", f"{upstream.origin}/page?start=1"),
+        _web_ui(TRUSTED, "Trusted site", f"{upstream.origin}/", MODE_TRUSTED),
+        _web_ui(
+            AUTH,
+            "Site with login",
+            f"{upstream.origin}/",
+            **{CONF_USERNAME: "admin", CONF_PASSWORD: "s3cret"},
+        ),
+        _web_ui(DOWN, "Unplugged", f"http://127.0.0.1:{_free_port()}/"),
+    ]
+    for entry in (hub_entry, *web_uis):
+        entry.add_to_hass(hass)
+    # Sets up the integration, and with it every entry
+    assert await hass.config_entries.async_setup(hub_entry.entry_id)
     await hass.async_block_till_done()
+    assert all(entry.state is ConfigEntryState.LOADED for entry in (hub_entry, *web_uis))
     client = await hass_client_no_auth()
     ws = await hass_ws_client(hass)
-    yield Env(hass, entry, client, ws, upstream)
+    env = Env(hass, hub_entry, {e.entry_id: e for e in web_uis}, client, ws, upstream)
+    yield env
     upstream.release_all()
-    if entry.state is ConfigEntryState.LOADED:
-        # Detaches (static views) or closes (discovered views) the upstream clients
-        assert await hass.config_entries.async_unload(entry.entry_id)
-        await hass.async_block_till_done()
+    if env.hub.active:
+        # Detaches (manual web UIs) or closes (device web UIs) the upstream clients
+        await env.unload_all()
 
 
 def shim_config(body: bytes) -> dict[str, Any]:
@@ -674,44 +749,143 @@ async def test_removed_view_is_not_found(env: Env) -> None:
     prefix = await env.prefix(ISO)
     assert (await env.client.get(prefix + "/echo")).status == 200
 
-    assert env.hass.config_entries.async_remove_subentry(env.entry, ISO)
+    assert (await env.hass.config_entries.async_remove(ISO))["require_restart"] is False
     await env.hass.async_block_till_done()
-    assert env.entry.state is ConfigEntryState.LOADED
+    assert env.hub.active  # Other web UIs are still there
 
     assert (await env.client.get(prefix + "/echo")).status == 404
     assert len(env.upstream.requests) == 1
 
 
+@pytest.mark.parametrize("how", ["disable", "delete"])
+async def test_disabled_or_deleted_web_ui_ends_its_sessions(env: Env, how: str) -> None:
+    prefix = await env.prefix(ISO)
+    other_prefix = await env.prefix(TRUSTED)
+    # An open event stream and an open WebSocket
+    stream = await asyncio.wait_for(env.client.get(prefix + "/events"), 5)
+    assert await asyncio.wait_for(stream.content.readuntil(b"\n\n"), 5) == b"data: one\n\n"
+    ws = await asyncio.wait_for(env.client.ws_connect(prefix + "/ws"), 5)
+    await ws.send_str("hi")
+    assert (await asyncio.wait_for(ws.receive(), 5)).data == "hi"
+
+    if how == "disable":
+        assert await env.hass.config_entries.async_set_disabled_by(ISO, ConfigEntryDisabler.USER)
+    else:
+        await env.hass.config_entries.async_remove(ISO)
+    await env.hass.async_block_till_done()
+
+    msg = await asyncio.wait_for(ws.receive(), 5)
+    assert msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED), msg
+    await asyncio.wait_for(env.upstream.ws_closed.wait(), 5)
+    # The stream is cut off, not completed
+    with pytest.raises(aiohttp.ClientPayloadError):
+        await asyncio.wait_for(stream.content.read(), 5)
+    assert not env.upstream.sse_done
+
+    requests_before = len(env.upstream.requests)
+    assert (await env.client.get(prefix + "/echo")).status == 404
+    assert len(env.upstream.requests) == requests_before
+    await env.ws.send_json_auto_id({"type": f"{DOMAIN}/session", "view_id": ISO})
+    msg = await env.ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "not_found"
+    # Other web UIs are not affected
+    assert (await env.client.get(other_prefix + "/echo")).status == 200
+
+
+async def test_disabled_web_ui_does_not_come_back_with_its_old_sessions(env: Env) -> None:
+    prefix = await env.prefix(ISO)
+    assert await env.hass.config_entries.async_set_disabled_by(ISO, ConfigEntryDisabler.USER)
+    await env.hass.async_block_till_done()
+    assert await env.hass.config_entries.async_set_disabled_by(ISO, None)
+    await env.hass.async_block_till_done()
+    assert env.web_uis[ISO].state is ConfigEntryState.LOADED
+
+    assert (await env.client.get(prefix + "/echo")).status == 404
+    # A new session works
+    assert (await env.client.get(await env.prefix(ISO) + "/echo")).status == 200
+
+
+async def test_device_web_ui_without_device_url_is_not_found(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The device's name resolves to the fake device UI, accepted as a LAN address here
+    resolver = _FakeResolver({"fake-device.local": "127.0.0.1"})
+    monkeypatch.setattr(aiohttp_client, "_async_get_or_create_resolver", lambda hass: resolver)
+    monkeypatch.setattr(discovery_module, "is_lan_address", lambda address: True)
+    owner = MockConfigEntry(domain="fake_devices", title="Fake devices")
+    owner.add_to_hass(env.hass)
+    registry = dr.async_get(env.hass)
+    device = registry.async_get_or_create(
+        config_entry_id=owner.entry_id,
+        identifiers={("fake_devices", "one")},
+        name="Fake device",
+        configuration_url=f"http://fake-device.local:{env.upstream.port}/page",
+    )
+    entry = _device_web_ui(device, "Fake device")
+    await env.add_web_ui(entry)
+    view = env.hub.get_view(entry.entry_id)
+    assert view is not None
+    assert view.source == "device"
+
+    result = await env.session(entry.entry_id)
+    assert result["url"].endswith("/page")
+    prefix = f"{PROXY_URL_PREFIX}/{entry.entry_id}/{result['token']}"
+    assert (await env.client.get(prefix + "/echo")).status == 200
+    assert env.upstream.last.target == "/echo"
+    requests_before = len(env.upstream.requests)
+
+    # Its integration no longer links to a web page
+    registry.async_update_device(device.id, configuration_url=None)
+    await env.hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED  # The entry stays, without a view
+    assert env.hub.get_view(entry.entry_id) is None
+    assert (await env.client.get(prefix + "/echo")).status == 404
+    await env.ws.send_json_auto_id({"type": f"{DOMAIN}/session", "view_id": entry.entry_id})
+    msg = await env.ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "not_found"
+
+    # Nor one that is not on the local network
+    registry.async_update_device(device.id, configuration_url="https://example.com/")
+    await env.hass.async_block_till_done()
+    assert env.hub.get_view(entry.entry_id) is None
+    assert (await env.client.get(prefix + "/echo")).status == 404
+    assert len(env.upstream.requests) == requests_before
+
+
 async def test_sessions_survive_web_ui_changes(env: Env) -> None:
     prefix = await env.prefix(ISO)
     hub = env.hub
-    env.hass.config_entries.async_add_subentry(
-        env.entry,
-        ConfigSubentry(
-            data={CONF_URL: "http://192.168.1.2/", CONF_MODE: MODE_ISOLATED},
-            subentry_type=SUBENTRY_TYPE_VIEW,
-            title="Another",
-            unique_id=None,
-        ),
+    await env.add_web_ui(_web_ui("anotherview", "Another", "http://192.168.1.2/"))
+    assert "anotherview" in hub.views
+    # Changing the web UI itself is applied in place too
+    env.hass.config_entries.async_update_entry(
+        env.web_uis[ISO], options={**env.web_uis[ISO].options, CONF_SHOW_IN_SIDEBAR: True}
     )
     await env.hass.async_block_till_done()
-    assert env.hub is hub  # Applied in place
+    assert env.web_uis[ISO].state is ConfigEntryState.LOADED
+    assert env.hub is hub
     assert (await env.client.get(prefix + "/echo")).status == 200
 
 
 async def test_sessions_survive_entry_reload(env: Env) -> None:
     prefix = await env.prefix(ISO)
     hub = env.hub
-    assert await env.hass.config_entries.async_reload(env.entry.entry_id)
+    assert await env.hass.config_entries.async_reload(ISO)
     await env.hass.async_block_till_done()
-    assert env.hub is not hub
+    assert env.hub is hub  # One hub for the integration, created once per run
+    assert (await env.client.get(prefix + "/echo")).status == 200
+
+    # Also when every entry was unloaded in between
+    await env.unload_all()
+    await env.setup_all()
     assert (await env.client.get(prefix + "/echo")).status == 200
 
 
 async def test_unloaded_integration_is_not_found(env: Env) -> None:
     prefix = await env.prefix(ISO)
-    assert await env.hass.config_entries.async_unload(env.entry.entry_id)
-    await env.hass.async_block_till_done()
+    await env.unload_all()
     assert (await env.client.get(prefix + "/echo")).status == 404
     assert env.upstream.requests == []
 
@@ -776,11 +950,16 @@ async def test_reload_releases_upstream_client_sessions(
     # The first proxied request creates the hub's upstream client session
     assert (await env.client.get(prefix + "/echo")).status == 200
     assert len(created) == 1
-    assert await env.hass.config_entries.async_reload(env.entry.entry_id)
+    # Reloading one web UI keeps the client: the other web UIs still use it
+    assert await env.hass.config_entries.async_reload(ISO)
     await env.hass.async_block_till_done()
+    assert not created[0].closed
+    # Released when the last entry is unloaded
+    await env.unload_all()
     assert "closes the Home Assistant aiohttp session" not in caplog.text
     assert created[0].closed
-    # The new hub makes its own
+    await env.setup_all()
+    # Set up again, the hub makes a new one
     assert (await env.client.get(prefix + "/echo")).status == 200
     assert len(created) == 2
 
@@ -833,12 +1012,23 @@ async def test_discovered_view_only_connects_to_lan_addresses(
         name="Fake device",
         configuration_url=f"http://fake-device.local:{env.upstream.port}/",
     )
+    # Offered through discovery, and added
     env.hass.config_entries.async_update_entry(
-        env.entry, options={**env.entry.options, CONF_DISCOVERY: True}
+        env.hub_entry, options={**env.hub_entry.options, CONF_DISCOVERY: True}
     )
     await env.hass.async_block_till_done()
+    flows = env.hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [flow["context"]["source"] for flow in flows] == [SOURCE_INTEGRATION_DISCOVERY]
+    result = await env.hass.config_entries.flow.async_configure(flows[0]["flow_id"], {})
+    assert result["type"] == "create_entry", result
+    await env.hass.async_block_till_done()
+    entry = result["result"]
+    assert entry.data == {CONF_KIND: KIND_VIEW, CONF_DEVICE_ID: device.id}
+    view = env.hub.get_view(entry.entry_id)
+    assert view is not None
+    assert view.source == "device"
 
-    prefix = await env.prefix(f"{DISCOVERED_PREFIX}{device.id}")
+    prefix = await env.prefix(entry.entry_id)
     response = await env.client.get(prefix + "/echo")
     assert response.status == 502
     assert "Fake device is not reachable" in await response.text()
@@ -1129,9 +1319,13 @@ async def test_cookie_jar_survives_reload(env: Env, hass_storage: dict[str, Any]
     prefix = await env.prefix(ISO)
     await env.client.get(prefix + "/login")
 
-    assert await env.hass.config_entries.async_reload(env.entry.entry_id)
-    await env.hass.async_block_till_done()
+    await env.unload_all()
     assert STORAGE_KEY_JAR in hass_storage
+    # As after a restart: a new hub that only knows what was stored
+    fresh = LocalWebUiHub(env.hass)
+    await fresh.async_load()
+    env.hass.data[DOMAIN] = fresh
+    await env.setup_all()
 
     assert (await env.client.get(prefix + "/echo")).status == 200
     assert sorted(env.upstream.last.headers[hdrs.COOKIE].split("; ")) == [

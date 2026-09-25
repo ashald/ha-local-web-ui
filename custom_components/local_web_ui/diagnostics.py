@@ -8,7 +8,7 @@ from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import LocalWebUiConfigEntry
-from .const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
+from .const import CONF_KIND, CONF_PASSWORD, CONF_URL, CONF_USERNAME, KIND_HUB
 
 TO_REDACT = {CONF_PASSWORD, CONF_USERNAME}
 
@@ -24,18 +24,20 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: LocalWebUiConfigEntry
 ) -> dict[str, Any]:
     hub = entry.runtime_data
-    return {
-        "options": dict(entry.options),
-        "static_views": [
-            async_redact_data(dict(s.data), TO_REDACT)
-            | {"title": s.title, CONF_URL: _redact_query(s.data.get(CONF_URL))}
-            for s in entry.subentries.values()
-        ],
-        "discovered_views": [
-            {"view_id": v.view_id, "name": v.name, "url": v.url, "device_id": v.device_id}
-            for v in hub.discovered_views(include_hidden=True).values()
-        ],
-        "hidden": sorted(hub.hidden),
-        "link_overrides": hub.link_overrides,
-        "device_page_links": sorted(hub.originals),
-    }
+    options = async_redact_data(dict(entry.options), TO_REDACT)
+    if CONF_URL in options:
+        options[CONF_URL] = _redact_query(options[CONF_URL])
+    result: dict[str, Any] = {"data": dict(entry.data), "options": options}
+    if entry.data.get(CONF_KIND) == KIND_HUB:
+        result["web_uis"] = len(hub.views)
+        result["device_page_links"] = sorted(hub.originals)
+    elif (view := hub.get_view(entry.entry_id)) is not None:
+        result["view"] = {
+            "url": _redact_query(view.url),
+            "source": view.source,
+            "mode": view.mode,
+            "device_page_link": hub.link_enabled(view.view_id) if view.device_id else None,
+        }
+    else:
+        result["view"] = None  # Its device has no local web page right now
+    return result

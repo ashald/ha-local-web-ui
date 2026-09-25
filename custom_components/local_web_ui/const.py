@@ -16,8 +16,15 @@ DEVICE_LINK_PREFIX: Final = f"homeassistant://{PANEL_URL_PATH}/"
 # Paths under a view that the proxy answers itself instead of forwarding
 INTERNAL_PATH_PREFIX: Final = "__lwu/"
 
+# Config entries: one hub (global options) and one per web UI
+CONF_KIND: Final = "kind"
+KIND_HUB: Final = "hub"
+KIND_VIEW: Final = "view"
+HUB_UNIQUE_ID: Final = "hub"
+# Before 0.3: web UIs were subentries of the one entry, discovered ones "d_<device id>"
 SUBENTRY_TYPE_VIEW: Final = "view"
 DISCOVERED_PREFIX: Final = "d_"
+CONF_PREVIOUS_VIEW_ID: Final = "previous_view_id"
 
 CONF_URL: Final = "url"
 CONF_MODE: Final = "mode"
@@ -31,13 +38,20 @@ CONF_TRUSTED_ACK: Final = "trusted_acknowledged"
 
 CONF_DISCOVERY: Final = "discovery"
 CONF_LINK_DEVICE_PAGES: Final = "link_device_pages"
-CONF_LINKED_DEVICES: Final = "linked_devices"
+CONF_LINKED_DEVICES: Final = "linked_devices"  # Before 0.3: every web UI has its device now
+CONF_SHOW_PANEL: Final = "show_panel"
+# What a device's own "Visit" button does: follow the hub's option, or not
+CONF_VISIT_LINK: Final = "visit_link"
+VISIT_DEFAULT: Final = "default"
+VISIT_HERE: Final = "here"
+VISIT_DEVICE: Final = "device"
+VISIT_CHOICES: Final = (VISIT_DEFAULT, VISIT_HERE, VISIT_DEVICE)
 CONF_PANEL_TITLE: Final = "panel_title"
 CONF_PANEL_ICON: Final = "panel_icon"
 DEFAULT_PANEL_ICON: Final = "mdi:web-box"
 DEFAULT_DISCOVERY: Final = True
 DEFAULT_LINK_DEVICE_PAGES: Final = True
-DEFAULT_LINKED_DEVICES: Final = False
+DEFAULT_SHOW_PANEL: Final = True
 
 MODE_ISOLATED: Final = "isolated"
 MODE_TRUSTED: Final = "trusted"

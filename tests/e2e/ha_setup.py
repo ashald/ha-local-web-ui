@@ -3,7 +3,8 @@
 - onboards it if needed (user demo / demo-password-123) and writes tokens to <tokens.json>
 - removes the variant 1 PoC integration (esphome_web_ui) if present
 - (re)adds the ESPHome device at <device host>:6053
-- adds Local Web UIs and a manual web UI for the stand-in router (with stored login)
+- adds the Local Web UIs hub, accepts the device's discovered web UI, and adds a web UI
+  for the stand-in router by URL (with stored login)
 
 Usage: python ha_setup.py <tokens.json> <device host>
 """
@@ -95,19 +96,33 @@ async def main(token_file: str, device_host: str) -> None:
             return result
 
         await flow("esphome", {"host": device_host, "port": 6053})
-        entry = await flow("local_web_ui", {})
-        entry_id = entry["result"]["entry_id"]
-
-        async with http.post(
-            f"{HA}/api/config/config_entries/subentries/flow",
-            headers=auth,
-            json={"handler": [entry_id, "view"]},
-        ) as r:
-            sub = await r.json()
-        async with http.post(
-            f"{HA}/api/config/config_entries/subentries/flow/{sub['flow_id']}",
-            headers=auth,
-            json={
+        # The hub (options for all web UIs), then the ESPHome device's web UI,
+        # which discovery offers, and a router added by URL
+        await flow("local_web_ui", {})
+        token = auth["Authorization"].split()[1]
+        async with http.ws_connect(f"{HA}/api/websocket") as ws:
+            await ws.receive_json()
+            await ws.send_json({"type": "auth", "access_token": token})
+            await ws.receive_json()
+            for attempt in range(20):
+                await ws.send_json({"id": attempt + 1, "type": "config_entries/flow/progress"})
+                offers = [
+                    f
+                    for f in (await ws.receive_json())["result"]
+                    if f["handler"] == "local_web_ui"
+                    and f["context"].get("source") == "integration_discovery"
+                ]
+                if offers:
+                    break
+                await asyncio.sleep(0.5)
+        for offer in offers:
+            async with http.post(
+                f"{HA}/api/config/config_entries/flow/{offer['flow_id']}", headers=auth, json={}
+            ) as r:
+                print("discovered ->", (await r.json()).get("title"))
+        await flow(
+            "local_web_ui",
+            {
                 "name": "Router",
                 "url": f"http://{device_host}:8081/",
                 "mode": "isolated",
@@ -118,8 +133,7 @@ async def main(token_file: str, device_host: str) -> None:
                 "show_in_sidebar": True,
                 "icon": "mdi:router-wireless",
             },
-        ) as r:
-            print("view Router ->", (await r.json()).get("type"))
+        )
 
 
 if __name__ == "__main__":
