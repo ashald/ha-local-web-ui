@@ -23,8 +23,15 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Custom repository: not in home-assistant/brands; topics are set in the GitHub UI
-          ignore: brands topics
+          # Topics are set in the GitHub UI
+          ignore: topics
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+      - run: ruff format --check
 
   tests:
     runs-on: ubuntu-latest

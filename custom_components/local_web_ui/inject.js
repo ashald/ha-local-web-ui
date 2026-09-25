@@ -154,14 +154,16 @@ function (cfg) {
   var nativePost = nativeFetch || window.fetch;
   function post(name, body) {
     try {
-      nativePost.call(window, prefix + "/__lwu/" + name, {
+      return nativePost.call(window, prefix + "/__lwu/" + name, {
         method: "POST",
         body: body,
-        keepalive: true,
+        // keepalive lets a write outlive the page, within a 64 KiB budget
+        keepalive: body.length < 60000,
+        // A CORS-safelisted type: no preflight
         headers: { "Content-Type": "text/plain" },
       });
     } catch (e) {
-      /* Best effort */
+      return null; // Best effort
     }
   }
 
@@ -200,22 +202,87 @@ function (cfg) {
   } catch (e) {
     /* Opaque origin: emulate below */
   }
+
+  // These throw in an opaque origin; without them pages fall back gracefully
+  // ("indexedDB" in window, "serviceWorker" in navigator, ...)
+  try {
+    delete Navigator.prototype.serviceWorker;
+    delete window.caches;
+    delete window.indexedDB;
+  } catch (e) {
+    /* Keep them */
+  }
+
+  // localStorage is written back as changes, each with an id. The last write of
+  // a page can reach the server after the next page was already rendered (save,
+  // then reload), so the page remembers that id in window.name, which survives
+  // navigation, and the next page fetches fresh data if its copy predates it.
+  var MARK = "\u0001lwu:";
+  var stored = cfg.storage || {};
+  var name = window.name;
+  if (name.indexOf(MARK) === 0 && name.indexOf("|") > 0) {
+    var marker = name.slice(MARK.length, name.indexOf("|")).split(":");
+    name = name.slice(name.indexOf("|") + 1);
+    try {
+      window.name = name;
+    } catch (e) {
+      /* Read-only in this context */
+    }
+    var writeId = marker[0];
+    var recent = Date.now() - Number(marker[1]) < 60000;
+    if (writeId && recent && (cfg.writes || []).indexOf(writeId) < 0) {
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", prefix + "/__lwu/storage?w=" + encodeURIComponent(writeId), false);
+        xhr.send();
+        if (xhr.status === 200) stored = JSON.parse(xhr.responseText);
+      } catch (e) {
+        /* Keep the copy we have */
+      }
+    }
+  }
+  var lastWrite = null;
+
   function makeStorage(data, persist) {
+    var changes = {};
+    var cleared = false;
+    var dirty = false;
     var timer = null;
     function flush() {
-      timer = null;
-      post("storage", JSON.stringify(data));
-    }
-    function changed() {
-      if (!persist) return;
       clearTimeout(timer);
-      timer = setTimeout(flush, 250);
+      timer = null;
+      if (!dirty) return;
+      var id = Math.random().toString(36).slice(2, 12);
+      var body = JSON.stringify({ w: id, set: changes, clear: cleared });
+      changes = {};
+      cleared = false;
+      dirty = false;
+      lastWrite = [id, Date.now()];
+      post("storage", body);
+    }
+    function changed(key, value) {
+      if (!persist) return;
+      if (key === null) {
+        changes = {};
+        cleared = true;
+      } else {
+        changes[key] = value;
+      }
+      dirty = true;
+      if (value && value.length > 16384) {
+        flush(); // Too large to leave for the page's last moments
+      } else if (!timer) {
+        timer = setTimeout(flush, 250);
+      }
     }
     if (persist) {
       window.addEventListener("pagehide", function () {
-        if (timer) {
-          clearTimeout(timer);
-          flush();
+        flush();
+        if (!lastWrite) return;
+        try {
+          window.name = MARK + lastWrite[0] + ":" + lastWrite[1] + "|" + name;
+        } catch (e) {
+          /* Read-only in this context */
         }
       });
     }
@@ -225,18 +292,22 @@ function (cfg) {
         return own.call(data, key) ? data[key] : null;
       },
       setItem: function (key, value) {
-        data[String(key)] = String(value);
-        changed();
+        key = String(key);
+        value = String(value);
+        data[key] = value;
+        changed(key, value);
       },
       removeItem: function (key) {
-        delete data[String(key)];
-        changed();
+        key = String(key);
+        if (!own.call(data, key)) return;
+        delete data[key];
+        changed(key, null);
       },
       clear: function () {
         Object.keys(data).forEach(function (key) {
           delete data[key];
         });
-        changed();
+        changed(null, null);
       },
       key: function (index) {
         var keys = Object.keys(data);
@@ -276,7 +347,8 @@ function (cfg) {
       },
     });
   }
-  var local = makeStorage(cfg.storage || {}, true);
+  var local = makeStorage(stored, true);
+  // Per page: it does not survive a reload, unlike a browser's
   var session = makeStorage({}, false);
   try {
     Object.defineProperty(window, "localStorage", { configurable: true, get: function () { return local; } });

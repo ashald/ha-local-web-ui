@@ -30,6 +30,7 @@ from .const import (
     CONF_DISCOVERY,
     CONF_ICON,
     CONF_LINK_DEVICE_PAGES,
+    CONF_LINKED_DEVICES,
     CONF_MODE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
@@ -39,6 +40,7 @@ from .const import (
     CONF_VERIFY_SSL,
     DEFAULT_DISCOVERY,
     DEFAULT_LINK_DEVICE_PAGES,
+    DEFAULT_LINKED_DEVICES,
     DOMAIN,
     MODE_ISOLATED,
     MODE_TRUSTED,
@@ -64,6 +66,7 @@ class LocalWebUiConfigFlow(ConfigFlow, domain=DOMAIN):
                 options={
                     CONF_DISCOVERY: DEFAULT_DISCOVERY,
                     CONF_LINK_DEVICE_PAGES: DEFAULT_LINK_DEVICE_PAGES,
+                    CONF_LINKED_DEVICES: DEFAULT_LINKED_DEVICES,
                 },
             )
         return self.async_show_form(step_id="user")
@@ -99,6 +102,10 @@ class LocalWebUiOptionsFlow(OptionsFlow):
                     vol.Required(
                         CONF_LINK_DEVICE_PAGES,
                         default=options.get(CONF_LINK_DEVICE_PAGES, DEFAULT_LINK_DEVICE_PAGES),
+                    ): BooleanSelector(),
+                    vol.Required(
+                        CONF_LINKED_DEVICES,
+                        default=options.get(CONF_LINKED_DEVICES, DEFAULT_LINKED_DEVICES),
                     ): BooleanSelector(),
                 }
             ),

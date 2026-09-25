@@ -16,11 +16,13 @@
         "title": "Local Web UIs options",
         "data": {
           "discovery": "Discover device web UIs",
-          "link_device_pages": "Open device \"Visit\" links here"
+          "link_device_pages": "Open device \"Visit\" links here",
+          "linked_devices": "Add a \"web UI\" linked device"
         },
         "data_description": {
           "discovery": "List devices whose integration links to a local web page (their \"Visit\" link), such as ESPHome devices with web_server, WLED or printers.",
-          "link_device_pages": "Point the \"Visit\" button of those devices at their web UI here, so it also works away from home. Can be changed per device in the panel. Turning it off restores the original links."
+          "link_device_pages": "Point the \"Visit\" button of devices with a web UI at their web UI here, so it also works away from home. Can be changed per device in the panel. Turning it off restores the original links.",
+          "linked_devices": "Add a \"<device> web UI\" device next to each device with a web UI. It appears in the \"Linked devices\" card of the device's page, and its \"Visit\" button opens the web UI here. The device itself is not changed."
         }
       }
     }
@@ -29,7 +31,8 @@
     "view": {
       "entry_type": "Web UI",
       "initiate_flow": {
-        "user": "Add web UI"
+        "user": "Add web UI",
+        "reconfigure": "Edit web UI"
       },
       "step": {
         "user": {
@@ -81,7 +84,8 @@
         "trusted_not_acknowledged": "Trusted mode needs your confirmation."
       },
       "abort": {
-        "reconfigure_successful": "Web UI updated."
+        "reconfigure_successful": "Web UI updated.",
+        "already_configured": "This device already has a configured web UI."
       }
     }
   },

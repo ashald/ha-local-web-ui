@@ -221,9 +221,12 @@ class LocalWebUiPanel extends HTMLElement {
       items.push(view.device_link.enabled
         ? ["link-off", "mdi:link-off", "Don't use for the device page's Visit link"]
         : ["link-on", "mdi:link", "Use for the device page's Visit link"]);
+      if (view.device_link.override !== null && view.device_link.override !== undefined) {
+        items.push(["link-default", "mdi:link-variant", "Visit link: follow the global setting"]);
+      }
     }
     if (view.device_id) items.push(["device", "mdi:devices", "Open device page"]);
-    if (!view.hidden && view.mode !== "trusted") items.push(["forget", "mdi:cookie-remove", "Forget saved logins and data"]);
+    if (!view.hidden) items.push(["forget", "mdi:cookie-remove", "Forget saved logins and data"]);
     if (view.source === "discovered") items.push(view.hidden ? ["unhide", "mdi:eye", "Unhide"] : ["hide", "mdi:eye-off", "Hide"]);
     const popup = document.createElement("div");
     popup.className = "popup";
@@ -251,7 +254,7 @@ class LocalWebUiPanel extends HTMLElement {
       if (act === "device") return this._navigate(`/config/devices/device/${view.device_id}`);
       if (act === "pin") {
         await ws({ type: "local_web_ui/pin", view_id: view.view_id });
-        // The integration reloads; the pinned web UI is edited on its settings page
+        // The pinned web UI is edited on the integration's settings page
         return this._navigate("/config/integrations/integration/local_web_ui");
       }
       if (act === "forget") {
@@ -262,8 +265,9 @@ class LocalWebUiPanel extends HTMLElement {
       if (act === "hide" || act === "unhide") {
         await ws({ type: "local_web_ui/set_hidden", view_id: view.view_id, hidden: act === "hide" });
       }
-      if (act === "link-on" || act === "link-off") {
-        await ws({ type: "local_web_ui/set_device_link", device_id: view.device_id, enabled: act === "link-on" });
+      if (act === "link-on" || act === "link-off" || act === "link-default") {
+        const enabled = act === "link-default" ? null : act === "link-on";
+        await ws({ type: "local_web_ui/set_device_link", device_id: view.device_id, enabled });
       }
     } catch (err) {
       alert(err.message || err);

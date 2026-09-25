@@ -31,8 +31,10 @@ CONF_TRUSTED_ACK: Final = "trusted_acknowledged"
 
 CONF_DISCOVERY: Final = "discovery"
 CONF_LINK_DEVICE_PAGES: Final = "link_device_pages"
+CONF_LINKED_DEVICES: Final = "linked_devices"
 DEFAULT_DISCOVERY: Final = True
 DEFAULT_LINK_DEVICE_PAGES: Final = True
+DEFAULT_LINKED_DEVICES: Final = False
 
 MODE_ISOLATED: Final = "isolated"
 MODE_TRUSTED: Final = "trusted"
@@ -53,3 +55,8 @@ MAX_SHIM_STORAGE_BYTES: Final = 1024 * 1024
 MAX_SHIM_STORAGE_KEYS: Final = 1000
 MAX_COOKIES_PER_SITE: Final = 50
 MAX_COOKIE_BYTES: Final = 4096
+# Concurrent upstream requests per site; small device web servers have few sockets.
+# Streams (downloads, server-sent events, WebSockets) do not hold a slot.
+MAX_REQUESTS_PER_SITE: Final = 6
+# How long a page load waits for the previous page's last storage write
+STORAGE_WRITE_WAIT: Final = 3.0

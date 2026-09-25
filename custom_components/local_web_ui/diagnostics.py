@@ -29,5 +29,5 @@ async def async_get_config_entry_diagnostics(
         ],
         "hidden": sorted(hub.hidden),
         "link_overrides": hub.link_overrides,
-        "linked_devices": sorted(hub.originals),
+        "device_page_links": sorted(hub.originals),
     }

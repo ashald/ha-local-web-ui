@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import device_registry as dr
 import voluptuous as vol
 
@@ -17,12 +19,13 @@ from .const import (
     CONF_URL,
     CONF_VERIFY_SSL,
     DEVICE_LINK_PREFIX,
+    DISCOVERED_PREFIX,
     DOMAIN,
     PROXY_URL_PREFIX,
     SESSION_TTL,
     SUBENTRY_TYPE_VIEW,
 )
-from .hub import main_device
+from .hub import main_device, pinned_unique_id
 
 if TYPE_CHECKING:
     from .hub import LocalWebUiHub, View
@@ -95,6 +98,7 @@ def ws_views(
             "views": [_view_json(hub, view) for view in views],
             "discovery": hub.discovery_enabled,
             "link_device_pages": hub.link_default,
+            "linked_devices": hub.linked_devices_enabled,
             "entry_id": hub.entry.entry_id,
         },
     )
@@ -122,9 +126,9 @@ def ws_session(
     user_id = connection.user.id
     session = None
     if (token := msg.get("token")) is not None:
-        session = hub.sessions.touch(token, view.view_id)
-        if session is not None and session.user_id != user_id:
-            session = None
+        existing = hub.sessions.get(token)
+        if existing is not None and existing.user_id == user_id:
+            session = hub.sessions.touch(token, view.view_id)
     if session is None:
         # Bound to this login: logging out ends the session
         session = hub.sessions.create(view.view_id, user_id, connection.refresh_token_id)
@@ -154,20 +158,29 @@ def ws_pin(
     if view is None or view.source != "discovered":
         connection.send_error(msg["id"], "not_found", "No such discovered web UI")
         return
+    assert view.device_id is not None  # Discovered views belong to a device
     subentry = ConfigSubentry(
-        data={
-            CONF_URL: view.url,
-            CONF_MODE: view.mode,
-            CONF_VERIFY_SSL: view.verify_ssl,
-            CONF_SHOW_IN_SIDEBAR: False,
-            CONF_DEVICE_ID: view.device_id,
-        },
+        data=MappingProxyType(
+            {
+                CONF_URL: view.url,
+                CONF_MODE: view.mode,
+                CONF_VERIFY_SSL: view.verify_ssl,
+                CONF_SHOW_IN_SIDEBAR: False,
+                CONF_DEVICE_ID: view.device_id,
+            }
+        ),
         subentry_type=SUBENTRY_TYPE_VIEW,
         title=view.name,
-        unique_id=None,
+        # One configured web UI per device, however often this is clicked
+        unique_id=pinned_unique_id(view.device_id),
     )
-    # Adding a subentry reloads the entry, which picks the new view up
-    hass.config_entries.async_add_subentry(hub.entry, subentry)
+    try:
+        hass.config_entries.async_add_subentry(hub.entry, subentry)
+    except AbortFlow:
+        connection.send_error(msg["id"], "already_pinned", "This device already has a web UI")
+        return
+    # The update listener also does this, later; the reply must see the new view
+    hub.async_update_config()
     connection.send_result(msg["id"], {"view_id": subentry.subentry_id})
 
 
@@ -185,6 +198,9 @@ def ws_set_hidden(
 ) -> None:
     """Hide or unhide a discovered view."""
     if (hub := _hub(hass, connection, msg["id"])) is None:
+        return
+    if not msg["view_id"].startswith(DISCOVERED_PREFIX):
+        connection.send_error(msg["id"], "not_found", "Only discovered web UIs can be hidden")
         return
     hub.async_set_hidden(msg["view_id"], msg["hidden"])
     connection.send_result(msg["id"])

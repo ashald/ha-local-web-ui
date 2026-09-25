@@ -156,6 +156,20 @@ SECURITY_HEADERS = {
 MAX_SIMPLE_RESPONSE_SIZE = 4 * 1024 * 1024
 MAX_WEBSOCKET_MESSAGE_SIZE = 4 * 1024 * 1024
 UPSTREAM_TIMEOUT = ClientTimeout(total=None, sock_connect=10)
+# Until the response headers arrive; bodies and streams have no overall limit
+UPSTREAM_HEADERS_TIMEOUT = 60
+# Conditional requests would let the browser reuse a page with stale injected data
+CONDITIONAL_HEADERS = (hdrs.IF_NONE_MATCH, hdrs.IF_MODIFIED_SINCE)
+# Close codes that describe a local failure and must not be sent (RFC 6455 7.4.1)
+RESERVED_CLOSE_CODES = frozenset({1005, 1006, 1015})
+# Browsers refuse scripts and stylesheets with a wrong type (nosniff); small
+# device web servers often send none or a generic one
+GENERIC_TYPES = frozenset({"", "application/octet-stream", "text/plain"})
+TYPES_BY_EXTENSION = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+}
 
 
 @dataclass(slots=True)
@@ -194,11 +208,18 @@ def _error(status: int, text: str) -> web.Response:
 
 async def _handle(request: web.Request) -> web.StreamResponse:
     try:
-        return await _handle_request(request)
+        response = await _handle_request(request)
     except web.HTTPException as err:
         # Never let an HTTPUnauthorized escape: HA's ban middleware would count it
         status = 404 if err.status == 401 else err.status
-        return _error(status, err.text or err.reason)
+        response = _error(status, err.text or err.reason)
+    if (
+        request.headers.get(hdrs.ORIGIN) == "null"
+        and not response.prepared
+        and hdrs.ACCESS_CONTROL_ALLOW_ORIGIN not in response.headers
+    ):
+        response.headers.update(CORS_HEADERS)  # Errors too, so the page can read them
+    return response
 
 
 async def _handle_request(request: web.Request) -> web.StreamResponse:
@@ -251,11 +272,22 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
         return _error(502, f"{view.name} is not reachable")
 
 
+# Isolated pages have origin "null". Echoing it with credentials allowed lets the
+# page's credentialed requests (fetch with credentials: "include", XHR
+# withCredentials) work too; the browser holds no site credentials for these paths
+# (cookies are server side), and the actual credential is the path token.
+CORS_HEADERS = {
+    hdrs.ACCESS_CONTROL_ALLOW_ORIGIN: "null",
+    hdrs.ACCESS_CONTROL_ALLOW_CREDENTIALS: "true",
+    hdrs.VARY: "Origin",
+}
+
+
 def _preflight_response(request: web.Request) -> web.Response:
     headers = {
         **SECURITY_HEADERS,
+        **CORS_HEADERS,
         "Content-Security-Policy": ISOLATION_CSP,
-        hdrs.ACCESS_CONTROL_ALLOW_ORIGIN: "*",
         hdrs.ACCESS_CONTROL_ALLOW_METHODS: "GET, HEAD, POST, PUT, PATCH, DELETE",
         hdrs.ACCESS_CONTROL_MAX_AGE: "600",
     }
@@ -271,6 +303,9 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
         if name.lower() not in REQUEST_HEADERS_DROPPED
         and not name.lower().startswith(REQUEST_HEADER_PREFIXES_DROPPED)
     )
+    if request.headers.get("Sec-Fetch-Dest") in ("document", "iframe"):
+        for name in CONDITIONAL_HEADERS:
+            headers.pop(name, None)
     cookies = ctx.hub.cookie_jar(ctx.session.user_id, ctx.view).filter_cookies(url)
     if cookies:
         headers[hdrs.COOKIE] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
@@ -313,8 +348,14 @@ def _response_headers(result: aiohttp.ClientResponse, ctx: _Context) -> CIMultiD
     if ctx.view.mode == MODE_ISOLATED:
         headers["Content-Security-Policy"] = ISOLATION_CSP
     if ctx.cross_origin:
-        headers[hdrs.ACCESS_CONTROL_ALLOW_ORIGIN] = "*"
-        headers[hdrs.ACCESS_CONTROL_EXPOSE_HEADERS] = "*"
+        # With credentials allowed, "*" is not a wildcard here: name the headers
+        exposed = sorted({name.lower() for name in headers} - {"set-cookie"})
+        if vary := headers.get(hdrs.VARY):
+            headers[hdrs.VARY] = f"{vary}, Origin"
+        headers.update({k: v for k, v in CORS_HEADERS.items() if k != hdrs.VARY})
+        headers.setdefault(hdrs.VARY, "Origin")
+        if exposed:
+            headers[hdrs.ACCESS_CONTROL_EXPOSE_HEADERS] = ", ".join(exposed)
     return headers
 
 
@@ -353,7 +394,11 @@ def html_rewriter(origin: URL, prefix: str) -> Callable[[bytes], bytes]:
         re.IGNORECASE,
     )
     replacement = rb"\1" + prefix.encode().replace(b"\\", b"\\\\") + b"/"
-    return lambda body: pattern.sub(replacement, body)
+    return lambda body: _META_REFERRER.sub(rb"\1x-referrer-removed", pattern.sub(replacement, body))
+
+
+# A page's own referrer policy could send its URL (with the token) to other sites
+_META_REFERRER = re.compile(rb"(<meta\s[^>]*?name\s*=\s*[\"']?)referrer", re.IGNORECASE)
 
 
 # Runs before any script of a proxied page; see inject.js
@@ -390,6 +435,8 @@ def inject_script(ctx: _Context) -> bytes:
     }
     if isolated:
         config["storage"] = ctx.hub.shim_storage(ctx.session.user_id, view.view_id)
+        # Lets the page tell whether the previous page's last write made it in
+        config["writes"] = ctx.hub.applied_writes(ctx.session.user_id, view.view_id)
     return (
         b"<script>/* local_web_ui */(" + INJECT_JS + b")(" + _js(config).encode() + b");</script>"
     )
@@ -434,13 +481,27 @@ async def read_limited(stream: aiohttp.StreamReader, limit: int) -> tuple[bytes,
 
 
 async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -> web.Response:
-    """Endpoints the injected script writes to (emulated storage and cookies)."""
+    """Endpoints the injected script uses (emulated storage and cookies).
+
+    POST storage  {"w": write id, "set": {key: value or null}, "clear": bool}
+    GET  storage?w=<write id>  the current storage, once that write has arrived
+    POST cookie   one Set-Cookie style string, from document.cookie
+    """
     hub, session, view = ctx.hub, ctx.session, ctx.view
     name = raw_path[len(INTERNAL_PATH_PREFIX) + 1 :]
-    if request.method != hdrs.METH_POST or name not in ("storage", "cookie"):
-        raise web.HTTPNotFound
     if name == "storage" and view.mode != MODE_ISOLATED:
         raise web.HTTPNotFound  # Trusted pages have real localStorage
+    headers = {**SECURITY_HEADERS, "Content-Security-Policy": ISOLATION_CSP}
+    if ctx.cross_origin:
+        headers.update(CORS_HEADERS)
+    if name == "storage" and request.method == hdrs.METH_GET:
+        await hub.async_wait_for_storage_write(
+            session.user_id, view.view_id, request.query.get("w", "")
+        )
+        headers[hdrs.CACHE_CONTROL] = "no-store"
+        return web.json_response(hub.shim_storage(session.user_id, view.view_id), headers=headers)
+    if request.method != hdrs.METH_POST or name not in ("storage", "cookie"):
+        raise web.HTTPNotFound
     body, complete = await read_limited(request.content, MAX_SHIM_STORAGE_BYTES)
     if not complete:
         raise web.HTTPRequestEntityTooLarge(max_size=MAX_SHIM_STORAGE_BYTES, actual_size=len(body))
@@ -449,16 +510,21 @@ async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -
             data = json.loads(body)
         except ValueError:
             raise web.HTTPBadRequest from None
-        if not isinstance(data, dict) or len(data) > MAX_SHIM_STORAGE_KEYS:
+        changes = data.get("set") if isinstance(data, dict) else None
+        if not isinstance(changes, dict) or len(changes) > MAX_SHIM_STORAGE_KEYS:
             raise web.HTTPBadRequest
-        hub.async_set_shim_storage(
-            session.user_id, view.view_id, {str(k): str(v) for k, v in data.items()}
-        )
+        if not hub.async_apply_storage_write(
+            session.user_id,
+            view.view_id,
+            str(data.get("w") or "")[:64],
+            {str(k): None if v is None else str(v) for k, v in changes.items()},
+            bool(data.get("clear")),
+        ):
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=MAX_SHIM_STORAGE_BYTES, actual_size=len(body)
+            )
     else:
         hub.async_store_cookies(session.user_id, view, [body.decode(errors="replace")], view.origin)
-    headers = {**SECURITY_HEADERS, "Content-Security-Policy": ISOLATION_CSP}
-    if ctx.cross_origin:
-        headers[hdrs.ACCESS_CONTROL_ALLOW_ORIGIN] = "*"
     return web.Response(status=204, headers=headers)
 
 
@@ -487,65 +553,89 @@ async def _proxy_request(
     url: URL,
     headers: CIMultiDict[str],
 ) -> web.StreamResponse:
-    view, prefix = ctx.view, ctx.prefix
-    async with client.request(
-        request.method,
-        url,
-        headers=headers,
-        data=request.content if request.body_exists else None,
-        allow_redirects=False,
-        timeout=UPSTREAM_TIMEOUT,
-        skip_auto_headers={hdrs.CONTENT_TYPE, hdrs.USER_AGENT},
-    ) as result:
-        response_headers = _response_headers(result, ctx)
-        content_type = (
-            result.headers.get(hdrs.CONTENT_TYPE, "application/octet-stream")
-            .partition(";")[0]
-            .strip()
-            .lower()
-        )
-        if must_be_empty_body(request.method, result.status):
-            if hdrs.CONTENT_TYPE in result.headers:
-                response_headers[hdrs.CONTENT_TYPE] = result.headers[hdrs.CONTENT_TYPE]
-            return web.Response(status=result.status, headers=response_headers)
-
-        length = result.headers.get(hdrs.CONTENT_LENGTH)
-        is_html = content_type in ("text/html", "application/xhtml+xml")
-        if is_html or (length is not None and int(length) <= MAX_SIMPLE_RESPONSE_SIZE):
-            body, complete = await read_limited(result.content, MAX_SIMPLE_RESPONSE_SIZE)
-            if complete:
-                if is_html:
-                    body = html_rewriter(view.origin, prefix)(body)
-                    body = inject_first(body, inject_script(ctx))
-                    # The page now embeds this user's stored site data
-                    response_headers[hdrs.CACHE_CONTROL] = "no-store"
-                elif content_type == "text/css":
-                    body = rewrite_css(body, prefix)
-                response = web.Response(status=result.status, headers=response_headers, body=body)
-                response.headers[hdrs.CONTENT_TYPE] = result.headers.get(
-                    hdrs.CONTENT_TYPE, content_type
-                )
-                if _should_compress(content_type) and len(body) > 256:
-                    response.enable_compression()
+    limiter = ctx.hub.request_limiter(ctx.view)
+    await limiter.acquire()
+    held = True
+    try:
+        async with asyncio.timeout(UPSTREAM_HEADERS_TIMEOUT):
+            result = await client.request(
+                request.method,
+                url,
+                headers=headers,
+                data=request.content if request.body_exists else None,
+                allow_redirects=False,
+                timeout=UPSTREAM_TIMEOUT,
+                skip_auto_headers={hdrs.CONTENT_TYPE, hdrs.USER_AGENT},
+            )
+        async with result:
+            response, stream_head = await _respond(request, ctx, result, url)
+            if stream_head is None:
                 return response
-            # Too large to rewrite: stream what we read, then the rest
-            return await _stream(request, result, response_headers, content_type, body)
+            # Streams (downloads, server-sent events) can last long; let others in
+            limiter.release()
+            held = False
+            return await _stream(request, result, response, stream_head)
+    finally:
+        if held:
+            limiter.release()
 
-        return await _stream(request, result, response_headers, content_type, b"")
+
+async def _respond(
+    request: web.Request, ctx: _Context, result: aiohttp.ClientResponse, url: URL
+) -> tuple[web.StreamResponse, bytes | None]:
+    """The response for a device response: complete, or to stream (with its head)."""
+    view, prefix = ctx.view, ctx.prefix
+    response_headers = _response_headers(result, ctx)
+    content_type_header = result.headers.get(hdrs.CONTENT_TYPE, "")
+    content_type = content_type_header.partition(";")[0].strip().lower()
+    if content_type in GENERIC_TYPES and (
+        fixed := TYPES_BY_EXTENSION.get(Path(url.path).suffix.lower())
+    ):
+        content_type = content_type_header = fixed
+    if must_be_empty_body(request.method, result.status):
+        if content_type_header:
+            response_headers[hdrs.CONTENT_TYPE] = content_type_header
+        return web.Response(status=result.status, headers=response_headers), None
+
+    is_html = content_type in ("text/html", "application/xhtml+xml")
+    if is_html:
+        # The page will embed this user's site data: never reuse a stored copy
+        response_headers[hdrs.CACHE_CONTROL] = "no-store"
+        response_headers.popall(hdrs.ETAG, None)
+        response_headers.popall(hdrs.LAST_MODIFIED, None)
+    length = result.headers.get(hdrs.CONTENT_LENGTH)
+    body = b""
+    if is_html or (
+        length is not None and length.isdigit() and int(length) <= MAX_SIMPLE_RESPONSE_SIZE
+    ):
+        body, complete = await read_limited(result.content, MAX_SIMPLE_RESPONSE_SIZE)
+        if is_html:
+            # Also when too large to buffer: the start of the page gets the script
+            body = html_rewriter(view.origin, prefix)(body)
+            body = inject_first(body, inject_script(ctx))
+        if complete:
+            if content_type == "text/css":
+                body = rewrite_css(body, prefix)
+            response = web.Response(status=result.status, headers=response_headers, body=body)
+            response.headers[hdrs.CONTENT_TYPE] = content_type_header or "application/octet-stream"
+            if _should_compress(content_type) and len(body) > 256:
+                response.enable_compression()
+            return response, None
+
+    response = web.StreamResponse(status=result.status, headers=response_headers)
+    response.headers[hdrs.CONTENT_TYPE] = content_type_header or "application/octet-stream"
+    if _should_compress(content_type):
+        response.enable_compression()
+    return response, body
 
 
 async def _stream(
     request: web.Request,
     result: aiohttp.ClientResponse,
-    headers: CIMultiDict[str],
-    content_type: str,
+    response: web.StreamResponse,
     head: bytes,
 ) -> web.StreamResponse:
     """Stream large or unbounded bodies: downloads, chunked responses, SSE."""
-    response = web.StreamResponse(status=result.status, headers=headers)
-    response.headers[hdrs.CONTENT_TYPE] = result.headers.get(hdrs.CONTENT_TYPE, content_type)
-    if _should_compress(content_type):
-        response.enable_compression()
     await response.prepare(request)
     try:
         if head:
@@ -619,7 +709,10 @@ async def _websocket_forward(
                 await ws_to.ping(msg.data)
             elif msg.type is aiohttp.WSMsgType.PONG:
                 await ws_to.pong(msg.data)
-        # Iteration ends on close
-        await ws_to.close(code=ws_from.close_code or aiohttp.WSCloseCode.OK)
-    except (RuntimeError, ConnectionError):
+        # Iteration ends on close. A lost connection has a local-only code.
+        code = ws_from.close_code
+        if code is None or code < 1000 or code in RESERVED_CLOSE_CODES:
+            code = aiohttp.WSCloseCode.GOING_AWAY
+        await ws_to.close(code=code)
+    except RuntimeError, ConnectionError:
         pass
