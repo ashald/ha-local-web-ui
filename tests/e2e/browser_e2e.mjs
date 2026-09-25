@@ -109,6 +109,25 @@ check("Router: localStorage and login survive a reload (stored server side)", vi
 await page.waitForTimeout(1500); // let HA's loading splash fade after the reload
 await page.screenshot({ path: `${outDir}/4-router-sidebar.png` });
 
+// Save, then reload at once: the next page must see the write, although the
+// write can reach Home Assistant after the reloaded page was rendered
+for (let round = 1; round <= 3; round++) {
+  const value = `saved-${round}-${Date.now()}`;
+  await frame.evaluate((v) => { localStorage.setItem("race", v); location.reload(); }, value).catch(() => {});
+  await page.waitForTimeout(300);
+  frame = await waitFrame(page, router.view_id);
+  await frame.waitForFunction(() => document.getElementById("server")?.textContent.startsWith("{"), null, { timeout: 15000 });
+  const seen = await frame.evaluate(() => localStorage.getItem("race"));
+  check(`Router: localStorage write right before a reload is kept (round ${round})`, seen === value, `${seen}`);
+}
+const apis = await frame.evaluate(async () => ({
+  indexedDB: typeof indexedDB,
+  serviceWorker: "serviceWorker" in navigator,
+  credentialed: (await fetch("api/whoami", { credentials: "include" })).status,
+}));
+check("Isolated: throwing APIs removed, credentialed fetch works",
+      apis.indexedDB === "undefined" && !apis.serviceWorker && apis.credentialed === 200, JSON.stringify(apis));
+
 // 3) Standalone: open in a new tab (full page, no HA chrome), still isolated
 const session = await ws(page, { type: "local_web_ui/session", view_id: router.view_id });
 const tab = await page.context().newPage();
@@ -128,7 +147,35 @@ await ws(page, { type: "local_web_ui/set_device_link", device_id: porch.device_i
 const relinked = await deviceUrl();
 check("Link switch on points Visit back at the view", relinked === `homeassistant://local-web-ui/${porch.view_id}`, relinked);
 
-// 5) Phone width list
+// 5) Optional "<device> web UI" linked device on the device page
+const api = async (path, body) => (await fetch(`${HA}${path}`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${hassTokens.access_token}`, "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+})).json();
+const setOptions = async (changes) => {
+  const entry = (await ws(page, { type: "config_entries/get", domain: "local_web_ui" }))[0];
+  const flow = await api("/api/config/config_entries/options/flow", { handler: entry.entry_id });
+  const current = Object.fromEntries(flow.data_schema.map((f) => [f.name, f.default]));
+  return api(`/api/config/config_entries/options/flow/${flow.flow_id}`, { ...current, ...changes });
+};
+await setOptions({ linked_devices: true });
+await page.goto(`${HA}/config/devices/device/${porch.device_id}`);
+await page.waitForTimeout(3000);
+const linkedCard = await page.evaluate(() => {
+  let found = false;
+  const walk = (root) => root.querySelectorAll("*").forEach((el) => {
+    if (el.shadowRoot) walk(el.shadowRoot);
+    if (el.textContent?.includes("Porch Light web UI")) found = true;
+  });
+  walk(document);
+  return found;
+});
+check("Linked devices card shows the Porch Light web UI device", linkedCard);
+await page.screenshot({ path: `${outDir}/7-linked-device.png` });
+await setOptions({ linked_devices: false });
+
+// 6) Phone width list
 const phone = await newPage({ width: 390, height: 844 });
 await phone.goto(`${HA}/local-web-ui`);
 await phone.waitForTimeout(2500);

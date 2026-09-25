@@ -245,6 +245,11 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     if (view := hub.get_view(view_id)) is None:
         raise web.HTTPNotFound
 
+    if request.headers.get("Service-Worker") == "script":
+        # Registered from HA's origin, a service worker could outlive the view and
+        # intercept Home Assistant itself. inject.js refuses too, but a page can get
+        # around that; the browser always marks the script request.
+        raise web.HTTPForbidden
     raw_path = raw[len(prefix) :] or "/"
     # Isolated pages have an opaque origin, so their requests to us are cross-origin
     cross_origin = request.headers.get(hdrs.ORIGIN) == "null"
