@@ -71,7 +71,8 @@ Views come from two sources:
 
 ## Proxy behaviour
 
-Inherited from the variant 1 PoC, which is tested with HTTP, 1 MiB downloads, SSE and WebSockets.
+Inherited from the variant 1 PoC, where it is tested with HTTP, 1 MiB downloads, SSE and
+WebSockets.
 
 **Request headers**
 - Hop-by-hop headers, `Origin` and `Referer` (which contains the token) are dropped.
@@ -81,30 +82,53 @@ Inherited from the variant 1 PoC, which is tested with HTTP, 1 MiB downloads, SS
   injected as Basic auth.
 
 **Response headers**
-- `X-Frame-Options` and the device's own CSP are dropped. In isolated mode our sandbox CSP
-  is added.
+- `X-Frame-Options`, the device's CSP, `Clear-Site-Data` and `Referrer-Policy` are dropped.
+- In isolated mode the sandbox CSP is added, and `Referrer-Policy` is always
+  `strict-origin-when-cross-origin`.
 - `Location` headers pointing at the target origin or at a root-relative path are rewritten
   under the prefix.
 
-**HTML rewriting**
-- Root-relative `src`, `href` and `action` attributes are rewritten under the prefix, as are
-  absolute URLs to the target origin.
-- In isolated mode the storage shim is injected.
+**Server-side rewriting**
+- HTML: root-relative `src`/`href`/`action`/`formaction`/`poster` attributes (including
+  `<base href="/">`) and absolute or protocol-relative URLs to the target origin are
+  rewritten under the prefix.
+- CSS: root-relative `url(...)` and `@import`.
+- Bodies over 4 MiB are streamed without rewriting.
+
+**Runtime rewriting** (`inject.js`, injected first in `<head>` in both modes)
+- The script keeps URLs that the page builds at runtime under the prefix: `fetch`, XHR,
+  `EventSource`, `WebSocket`, `history.pushState`/`replaceState`, `window.open`, `src`/`href`/
+  `action` set through `setAttribute` or properties, and link clicks and form submits.
+- It handles root-relative paths, `location.host`-based URLs and absolute URLs to the device.
+- In isolated mode the same script also emulates `localStorage`, `sessionStorage` (per page)
+  and `document.cookie`.
 
 **Bodies and streaming**
 - Bodies up to 4 MiB are buffered, and compressible types are compressed.
 - Larger or unknown-length bodies, and SSE (uncompressed), are streamed.
-- WebSockets are relayed frame by frame.
+- WebSockets connect upstream first, then accept the browser with the negotiated subprotocol,
+  and relay frames.
 
 **Upstream connections**
-- One aiohttp `ClientSession` per `verify_ssl` value.
-- `DummyCookieJar`, because cookies are handled per user and view as above.
-- `limit_per_host=6`, a 10 s connect timeout, and no total timeout.
+- HA's shared aiohttp connectors (so `.local` names resolve over mDNS), one session per
+  `verify_ssl` value.
+- `DummyCookieJar`, because cookies are per user and view, as above.
+- A 10 s connect timeout and no total timeout.
 
 **Safety**
-- Targets always come from view config, never from the request. There is no open proxy and
-  no SSRF.
-- Everything is admin-only in v0.1.
+- Targets always come from view config or the device registry, never from the request.
+- Everything is admin-only in v0.1; each proxied request re-checks that the session's user is
+  still an active admin.
+
+**Discovery filter.** A discovered URL must point at one of:
+- a private IPv4/IPv6 address, or `100.64.0.0/10` (Tailscale/CGNAT);
+- a `.local`, `.lan`, `.home`, `.home.arpa`, `.internal` or `.localdomain` name;
+- a single-label hostname.
+
+It excludes loopback, link-local, multicast, cloud metadata addresses, Supervisor's
+`172.30.32.0/23` network, app hostnames (`core-*`, `local-*`, `a0d7b954-*`, `supervisor`,
+`homeassistant`) and Home Assistant's own URLs. Discovered views skip TLS verification,
+because LAN devices rarely have trusted certificates. Static views are not filtered.
 
 ## Frontend
 
@@ -124,7 +148,8 @@ with no build step.
 - It is controlled at two levels:
   - a **global switch** in the integration options, `link_device_pages`, default on;
   - **per-device exceptions** that flip the global default for one device. You set them from
-    the panel's view menu ("Use for device page link"), and they are stored in options.
+    the panel's view menu, and they are stored in `.storage/local_web_ui` together with the
+    remembered originals and hidden views, so changing them does not reload the integration.
 - The original URL is remembered in `.storage`. It is refreshed whenever the owning
   integration rewrites it (for example on ESPHome reconnect), and restored when linking is
   turned off for that device, globally, or when the integration is removed.
@@ -143,12 +168,13 @@ with no build step.
 | `local_web_ui/views` | list the visible views |
 | `local_web_ui/session {view_id, token?}` | create or extend a session; returns `{url, token, name, mode, expires_in}` |
 | `local_web_ui/pin {view_id}` | turn a discovered view into a static subentry |
-| `local_web_ui/hide {view_id}` / `local_web_ui/unhide {view_id}` | hide or unhide a discovered view |
+| `local_web_ui/set_hidden {view_id, hidden}` | hide or unhide a discovered view |
+| `local_web_ui/set_device_link {device_id, enabled}` | per-device override of `link_device_pages` |
+| `local_web_ui/clear_site_data {view_id}` | forget the caller's cookies and stored data for a view ("log out") |
 
 ## Out of scope for v0.1 (designed for)
 
 - A pluggable transport, for example the ESPHome native-API tunnel from variant 1.
 - Non-admin users with per-view allow lists.
-- A `document.cookie` shim.
-- CSS `url(/…)` and JavaScript-built absolute URLs. UIs that build `location.origin + '/…'`
-  need trusted mode plus firmware that honours `X-Ingress-Path`, or rewrite rules.
+- Root-relative ES module imports (`import "/x.js"`), and URLs built from `location.origin`
+  while isolated (the origin is `null`). Trusted mode handles the latter.

@@ -47,7 +47,7 @@
             "icon": "Icon"
           },
           "data_description": {
-            "url": "For example http://192.168.1.50/ or https://printer.local:8443/admin/",
+            "url": "The full address of the page, including http or https and the port if it is not the default.",
             "mode": "Isolated keeps the page away from Home Assistant; it cannot read Home Assistant's data or act as you. Trusted runs it with Home Assistant's own origin, which some pages need (for example ones that rely on browser storage APIs the isolation shim does not cover), but the page's scripts could then control Home Assistant as you. Only use it for pages you fully trust.",
             "trusted_acknowledged": "Required for trusted mode.",
             "verify_ssl": "Turn off for devices with self-signed certificates.",

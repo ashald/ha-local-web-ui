@@ -187,8 +187,8 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
             headers[hdrs.COOKIE] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
     elif cookie := request.headers.get(hdrs.COOKIE):
         headers[hdrs.COOKIE] = cookie
-    if view.auth is not None and hdrs.AUTHORIZATION not in headers:
-        headers[hdrs.AUTHORIZATION] = view.auth.encode()
+    if view.authorization is not None and hdrs.AUTHORIZATION not in headers:
+        headers[hdrs.AUTHORIZATION] = view.authorization
     # Same header Supervisor ingress uses, so UIs built for ingress can adapt links
     headers["X-Ingress-Path"] = prefix
     if request.transport and (peername := request.transport.get_extra_info("peername")):

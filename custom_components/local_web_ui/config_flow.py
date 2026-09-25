@@ -182,18 +182,27 @@ class WebUiSubentryFlow(ConfigSubentryFlow):
                 data=_subentry_data(user_input, dict(subentry.data)),
             )
         defaults = {CONF_NAME: subentry.title, **subentry.data}
-        return self.async_show_form(
-            step_id="reconfigure",
-            data_schema=_view_schema(defaults),
-            errors=errors,
-        )
+        schema = _view_schema(defaults)
+        if user_input is not None:
+            # Keep what was typed when validation fails, except the password
+            schema = self.add_suggested_values_to_schema(
+                schema, {k: v for k, v in user_input.items() if k != CONF_PASSWORD}
+            )
+        return self.async_show_form(step_id="reconfigure", data_schema=schema, errors=errors)
 
 
 def _subentry_data(user_input: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
-    password = user_input.get(CONF_PASSWORD) or previous.get(CONF_PASSWORD)
+    url = parse_http_url(user_input[CONF_URL].strip())
+    assert url is not None  # Validated before
     username = (user_input.get(CONF_USERNAME) or "").strip()
+    password = user_input.get(CONF_PASSWORD) or previous.get(CONF_PASSWORD)
+    if url.user is not None or url.password is not None:
+        # Credentials typed into the URL: keep them where they are used (and redacted)
+        username = username or url.user or ""
+        password = user_input.get(CONF_PASSWORD) or url.password or password
+        url = url.with_user(None)
     data: dict[str, Any] = {
-        CONF_URL: user_input[CONF_URL].strip(),
+        CONF_URL: str(url),
         CONF_MODE: user_input[CONF_MODE],
         CONF_TRUSTED_ACK: bool(user_input.get(CONF_TRUSTED_ACK)),
         CONF_VERIFY_SSL: user_input[CONF_VERIFY_SSL],

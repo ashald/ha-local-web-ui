@@ -21,6 +21,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import voluptuous as vol
 
 from custom_components.local_web_ui import config_flow
+from custom_components.local_web_ui.hub import basic_authorization
 from custom_components.local_web_ui.const import (
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
@@ -378,7 +379,7 @@ async def test_view_user_step_creates_subentry(hass: HomeAssistant, entry: MockC
     assert view.name == "Router"
     assert view.url == "http://192.168.1.1/admin/?tab=1"
     assert view.source == "static"
-    assert view.auth is None
+    assert view.authorization is None
     # Not flagged for the sidebar: no extra panel
     assert _view_panel_path(subentry.subentry_id) not in _panels(hass)
 
@@ -434,8 +435,7 @@ async def test_view_user_step_strips_and_stores_all_fields(
     view = entry.runtime_data.static_views[subentry.subentry_id]
     assert view.mode == MODE_TRUSTED
     assert view.verify_ssl is False
-    assert view.auth is not None
-    assert (view.auth.login, view.auth.password) == ("admin", "hunter2")
+    assert view.authorization == basic_authorization("admin", "hunter2")
     assert view.icon == "mdi:nas"
 
 
@@ -582,27 +582,22 @@ async def test_unknown_subentry_type_is_rejected(
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: credentials in the URL are accepted, silently ignored by the proxy and stored unredacted",
-)
 async def test_view_url_with_credentials_is_not_stored_verbatim(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
-    """http://user:pass@host/ must be rejected or split into the credential fields.
+    """http://user:pass@host/ is split into the credential fields.
 
-    Today the flow stores it as is: the proxy drops the userinfo (view origin), so
-    Basic auth is never sent, and the password sits in the url field, which
-    diagnostics does not redact.
+    The proxy only sends Basic auth from those fields, and only they are redacted in
+    diagnostics, so the credentials must not stay in the URL.
     """
     result, subentry = await _add_view(
         hass, entry, VIEW_INPUT | {CONF_URL: "http://admin:s3cret@192.168.1.1/"}
     )
-    if result["type"] is FlowResultType.FORM:
-        assert CONF_URL in result["errors"]
-        return
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert subentry is not None
-    assert "s3cret" not in subentry.data[CONF_URL]
+    assert subentry.data[CONF_URL] == "http://192.168.1.1/"
+    assert subentry.data[CONF_USERNAME] == "admin"
+    assert subentry.data[CONF_PASSWORD] == "s3cret"
 
 
 # ---- view subentry: reconfigure ---------------------------------------------
@@ -713,8 +708,7 @@ async def test_reconfigure_empty_password_keeps_stored_one(
     assert data[CONF_USERNAME] == "admin"
     assert data[CONF_PASSWORD] == "hunter2"
     view = entry.runtime_data.static_views[subentry.subentry_id]
-    assert view.auth is not None
-    assert (view.auth.login, view.auth.password) == ("admin", "hunter2")
+    assert view.authorization == basic_authorization("admin", "hunter2")
 
 
 async def test_reconfigure_new_password_replaces_stored_one(
@@ -748,7 +742,7 @@ async def test_reconfigure_removing_username_drops_password(
     data = entry.subentries[subentry.subentry_id].data
     assert CONF_USERNAME not in data
     assert CONF_PASSWORD not in data
-    assert entry.runtime_data.static_views[subentry.subentry_id].auth is None
+    assert entry.runtime_data.static_views[subentry.subentry_id].authorization is None
 
 
 async def test_reconfigure_removing_icon(hass: HomeAssistant, entry: MockConfigEntry) -> None:
@@ -846,10 +840,6 @@ async def test_reconfigure_trusted_with_ack(hass: HomeAssistant, entry: MockConf
     assert entry.runtime_data.static_views[subentry.subentry_id].mode == MODE_TRUSTED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a reconfigure validation error re-shows the stored values, discarding the user's edits",
-)
 async def test_reconfigure_error_keeps_user_input(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:

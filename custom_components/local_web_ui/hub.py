@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
@@ -59,7 +60,7 @@ class View:
     entry: str  # raw path and query of the page to open first
     mode: str
     verify_ssl: bool
-    auth: aiohttp.BasicAuth | None
+    authorization: str | None  # Authorization header value for stored credentials
     source: str  # "static" or "discovered"
     device_id: str | None
     show_in_sidebar: bool
@@ -70,6 +71,12 @@ class View:
     def url(self) -> str:
         """Full URL of the entry page, for display."""
         return str(self.origin) + self.entry
+
+
+def basic_authorization(username: str, password: str) -> str:
+    """HTTP Basic credentials (RFC 7617, UTF-8)."""
+    token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return f"Basic {token}"
 
 
 def view_from_url(url: URL) -> tuple[URL, str]:
@@ -216,9 +223,11 @@ class LocalWebUiHub:
                 _LOGGER.warning("Ignoring web UI %s with invalid URL", subentry.title)
                 continue
             origin, entry_path = view_from_url(url)
-            auth = None
+            authorization = None
             if data.get(CONF_USERNAME):
-                auth = aiohttp.BasicAuth(data[CONF_USERNAME], data.get(CONF_PASSWORD) or "")
+                authorization = basic_authorization(
+                    data[CONF_USERNAME], data.get(CONF_PASSWORD) or ""
+                )
             views[subentry.subentry_id] = View(
                 view_id=subentry.subentry_id,
                 name=subentry.title,
@@ -226,7 +235,7 @@ class LocalWebUiHub:
                 entry=entry_path,
                 mode=data.get(CONF_MODE, MODE_ISOLATED),
                 verify_ssl=data.get(CONF_VERIFY_SSL, True),
-                auth=auth,
+                authorization=authorization,
                 source="static",
                 device_id=data.get(CONF_DEVICE_ID),
                 show_in_sidebar=data.get(CONF_SHOW_IN_SIDEBAR, False),
@@ -267,7 +276,7 @@ class LocalWebUiHub:
             entry=entry_path,
             mode=MODE_ISOLATED,
             verify_ssl=False,  # Device UIs on the LAN rarely have trusted certificates
-            auth=None,
+            authorization=None,
             source="discovered",
             device_id=device.id,
             show_in_sidebar=False,
