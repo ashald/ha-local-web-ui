@@ -126,6 +126,22 @@ at all. It needs changes to ESPHome, aioesphomeapi and Home Assistant core; see
 [ashald/esphome@variant-1](https://github.com/ashald/esphome/tree/variant-1/poc). This
 integration is designed to become its carrier.
 
+## Related projects
+
+- [hass_ingress](https://github.com/lovelylain/hass_ingress) (custom integration, in the HACS
+  default list) proxies URLs you list in YAML at `/api/ingress/<name>/`, each with its own
+  sidebar panel. Proxied pages share Home Assistant's origin, so they can act as you.
+- [Multi-App Proxy](https://github.com/Pulpyyyy/multiappproxy) and
+  [Admin Panels](https://github.com/WilliamFriconneau/ha-admin-panels) are apps (add-ons)
+  that proxy several LAN UIs behind one ingress panel, also on Home Assistant's origin.
+- Browser-in-the-sidebar apps (Firefox, Chromium) stream a whole remote browser: fully
+  isolated, but heavy, and not native on phones.
+
+Local Web UIs differs in three ways: it finds device UIs itself (from the device list),
+it isolates each page from Home Assistant by default, and it keeps each site's cookies
+separately per user on the server. An app (add-on) alone cannot isolate pages: Supervisor
+ingress authenticates with a `SameSite=Strict` cookie that isolated pages never send.
+
 ## Development
 
 ```bash
