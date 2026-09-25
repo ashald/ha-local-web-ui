@@ -23,11 +23,12 @@
         },
         "data_description": {
           "discovery": "List devices whose integration links to a local web page (their \"Visit\" link), such as ESPHome devices with web_server, WLED or printers.",
-          "link_device_pages": "Point the \"Visit\" button of devices with a web UI at their web UI here, so it also works away from home. Can be changed per device in the panel. Turning it off restores the original links.",
+          "link_device_pages": "Point the \"Visit\" button of devices with a web UI at their web UI here, so it also works away from home. To change it for one device, use ⋮ on its row in the Local Web UIs panel. Turning it off restores the original links.",
           "linked_devices": "Next to each device with a web UI, add a device named after it with \"web UI\" appended. It appears in the \"Linked devices\" card of the device's page, and its \"Visit\" button opens the web UI here. The device itself is not changed.",
           "panel_title": "Name of the Local Web UIs entry in the sidebar. Leave empty for \"Local Web UIs\".",
           "panel_icon": "Icon of the Local Web UIs entry in the sidebar."
-        }
+        },
+        "description": "These settings apply to all web UIs. Settings of one web UI (hiding it, its device's \"Visit\" button, forgetting its saved logins) are in the [Local Web UIs panel]({panel_url}): open ⋮ on its row. Web UIs you add (\"Add web UI\") are edited here, on the integration page."
       }
     }
   },

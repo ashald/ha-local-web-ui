@@ -49,6 +49,7 @@ from .const import (
     MODE_TRUSTED,
     MODES,
     NAME,
+    PANEL_URL_PATH,
     SUBENTRY_TYPE_VIEW,
 )
 from .discovery import parse_http_url
@@ -97,6 +98,7 @@ class LocalWebUiOptionsFlow(OptionsFlow):
         options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
+            description_placeholders={"panel_url": f"/{PANEL_URL_PATH}"},
             data_schema=vol.Schema(
                 {
                     vol.Required(

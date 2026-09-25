@@ -56,6 +56,7 @@ const STYLE = `
   .message { padding: 32px 16px; text-align: center; color: var(--secondary-text-color); line-height: 1.5; }
   .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin: 4px 0 8px; }
   .actions a.button { border: 1px solid var(--divider-color); color: var(--primary-color); }
+  .actions .hint { flex: 1; align-self: center; font-size: 13px; color: var(--secondary-text-color); }
   details summary { cursor: pointer; color: var(--secondary-text-color); margin: 24px 4px 8px; }
   code { background: rgba(127,127,127,.18); padding: 1px 4px; border-radius: 4px; }
 `;
@@ -167,7 +168,9 @@ class LocalWebUiPanel extends HTMLElement {
     const hidden = views.filter((v) => v.hidden);
     const section = (title, list) =>
       list.length ? `<h2>${esc(title)}</h2>${list.map((v) => this._row(v)).join("")}` : "";
-    let html = `<div class="actions"><a class="button" href="/config/integrations/integration/local_web_ui">
+    let html = `<div class="actions"><span class="hint">⋮ on a row: settings of that web UI.
+      Settings at the top: options for all of them, and web UIs you added.</span>
+      <a class="button" href="/config/integrations/integration/local_web_ui">
       ${icon("mdi:plus", "+")} Add a web UI</a></div>`;
     html += section("Devices", devices) + section("Sites", sites);
     if (!visible.length) {
@@ -219,10 +222,10 @@ class LocalWebUiPanel extends HTMLElement {
     if (view.source === "static") items.push(["edit", "mdi:pencil", "Edit…"]);
     if (view.device_link && !view.hidden) {
       items.push(view.device_link.enabled
-        ? ["link-off", "mdi:link-off", "Don't use for the device page's Visit link"]
-        : ["link-on", "mdi:link", "Use for the device page's Visit link"]);
+        ? ["link-off", "mdi:link-off", "Device page's Visit button: open the device directly"]
+        : ["link-on", "mdi:link", "Device page's Visit button: open it here"]);
       if (view.device_link.override !== null && view.device_link.override !== undefined) {
-        items.push(["link-default", "mdi:link-variant", "Visit link: follow the global setting"]);
+        items.push(["link-default", "mdi:link-variant", "Device page's Visit button: follow the integration option"]);
       }
     }
     if (view.device_id) items.push(["device", "mdi:devices", "Open device page"]);
