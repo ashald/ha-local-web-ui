@@ -608,8 +608,8 @@ async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -
             view.view_id,
             str(data.get("w") or "")[:64],
             {str(k): None if v is None else str(v) for k, v in changes.items()},
-            bool(data.get("clear")),
-            page,
+            clear=bool(data.get("clear")),
+            page=page,
         ):
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_SHIM_STORAGE_BYTES, actual_size=len(body)

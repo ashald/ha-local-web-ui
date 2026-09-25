@@ -831,6 +831,7 @@ class LocalWebUiHub:
         view_id: str,
         write_id: str,
         changes: dict[str, str | None],
+        *,
         clear: bool,
         page: tuple[str, int] | None = None,
     ) -> bool:

@@ -146,7 +146,7 @@ async def set_options(hass: HomeAssistant, entry: MockConfigEntry, **options: An
 def seed_site_data(hub: LocalWebUiHub, user_id: str, view: View) -> None:
     """Give a user cookies and stored data for a site, as the proxy would."""
     hub.async_store_cookies(user_id, view, ["sid=abc; Path=/"], URL(view.url))
-    assert hub.async_apply_storage_write(user_id, view.view_id, "w1", {"k": "v"}, False)
+    assert hub.async_apply_storage_write(user_id, view.view_id, "w1", {"k": "v"}, clear=False)
 
 
 def has_site_data(hub: LocalWebUiHub, user_id: str, view: View) -> bool:

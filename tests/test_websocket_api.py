@@ -1154,7 +1154,7 @@ async def test_diagnostics_never_contain_session_tokens_or_site_data(
     session = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
     hub = hub_of(hass)
     assert hub.async_apply_storage_write(
-        hass_admin_user.id, PRINTER_VIEW_ID, "write-1", {"secret": "s3cr3t"}, False
+        hass_admin_user.id, PRINTER_VIEW_ID, "write-1", {"secret": "s3cr3t"}, clear=False
     )
     router = hub.get_view(ROUTER_ID)
     assert router is not None

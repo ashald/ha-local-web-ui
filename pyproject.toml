@@ -6,6 +6,10 @@ line-length = 100
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "BLE", "ASYNC", "RET", "C4", "PIE"]
 ignore = ["PLR0913", "PLR0911", "PLR0912", "PLR0915", "PLR2004", "RET505", "E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# Test functions take their pytest fixtures as positional arguments
+"tests/**" = ["PLR0917"]
+
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
 combine-as-imports = true
