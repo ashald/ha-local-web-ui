@@ -60,11 +60,9 @@ const STYLE = `
   code { background: rgba(127,127,127,.18); padding: 1px 4px; border-radius: 4px; }
 `;
 
-const esc = (text) => {
-  const div = document.createElement("div");
-  div.textContent = text ?? "";
-  return div.innerHTML;
-};
+// For text and for quoted attribute values: names come from devices, not only admins
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const esc = (text) => String(text ?? "").replace(/[&<>"']/g, (c) => ESCAPES[c]);
 const icon = (name, fallback = "") =>
   customElements.get("ha-icon") ? `<ha-icon icon="${esc(name)}"></ha-icon>` : fallback;
 
