@@ -244,8 +244,13 @@ class LocalWebUiPanel extends HTMLElement {
     try {
       if (act === "open-tab") {
         const tab = window.open("about:blank", "_blank");
-        const s = await ws({ type: "local_web_ui/session", view_id: view.view_id });
-        if (tab) tab.location = s.url;
+        try {
+          const s = await ws({ type: "local_web_ui/session", view_id: view.view_id });
+          if (tab) tab.location = s.url;
+        } catch (err) {
+          tab?.close();
+          throw err;
+        }
         return;
       }
       if (act === "edit") return this._navigate("/config/integrations/integration/local_web_ui");

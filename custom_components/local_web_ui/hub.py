@@ -174,6 +174,11 @@ class SessionManager:
         session.expires = min(now + SESSION_TTL, session.created + SESSION_MAX_AGE)
         return session
 
+    def end_all(self) -> None:
+        """End every session, closing its WebSockets (integration disabled or removed)."""
+        for session in list(self._sessions.values()):
+            self._end(session)
+
     def revoke_user(self, user_id: str) -> None:
         for session in [s for s in self._sessions.values() if s.user_id == user_id]:
             self._end(session)
@@ -280,6 +285,8 @@ class LocalWebUiHub:
         self._limiters: dict[str, asyncio.Semaphore] = {}
         self._static: dict[str, View] = {}
         self._index: _DiscoveredIndex | None = None
+        # device_id -> (what the view was computed from, the view)
+        self._device_views: dict[str, tuple[tuple[Any, ...], View | None]] = {}
         self._unsubs: list[Callable[[], None]] = []
         self._own_hosts: frozenset[tuple[str, int]] = frozenset()
         self._loaded = False  # Never save over storage that was not loaded
@@ -309,6 +316,11 @@ class LocalWebUiHub:
         self._cookies = dict(jar.get("cookies", {}))
         self._shim_storage = dict(jar.get("storage", {}))
         self._loaded = True
+        # Users removed while the integration was not running
+        users = {user.id for user in await self.hass.auth.async_get_users()}
+        for user_id in {key.partition("|")[0] for key in (*self._cookies, *self._shim_storage)}:
+            if user_id not in users:
+                self._async_forget_user(user_id)
         self._own_hosts = self._compute_own_hosts()
         self._unsubs.append(
             self.hass.bus.async_listen(
@@ -336,8 +348,10 @@ class LocalWebUiHub:
         self._index = None
         for view_id, old in previous.items():
             # A web UI moved to another site must not hand it the old site's data
-            if (view := self._static.get(view_id)) is None or view.origin != old.origin:
+            if (view := self._static.get(view_id)) is None:
                 self._async_forget_view(view_id)
+            elif view.origin != old.origin:
+                self._async_forget_site_data(view_id)
         self.async_sync_device_links()
         self.async_sync_linked_devices()
         if trusted := [v.name for v in self._static.values() if v.mode == MODE_TRUSTED]:
@@ -385,6 +399,9 @@ class LocalWebUiHub:
             event.set()
         if self._loaded:
             await self._async_save_now()
+            # A request still in flight must not write storage back after this
+            # (the integration may have been removed)
+            self._loaded = False
 
     def _compute_own_hosts(self) -> frozenset[tuple[str, int]]:
         hosts: set[tuple[str, int]] = set()
@@ -484,9 +501,8 @@ class LocalWebUiHub:
             for device in iter_devices(dr.async_get(self.hass)):
                 if device.disabled or device.id in pinned:
                     continue
-                if (url := self.device_ui_url(device)) is None:
+                if (view := self._device_view(device)) is None:
                     continue
-                view = self._discovered_view(device, url)
                 if (kept := by_url.get(view.url)) is not None:
                     index.by_device[device.id] = kept
                     continue
@@ -494,6 +510,25 @@ class LocalWebUiHub:
                 index.by_device[device.id] = by_url[view.url] = view.view_id
         self._index = index
         return index
+
+    def _device_view(self, device: dr.DeviceEntry) -> View | None:
+        """The device's discovered view; remembered, as parsing URLs adds up."""
+        current = device.configuration_url
+        key = (
+            current,
+            self.originals.get(device.id)
+            if current and current.startswith(DEVICE_LINK_PREFIX)
+            else None,
+            device.name,
+            device.name_by_user,
+            device.config_entry_id,
+        )
+        if (cached := self._device_views.get(device.id)) is not None and cached[0] == key:
+            return cached[1]
+        url = self.device_ui_url(device)
+        view = None if url is None else self._discovered_view(device, url)
+        self._device_views[device.id] = (key, view)
+        return view
 
     def discovered_views(self, include_hidden: bool = False) -> dict[str, View]:
         return {
@@ -580,23 +615,56 @@ class LocalWebUiHub:
         if self._writing:
             return
         device_id = event.data["device_id"]
-        if event.data["action"] == "remove":
-            if self.originals.pop(device_id, None) is not None:
-                self._async_schedule_save()
-            self._async_forget_view(f"{DISCOVERED_PREFIX}{device_id}")
-        elif event.data["action"] == "update" and not (
+        action = event.data["action"]
+        if action == "update" and not (
             {"configuration_url", "disabled_by", "name", "name_by_user", "connections"}
             & set(event.data.get("changes", {}))
         ):
             return
-        else:
-            device = main_device(dr.async_get(self.hass), device_id)
-            if device is None or device.config_entry_id == self.entry.entry_id:
-                return  # A child device, or one of our linked devices
-        # Any device can change which device owns a shared URL's view, so every
-        # link is checked; only the ones that change are written
+        registry = dr.async_get(self.hass)
+        device = None if action == "remove" else main_device(registry, device_id)
+        if device is not None and device.config_entry_id == self.entry.entry_id:
+            return  # One of our linked devices
+        if device is None:
+            self._device_views.pop(device_id, None)
+        if device is None and (
+            device_id in self.originals
+            or device_id in self.link_overrides
+            or f"{DISCOVERED_PREFIX}{device_id}" in self.hidden
+            or any(k.endswith(f"|{DISCOVERED_PREFIX}{device_id}") for k in self._shim_storage)
+            or any(k.endswith(f"|{DISCOVERED_PREFIX}{device_id}") for k in self._cookies)
+        ):
+            # Removed, or turned into a child device (2026.9), which has no link of
+            # its own: forget what was kept for it
+            self.originals.pop(device_id, None)
+            self.link_overrides.pop(device_id, None)
+            self._async_forget_view(f"{DISCOVERED_PREFIX}{device_id}")
+        old = self._index
+        if (
+            old is not None
+            and device_id not in old.by_device
+            and (device is None or device.disabled or self.device_ui_url(device) is None)
+            and not any(view.device_id == device_id for view in self._static.values())
+        ):
+            return  # Had and has no web UI: nothing depends on it
         self._index = None
-        self.async_sync_device_links()
+        new = self._discovered_index()
+        if old is None:
+            self.async_sync_device_links()
+        else:
+            for view_id, view in old.views.items():
+                moved = new.views.get(view_id)
+                if moved is not None and moved.origin != view.origin:
+                    # A device's stored site data must not follow it to another site
+                    self._async_forget_site_data(view_id)
+            # Devices sharing a URL follow when the one owning its view changes
+            for other in {device_id} | {
+                d
+                for d in old.by_device.keys() | new.by_device.keys()
+                if old.by_device.get(d) != new.by_device.get(d)
+            }:
+                if (changed := main_device(registry, other)) is not None:
+                    self._async_sync_device_link(changed)
         self.async_sync_linked_devices()
 
     @callback
@@ -637,31 +705,35 @@ class LocalWebUiHub:
                 if target is None or target.disabled:
                     continue
                 wanted[view.view_id] = (view, target)
-        existing: dict[str, dr.DeviceEntry] = {}
-        for device in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
-            view_id = next((i for d, i in device.identifiers if d == DOMAIN), None)
-            if view_id is None or view_id not in wanted or view_id in existing:
-                self._write(registry.async_remove_device, device.id)
-            else:
-                existing[view_id] = device
         # Connections are unique within a config entry: two devices of one physical
         # device (one per integration) would otherwise merge into one linked device
         claimed: set[tuple[str, str]] = set()
+        specs: dict[str, tuple[set[tuple[str, str]], set[tuple[str, str]], str]] = {}
         for view_id, (view, target) in wanted.items():
             connections = set(target.connections) - claimed
             claimed |= connections
             identifiers = {(DOMAIN, view_id)}
             if not connections:
                 identifiers |= set(target.identifiers)
-            name = f"{view.name} web UI"
-            url = f"{DEVICE_LINK_PREFIX}{view_id}"
-            device = existing.get(view_id)
-            if device is not None and (
-                device.connections != connections or device.identifiers != identifiers
+            specs[view_id] = (identifiers, connections, f"{view.name} web UI")
+        # Remove everything that does not match first: creating a device whose
+        # connection an outdated one still holds would merge the two
+        existing: dict[str, dr.DeviceEntry] = {}
+        for device in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
+            view_id = next((i for d, i in device.identifiers if d == DOMAIN), None)
+            spec = specs.get(view_id) if view_id is not None else None
+            if (
+                spec is None
+                or view_id in existing
+                or device.identifiers != spec[0]
+                or device.connections != spec[1]
             ):
                 self._write(registry.async_remove_device, device.id)
-                device = None
-            if device is None:
+            else:
+                existing[view_id] = device
+        for view_id, (identifiers, connections, name) in specs.items():
+            url = f"{DEVICE_LINK_PREFIX}{view_id}"
+            if (device := existing.get(view_id)) is None:
                 self._write(
                     registry.async_get_or_create,
                     config_entry_id=self.entry.entry_id,
@@ -775,18 +847,27 @@ class LocalWebUiHub:
 
     @callback
     def _async_forget_view(self, view_id: str) -> None:
-        """Every user's cookies and stored data for a web UI that is gone."""
+        """Everything kept for a web UI that is gone."""
+        self.hidden.discard(view_id)
+        self._async_forget_site_data(view_id)
+
+    @callback
+    def _async_forget_site_data(self, view_id: str) -> None:
+        """Every user's cookies and stored data for a web UI (gone or moved)."""
         suffix = f"|{view_id}"
         for store in (self._jars, self._cookies, self._shim_storage, self._applied_writes):
             for key in [k for k in store if k.endswith(suffix)]:
                 del store[key]
-        self.hidden.discard(view_id)
         self._async_schedule_save()
 
     @callback
     def _async_user_removed(self, event: Event[dict[str, Any]]) -> None:
         user_id = event.data["user_id"]
         self.sessions.revoke_user(user_id)
+        self._async_forget_user(user_id)
+
+    @callback
+    def _async_forget_user(self, user_id: str) -> None:
         prefix = f"{user_id}|"
         for store in (self._jars, self._cookies, self._shim_storage, self._applied_writes):
             for key in [k for k in store if k.startswith(prefix)]:

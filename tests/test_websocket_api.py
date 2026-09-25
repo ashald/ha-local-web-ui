@@ -1127,7 +1127,8 @@ async def test_diagnostics_redacts_credentials(
     static = {view["title"]: view for view in diagnostics["static_views"]}
     assert static["Router"][CONF_USERNAME] == "**REDACTED**"
     assert static["Router"][CONF_PASSWORD] == "**REDACTED**"
-    assert static["Router"][CONF_URL] == ROUTER_URL
+    # Query strings can hold tokens
+    assert static["Router"][CONF_URL] == ROUTER_URL.partition("?")[0] + "?**REDACTED**"
     assert static["Router"][CONF_MODE] == MODE_TRUSTED
     assert CONF_USERNAME not in static["Office printer"]
     assert static["Office printer"][CONF_DEVICE_ID] == home.printer.id

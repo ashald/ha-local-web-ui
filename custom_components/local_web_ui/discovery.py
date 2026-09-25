@@ -32,8 +32,23 @@ _LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".local
 _SUPERVISOR_NETWORK = ipaddress.ip_network("172.30.32.0/23")
 # Carrier-grade NAT space, which Tailscale uses for devices on a tailnet
 _SHARED_NETWORK = ipaddress.ip_network("100.64.0.0/10")
-_METADATA_ADDRESSES = frozenset(
-    {ipaddress.ip_address("169.254.169.254"), ipaddress.ip_address("fd00:ec2::254")}
+# Cloud metadata services (AWS, GCP, Alibaba) and Tailscale's own DNS address.
+# Some sit inside ranges accepted below.
+_BLOCKED_ADDRESSES = frozenset(
+    ipaddress.ip_address(address)
+    for address in (
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "fd20:ce::254",
+        "100.100.100.200",
+        "100.100.100.100",
+    )
+)
+# IPv6 prefixes that Python counts as private but that carry traffic to other
+# networks (6to4, Teredo, NAT64)
+_TRANSITION_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in ("2002::/16", "2001::/32", "64:ff9b::/96", "64:ff9b:1::/48")
 )
 
 
@@ -59,10 +74,12 @@ def is_lan_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bo
         or address.is_link_local
         or address.is_multicast
         or address.is_unspecified
-        or address in _METADATA_ADDRESSES
+        or address in _BLOCKED_ADDRESSES
     ):
         return False
     if address.version == 4 and address in _SUPERVISOR_NETWORK:
+        return False
+    if address.version == 6 and any(address in network for network in _TRANSITION_NETWORKS):
         return False
     return address.is_private or (address.version == 4 and address in _SHARED_NETWORK)
 

@@ -18,7 +18,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN, NAME, PANEL_COMPONENT, PANEL_URL_PATH, STATIC_URL_PATH
-from .hub import LocalWebUiHub, async_restore_device_links
+from .hub import LocalWebUiHub, async_get_sessions, async_restore_device_links
 from .proxy import async_register_proxy
 from .websocket import async_register_commands
 
@@ -57,6 +57,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: LocalWebUiConfigEntry) -
     await hub.async_setup()
     entry.runtime_data = hub
     hass.data[DOMAIN] = hub
+    # Also when setup fails below: requests must not reach a hub that is gone
+    entry.async_on_unload(lambda: _async_forget_hub(hass, hub))
 
     await panel_custom.async_register_panel(
         hass,
@@ -123,14 +125,23 @@ def _async_remove_sidebar_panels(hass: HomeAssistant) -> None:
         frontend.async_remove_panel(hass, path, warn_if_unknown=False)
 
 
+@callback
+def _async_forget_hub(hass: HomeAssistant, hub: LocalWebUiHub) -> None:
+    if hass.data.get(DOMAIN) is hub:
+        del hass.data[DOMAIN]
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: LocalWebUiConfigEntry) -> bool:
-    hass.data.pop(DOMAIN, None)
+    _async_forget_hub(hass, entry.runtime_data)
     if entry.disabled_by is not None:
-        # The panel is gone, so device pages must not point at it
+        # The panel is gone, so device pages must not point at it, and views that
+        # are open (WebSockets included) must stop working
         entry.runtime_data.async_restore_device_links()
+        async_get_sessions(hass).end_all()
     return True
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: LocalWebUiConfigEntry) -> None:
+    async_get_sessions(hass).end_all()
     await async_restore_device_links(hass)
     await LocalWebUiHub.async_remove_storage(hass)

@@ -199,7 +199,11 @@ def ws_set_hidden(
     """Hide or unhide a discovered view."""
     if (hub := _hub(hass, connection, msg["id"])) is None:
         return
-    if not msg["view_id"].startswith(DISCOVERED_PREFIX):
+    view = hub.get_view(msg["view_id"])
+    # Unhiding is allowed for any id: its device may have gone meanwhile
+    if not msg["view_id"].startswith(DISCOVERED_PREFIX) or (
+        msg["hidden"] and (view is None or view.source != "discovered")
+    ):
         connection.send_error(msg["id"], "not_found", "Only discovered web UIs can be hidden")
         return
     hub.async_set_hidden(msg["view_id"], msg["hidden"])
