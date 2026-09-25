@@ -1,0 +1,19 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "BLE", "ASYNC", "RET", "C4", "PIE"]
+ignore = ["PLR0913", "PLR0911", "PLR0912", "PLR0915", "PLR2004", "RET505", "E501"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+combine-as-imports = true
+known-first-party = ["custom_components"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+norecursedirs = ["tests/e2e"]
