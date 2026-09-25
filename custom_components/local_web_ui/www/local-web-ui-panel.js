@@ -48,11 +48,9 @@ const STYLE = `
                overflow: hidden; text-overflow: ellipsis; }
   .chips { display: flex; gap: 6px; flex: none; }
   :host([narrow]) .chips { display: none; }
-  .popup { position: absolute; right: 8px; top: 48px; z-index: 5; min-width: 240px; padding: 4px 0;
-           background: var(--card-background-color); border-radius: 8px;
-           box-shadow: 0 4px 16px rgba(0,0,0,.35); border: 1px solid var(--divider-color); }
-  .popup button { width: 100%; justify-content: flex-start; border-radius: 0; padding: 0 16px;
-                  color: var(--primary-text-color); }
+  .row-actions { display: flex; flex: none; }
+  .row-actions button { color: var(--secondary-text-color); }
+  .row-actions button:hover { color: var(--primary-color); }
   .message { padding: 32px 16px; text-align: center; color: var(--secondary-text-color); line-height: 1.5; }
   .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin: 4px 0 8px; }
   .actions a.button { border: 1px solid var(--divider-color); color: var(--primary-color); }
@@ -77,7 +75,6 @@ class LocalWebUiPanel extends HTMLElement {
     this._key = null;
     this._session = null;
     this._timer = null;
-    this._onDocClick = () => this._closePopups();
   }
 
   set hass(hass) {
@@ -90,11 +87,9 @@ class LocalWebUiPanel extends HTMLElement {
   set panel(panel) { this._panel = panel; if (this._hass) this._update(); }
 
   connectedCallback() {
-    document.addEventListener("click", this._onDocClick);
     if (this._hass) this._update();
   }
   disconnectedCallback() {
-    document.removeEventListener("click", this._onDocClick);
     clearInterval(this._timer);
     this._timer = null;
     this._key = null;
@@ -136,10 +131,6 @@ class LocalWebUiPanel extends HTMLElement {
     root.querySelector(".back")?.addEventListener("click", () => this._navigate(this._backTarget || PANEL_PATH));
   }
 
-  _closePopups() {
-    this.shadowRoot.querySelectorAll(".popup").forEach((p) => p.remove());
-  }
-
   // ---- list ----------------------------------------------------------------
 
   async _showList() {
@@ -170,7 +161,7 @@ class LocalWebUiPanel extends HTMLElement {
     const section = (title, list) =>
       list.length ? `<h2>${esc(title)}</h2>${list.map((v) => this._row(v)).join("")}` : "";
     let html = `<div class="actions"><span class="hint">Each web UI is an entry of the integration:
-      its settings are behind ⋮ on its row.</span>
+      its settings are behind the ⚙ button on its row.</span>
       <a class="button" href="${SETTINGS_PATH}">${icon("mdi:plus", "+")} Add a web UI</a></div>`;
     if (discovered) {
       html += `<a class="notice" href="${SETTINGS_PATH}">${icon("mdi:magnify", "🔍")}
@@ -193,10 +184,11 @@ class LocalWebUiPanel extends HTMLElement {
         this._fromList = true;
         this._navigate(`${PANEL_PATH}/${view.view_id}`);
       });
-      row.querySelector(".more").addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        this._openMenu(row, view);
-      });
+      row.querySelectorAll(".row-actions button").forEach((button) =>
+        button.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._rowAction(button.dataset.act, view);
+        }));
     });
   }
 
@@ -208,33 +200,15 @@ class LocalWebUiPanel extends HTMLElement {
       ${icon(glyph)}
       <div class="text"><div class="name">${esc(v.name)}</div><div class="desc">${esc(desc)}</div></div>
       <div class="chips">${chips}</div>
-      <button class="more" title="More">${icon("mdi:dots-vertical", "⋮")}</button>
+      <div class="row-actions">
+        <button data-act="open-tab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>
+        ${v.device_id ? `<button data-act="device" title="Device page">${icon("mdi:devices", "▣")}</button>` : ""}
+        <button data-act="settings" title="Settings (mode, login, Visit button…)">${icon("mdi:cog", "⚙")}</button>
+      </div>
     </div>`;
   }
 
-  _openMenu(row, view) {
-    this._closePopups();
-    const items = [
-      ["open-tab", "mdi:open-in-new", "Open in a new tab"],
-      ["settings", "mdi:cog", "Settings (mode, login, Visit button…)"],
-    ];
-    if (view.device_id) items.push(["device", "mdi:devices", "Open device page"]);
-    if (view.linked_device_id) items.push(["linked", "mdi:link-variant", "Open web UI device page"]);
-    items.push(["forget", "mdi:cookie-remove", "Forget my saved logins and data"]);
-    const popup = document.createElement("div");
-    popup.className = "popup";
-    popup.innerHTML = items.map(([act, ic, label]) => `<button data-act="${act}">${icon(ic)} ${esc(label)}</button>`).join("");
-    popup.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      const act = ev.target.closest("button")?.dataset.act;
-      if (!act) return;
-      this._closePopups();
-      await this._menuAction(act, view);
-    });
-    row.appendChild(popup);
-  }
-
-  async _menuAction(act, view) {
+  async _rowAction(act, view) {
     const ws = (msg) => this._hass.callWS(msg);
     try {
       if (act === "open-tab") {
@@ -250,11 +224,6 @@ class LocalWebUiPanel extends HTMLElement {
       }
       if (act === "settings") return this._navigate(`${SETTINGS_PATH}#config_entry=${view.entry_id}`);
       if (act === "device") return this._navigate(`/config/devices/device/${view.device_id}`);
-      if (act === "linked") return this._navigate(`/config/devices/device/${view.linked_device_id}`);
-      if (act === "forget") {
-        if (!confirm(`Forget the cookies and stored data ${view.name} keeps for you? You may have to log in to it again.`)) return;
-        await ws({ type: "local_web_ui/clear_site_data", view_id: view.view_id });
-      }
     } catch (err) {
       alert(err.message || err);
     }
@@ -297,6 +266,7 @@ class LocalWebUiPanel extends HTMLElement {
         `${badge}
          ${view.device_id ? `<button class="device" title="Device page">${icon("mdi:devices", "▣")}</button>` : ""}
          ${view.linked_device_id ? `<button class="linked" title="Web UI device page">${icon("mdi:link-variant", "⛓")}</button>` : ""}
+         <button class="forget" title="Forget my saved logins and data">${icon("mdi:cookie-remove", "✕")}</button>
          <button class="reload" title="Reload">${icon("mdi:refresh", "⟳")}</button>
          <button class="newtab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>`,
         back) +
@@ -310,6 +280,15 @@ class LocalWebUiPanel extends HTMLElement {
       this._navigate(`/config/devices/device/${view.linked_device_id}`));
     root.querySelector(".reload").addEventListener("click", () => {
       root.querySelector("iframe").src = this._session.url;
+    });
+    root.querySelector(".forget").addEventListener("click", async () => {
+      if (!confirm(`Forget the cookies and stored data ${view.name} keeps for you? You may have to log in to it again.`)) return;
+      try {
+        await this._hass.callWS({ type: "local_web_ui/clear_site_data", view_id: view.view_id });
+        root.querySelector("iframe").src = this._session.url;
+      } catch (err) {
+        alert(err.message || err);
+      }
     });
     // A tab of its own gets its own session, separate from the iframe's
     root.querySelector(".newtab").addEventListener("click", async () => {

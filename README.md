@@ -39,7 +39,8 @@ You don't need to open ports or change any firmware.
   the global setting, always here, or always the device's address). The original links are
   restored when you switch it off or remove the web UI.
 - **Standalone pages.** Every web UI has its own address (`/local-web-ui/<id>`), an optional
-  sidebar entry, and *open in a new tab* for a full-page view. A web UI opened from a device
+  sidebar entry, and *open in a new tab* for a full-page view. Each row of the list has
+  buttons to open it in a new tab, to its device page and to its settings. A web UI opened from a device
   page has buttons back to that device page (and to its linked device).
 - **Your sidebar.** The name and icon of the Local Web UIs entry can be changed, or the
   entry hidden, in the global settings.
@@ -58,7 +59,7 @@ browser then withholds from the page, Local Web UIs provides:
 
 | | How it works when isolated |
 |---|---|
-| Logins and cookies | Kept server side per Home Assistant user, so they survive reloads and follow you across devices. *⋮ → Forget saved logins and data* logs you out. |
+| Logins and cookies | Kept server side per Home Assistant user, so they survive reloads and follow you across devices. The *Forget my saved logins and data* button in a web UI's toolbar logs you out. |
 | `localStorage` | Emulated and stored server side per user. |
 | `sessionStorage` | Emulated for the current page. |
 | `document.cookie` | Emulated, backed by the same cookie store. |
@@ -128,6 +129,17 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the details.
 - **The device sees the session path.** It arrives in the `X-Ingress-Path` header, so the page
   can build links. The session only grants access to that one web UI, and only for a few
   minutes.
+
+## Possible future work
+
+- **Dashboard cards.** Home Assistant's own *Webpage* card cannot show these web UIs: it
+  takes a fixed URL, while the proxy's URLs carry a short-lived session. A card of this
+  integration could get and renew the session the way the panel does, with the same
+  isolation. It needs non-admin access first (below), since dashboards are often viewed
+  by users who are not admins.
+- **Non-admin users,** with a list of web UIs each user may open.
+- **A pluggable transport,** for example tunnelling ESPHome's web server over its native
+  API, so it works without a direct network path to the device.
 
 ## Relation to ESPHome native API tunnelling
 

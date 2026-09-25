@@ -241,9 +241,10 @@ last entry deletes both stores.
 A panel is registered with `panel_custom` at `/local-web-ui`. It is a plain web component
 with no build step.
 - **List view:** "Devices" (with device name and area) and "Sites" (manual), plus a
-  notice when discoveries wait to be added. Actions: open, open in new tab, settings (the
-  entry's page), device page, web UI device page, forget saved logins and data.
-- **View page:** a toolbar with back, title, a mode badge, reload and open in new tab,
+  notice when discoveries wait to be added. A row opens the web UI; its buttons open it in
+  a new tab, open the device page, and open the settings (the entry's page).
+- **View page:** a toolbar with back, title, a mode badge, the device page and web UI
+  device page, forget my saved logins and data (then reload), reload and open in new tab,
   plus the iframe (with `sandbox` when isolated).
 - **Sidebar entries:** web UIs flagged "show in sidebar" get their own entry at
   `/local-web-ui-<view_id>`, using the same component in single-view mode.
@@ -299,3 +300,8 @@ Adding, ignoring and editing web UIs go through HA's own config entry flows.
 
 - A pluggable transport, for example the ESPHome native-API tunnel from variant 1.
 - Non-admin users with per-view allow lists.
+- A dashboard card (`custom:local-web-ui-card` with a `view_id`), loaded as a frontend
+  extra module. It would reuse the panel's view code: get a session over the WebSocket
+  API, keep it alive, and show the iframe with the same sandbox. HA's own iframe card
+  cannot do this, because session URLs expire. It depends on non-admin access, since
+  sessions are admin only today.

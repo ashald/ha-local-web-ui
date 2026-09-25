@@ -56,6 +56,10 @@ check("Porch Light added from discovery (ESPHome)", porch?.source === "device", 
 check("Router added by URL", router?.source === "manual", router?.url);
 await page.waitForTimeout(1500);
 await page.screenshot({ path: `${outDir}/1-list.png` });
+const rowButtons = await page.locator("local-web-ui-panel .row").evaluateAll((rows) =>
+  rows.map((r) => [...r.querySelectorAll(".row-actions button")].map((b) => b.dataset.act).join(",")));
+check("List rows have inline buttons, no menu",
+      rowButtons.includes("open-tab,device,settings") && rowButtons.includes("open-tab,settings"), JSON.stringify(rowButtons));
 
 // 1) Device page: Visit opens the discovered view
 await page.goto(`${HA}/config/devices/device/${porch.device_id}`);
@@ -85,7 +89,7 @@ check("Back returns to the device page the view was opened from",
 
 // 2) Router: sidebar entry, stored Basic credentials, cookie login, redirects,
 //    root-relative links, runtime-built URLs, localStorage and document.cookie shims
-// Start logged out: forget what the proxy keeps for this site (as the panel menu does)
+// Start logged out: forget what the proxy keeps for this site (as the toolbar's forget button does)
 await ws(page, { type: "local_web_ui/clear_site_data", view_id: router.view_id });
 const sidebarPath = `/local-web-ui-${router.view_id.toLowerCase()}`;
 await page.goto(`${HA}${sidebarPath}`);
@@ -111,6 +115,16 @@ frame = await waitFrame(page, router.view_id);
 await frame.waitForFunction(() => document.getElementById("server")?.textContent.startsWith("{"), null, { timeout: 15000 });
 const visits2 = await frame.evaluate(() => document.getElementById("visits").textContent);
 check("Router: localStorage and login survive a reload (stored server side)", visits2 === "2", `visits=${visits2}`);
+page.once("dialog", (dialog) => dialog.accept());
+await page.locator("local-web-ui-panel button.forget").click();
+await page.waitForTimeout(500);
+frame = await waitFrame(page, router.view_id);
+await frame.waitForSelector("#login", { timeout: 15000 });
+check("Router: toolbar's forget button logs out and reloads", frame.url().endsWith("/login"));
+await frame.locator("#login").click();
+await page.waitForTimeout(500);
+frame = await waitFrame(page, router.view_id);
+await frame.waitForFunction(() => document.getElementById("server")?.textContent.startsWith("{"), null, { timeout: 15000 });
 await page.waitForTimeout(1500); // let HA's loading splash fade after the reload
 await page.screenshot({ path: `${outDir}/4-router-sidebar.png` });
 
