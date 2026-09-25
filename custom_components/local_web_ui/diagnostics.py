@@ -28,6 +28,6 @@ async def async_get_config_entry_diagnostics(
             for v in hub.discovered_views(include_hidden=True).values()
         ],
         "hidden": sorted(hub.hidden),
-        "link_exceptions": sorted(hub.link_exceptions),
+        "link_overrides": hub.link_overrides,
         "linked_devices": sorted(hub.originals),
     }

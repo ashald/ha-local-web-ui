@@ -12,7 +12,20 @@ from yarl import URL
 # (Supervisor, apps). Proxying to them from a URL a device or integration chose
 # would turn discovery into a way to reach services that are not device UIs.
 _BLOCKED_HOSTS = frozenset(
-    {"localhost", "supervisor", "homeassistant", "hassio", "host.docker.internal"}
+    {
+        "localhost",
+        "localhost.localdomain",
+        "ip6-localhost",
+        "ip6-loopback",
+        "supervisor",
+        "homeassistant",
+        "hassio",
+        "host.docker.internal",
+        "gateway.docker.internal",
+        "kubernetes.docker.internal",
+        "metadata",
+        "metadata.google.internal",
+    }
 )
 _LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
 # Supervisor's internal network on HA OS / Supervised installs
@@ -68,7 +81,11 @@ def is_local_ui_url(url: URL, own_hosts: frozenset[tuple[str, int]] = frozenset(
     try:
         address = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
-        if host in _BLOCKED_HOSTS or host.startswith(("a0d7b954-", "core-", "local-")):
+        if (
+            host in _BLOCKED_HOSTS
+            or host.endswith(".localhost")  # RFC 6761: always loopback
+            or host.startswith(("a0d7b954-", "core-", "local-"))
+        ):
             return False  # App hostnames on the Supervisor network
         return "." not in host or host.endswith(_LOCAL_SUFFIXES)
     return is_lan_address(address)

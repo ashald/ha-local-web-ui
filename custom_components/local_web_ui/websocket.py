@@ -22,6 +22,7 @@ from .const import (
     SESSION_TTL,
     SUBENTRY_TYPE_VIEW,
 )
+from .hub import main_device
 
 if TYPE_CHECKING:
     from .hub import LocalWebUiHub, View
@@ -52,9 +53,10 @@ def _hub(
 def _view_json(hub: LocalWebUiHub, view: View) -> dict[str, Any]:
     device_link = None
     if view.device_id is not None:
-        device = dr.async_get(hub.hass).async_get(view.device_id)
+        device = main_device(dr.async_get(hub.hass), view.device_id)
         device_link = {
             "enabled": hub.link_enabled(view.device_id),
+            "override": hub.link_overrides.get(view.device_id),
             "active": bool(
                 device and device.configuration_url == f"{DEVICE_LINK_PREFIX}{view.view_id}"
             ),
@@ -193,7 +195,8 @@ def ws_set_hidden(
     {
         vol.Required("type"): f"{DOMAIN}/set_device_link",
         vol.Required("device_id"): str,
-        vol.Required("enabled"): bool,
+        # None: follow the global option again
+        vol.Required("enabled"): vol.Any(bool, None),
     }
 )
 @callback

@@ -237,9 +237,9 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     if raw_path.startswith("/" + INTERNAL_PATH_PREFIX):
         return await _handle_internal(request, ctx, raw_path)
 
-    url = view.origin.with_path(raw_path, encoded=True)
-    if query := request.rel_url.raw_query_string:
-        url = url.with_query(query)
+    # Already percent-encoded: pass path and query through byte for byte
+    query = request.rel_url.raw_query_string
+    url = URL(str(view.origin) + raw_path + (f"?{query}" if query else ""), encoded=True)
     headers = _request_headers(request, ctx, url)
     client = hub.http_client(view)
     try:
@@ -320,15 +320,18 @@ def _response_headers(result: aiohttp.ClientResponse, ctx: _Context) -> CIMultiD
 
 def rewrite_location(location: str, origin: URL, prefix: str) -> str:
     """Keep redirects to the site's own pages inside the proxy."""
+    # A protocol-relative location takes the site's scheme so origins compare
+    location_url = f"{origin.scheme}:{location}" if location.startswith("//") else location
     try:
-        url = URL(location)
+        url = URL(location_url)
+        if url.is_absolute() and url.origin() != origin:
+            return location  # Redirect somewhere else entirely
     except ValueError:
         return location
     if url.is_absolute():
-        if url.origin() != origin:
-            return location  # Redirect somewhere else entirely
-    elif location.startswith("//") or not location.startswith("/"):
-        return location  # Protocol-relative elsewhere, or relative: fine as is
+        pass  # Same site (checked above): keep it inside the proxy
+    elif not location.startswith("/"):
+        return location  # Relative: resolves inside the proxy as is
     rest = url.raw_path + (f"?{url.raw_query_string}" if url.raw_query_string else "")
     if url.raw_fragment:
         rest += f"#{url.raw_fragment}"

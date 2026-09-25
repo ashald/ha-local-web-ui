@@ -221,8 +221,8 @@ class LocalWebUiHub:
         # device_id -> configuration_url the owning integration set, before we linked it
         self.originals: dict[str, str] = {}
         self.hidden: set[str] = set()
-        # Devices whose page link behaviour is flipped relative to the global option
-        self.link_exceptions: set[str] = set()
+        # Per-device choice for the device page link; absent means the global option
+        self.link_overrides: dict[str, bool] = {}
         self._cookies: dict[str, list[dict[str, str]]] = {}
         self._shim_storage: dict[str, dict[str, str]] = {}
         self._jars: dict[str, aiohttp.CookieJar] = {}
@@ -245,7 +245,7 @@ class LocalWebUiHub:
         data = await self._store.async_load() or {}
         self.originals = dict(data.get("originals", {}))
         self.hidden = set(data.get("hidden", []))
-        self.link_exceptions = set(data.get("link_exceptions", []))
+        self.link_overrides = {str(k): bool(v) for k, v in data.get("link_overrides", {}).items()}
         jar = await self._jar_store.async_load() or {}
         self._cookies = dict(jar.get("cookies", {}))
         self._shim_storage = dict(jar.get("storage", {}))
@@ -273,8 +273,11 @@ class LocalWebUiHub:
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
-        for client in self._http.values():
-            await client.close()
+        for key, client in self._http.items():
+            if key == "discovered":
+                await client.close()  # Our own connector
+            else:
+                client.detach()  # Shares Home Assistant's connector; only let go of it
         self._http.clear()
         await self._async_save_now()
 
@@ -383,7 +386,7 @@ class LocalWebUiHub:
             return view
         if not view_id.startswith(DISCOVERED_PREFIX) or not self.discovery_enabled:
             return None
-        device = dr.async_get(self.hass).async_get(view_id[len(DISCOVERED_PREFIX) :])
+        device = main_device(dr.async_get(self.hass), view_id[len(DISCOVERED_PREFIX) :])
         if device is None or device.disabled:
             return None
         if any(v.device_id == device.id for v in self._static.values()):
@@ -400,7 +403,7 @@ class LocalWebUiHub:
     def area_name(self, device_id: str | None) -> str | None:
         if device_id is None:
             return None
-        device = dr.async_get(self.hass).async_get(device_id)
+        device = main_device(dr.async_get(self.hass), device_id)
         if device is None or device.area_id is None:
             return None
         area = ar.async_get(self.hass).async_get_area(device.area_id)
@@ -409,7 +412,7 @@ class LocalWebUiHub:
     # ---- device page links ---------------------------------------------------
 
     def link_enabled(self, device_id: str) -> bool:
-        return self.link_default != (device_id in self.link_exceptions)
+        return self.link_overrides.get(device_id, self.link_default)
 
     @callback
     def async_sync_device_links(self) -> None:
@@ -456,7 +459,7 @@ class LocalWebUiHub:
             & set(event.data.get("changes", {}))
         ):
             return
-        if device := dr.async_get(self.hass).async_get(event.data["device_id"]):
+        if device := main_device(dr.async_get(self.hass), event.data["device_id"]):
             self._async_sync_device_link(device)
 
     @callback
@@ -464,18 +467,19 @@ class LocalWebUiHub:
         (self.hidden.add if hidden else self.hidden.discard)(view_id)
         self._async_schedule_save()
         if view_id.startswith(DISCOVERED_PREFIX) and (
-            device := dr.async_get(self.hass).async_get(view_id[len(DISCOVERED_PREFIX) :])
+            device := main_device(dr.async_get(self.hass), view_id[len(DISCOVERED_PREFIX) :])
         ):
             self._async_sync_device_link(device)
 
     @callback
-    def async_set_device_link(self, device_id: str, enabled: bool) -> None:
-        if enabled == self.link_default:
-            self.link_exceptions.discard(device_id)
+    def async_set_device_link(self, device_id: str, enabled: bool | None) -> None:
+        """Choose the device page link for one device; None follows the global option."""
+        if enabled is None:
+            self.link_overrides.pop(device_id, None)
         else:
-            self.link_exceptions.add(device_id)
+            self.link_overrides[device_id] = enabled
         self._async_schedule_save()
-        if device := dr.async_get(self.hass).async_get(device_id):
+        if device := main_device(dr.async_get(self.hass), device_id):
             self._async_sync_device_link(device)
 
     # ---- per-user site state -------------------------------------------------
@@ -572,7 +576,7 @@ class LocalWebUiHub:
         return {
             "originals": self.originals,
             "hidden": sorted(self.hidden),
-            "link_exceptions": sorted(self.link_exceptions),
+            "link_overrides": self.link_overrides,
         }
 
     def _jar_data(self) -> dict[str, Any]:
@@ -592,6 +596,12 @@ class LocalWebUiHub:
         """Forget originals, cookies and stored site data (integration removed)."""
         await Store(hass, STORAGE_VERSION, STORAGE_KEY).async_remove()
         await Store(hass, STORAGE_VERSION, STORAGE_KEY_JAR).async_remove()
+
+
+def main_device(registry: dr.DeviceRegistry, device_id: str) -> dr.DeviceEntry | None:
+    """A device by id, ignoring child devices (HA 2026+), which have no own URL."""
+    device = registry.async_get(device_id)
+    return device if isinstance(device, dr.DeviceEntry) else None
 
 
 def iter_devices(registry: dr.DeviceRegistry) -> list[dr.DeviceEntry]:
