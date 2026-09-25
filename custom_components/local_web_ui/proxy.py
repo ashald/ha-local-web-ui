@@ -191,18 +191,42 @@ UPSTREAM_HEADERS_TIMEOUT = 60
 CONDITIONAL_HEADERS = (hdrs.IF_NONE_MATCH, hdrs.IF_MODIFIED_SINCE)
 # Close codes that describe a local failure and must not be sent (RFC 6455 7.4.1)
 RESERVED_CLOSE_CODES = frozenset({1005, 1006, 1015})
-# Browsers refuse scripts and stylesheets with a wrong type (nosniff); small
-# device web servers often send none or a generic one
-GENERIC_TYPES = frozenset({"", "application/octet-stream", "text/plain"})
+# nosniff (set on every response) makes the browser refuse a script or stylesheet
+# whose type is not one it accepts for that kind. Small device web servers often
+# send none, a generic one, or even a mismatched one (an SLZB-06 serves its
+# stylesheet as text/javascript), so for these extensions the extension decides.
 TYPES_BY_EXTENSION = {
     ".js": "text/javascript",
     ".mjs": "text/javascript",
     ".css": "text/css",
 }
+# Types already fine for those extensions, kept as the site sent them: a specific
+# JavaScript type is the site's choice, and the browser accepts them all as scripts
+JAVASCRIPT_TYPES = frozenset(
+    {
+        "text/javascript",
+        "application/javascript",
+        "application/ecmascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    }
+)
 # When a device sends no type at all: without one, nosniff would make the browser
 # download a page instead of showing it
 PAGE_EXTENSIONS = (".html", ".htm")
 _HTML_START = (b"<!doctype html", b"<html")
+
+
+def _type_accepted(suffix: str, content_type: str) -> bool:
+    """Whether a script's or stylesheet's type is one the browser accepts (nosniff)."""
+    if suffix == ".css":
+        return content_type == "text/css"
+    return content_type in JAVASCRIPT_TYPES
 
 
 @dataclass(slots=True)
@@ -730,7 +754,7 @@ async def _respond(
     content_type = content_type_header.partition(";")[0].strip().lower()
     suffix = Path(url.path).suffix.lower()
     untyped = hdrs.CONTENT_TYPE not in result.headers
-    if content_type in GENERIC_TYPES and (fixed := TYPES_BY_EXTENSION.get(suffix)):
+    if (fixed := TYPES_BY_EXTENSION.get(suffix)) and not _type_accepted(suffix, content_type):
         content_type = content_type_header = fixed
     elif untyped and (url.path.endswith("/") or suffix in PAGE_EXTENSIONS):
         content_type = content_type_header = "text/html"
