@@ -280,7 +280,7 @@ class LocalWebUiHub:
             return {}
         pinned = {v.device_id for v in self._static.values() if v.device_id}
         views: dict[str, View] = {}
-        for device in dr.async_get(self.hass).devices.values():
+        for device in iter_devices(dr.async_get(self.hass)):
             if device.disabled or device.id in pinned:
                 continue
             if (url := self.device_ui_url(device)) is None:
@@ -325,7 +325,7 @@ class LocalWebUiHub:
 
     @callback
     def async_sync_device_links(self) -> None:
-        for device in list(dr.async_get(self.hass).devices.values()):
+        for device in iter_devices(dr.async_get(self.hass)):
             self._async_sync_device_link(device)
 
     @callback
@@ -423,6 +423,15 @@ class LocalWebUiHub:
         self._shim_storage[self._state_key(user_id, view_id)] = data
         self._async_schedule_save()
 
+    @callback
+    def async_clear_site_data(self, user_id: str, view_id: str) -> None:
+        """Forget the cookies and stored data a site keeps for this user (log out)."""
+        key = self._state_key(user_id, view_id)
+        self._jars.pop(key, None)
+        self._cookies.pop(key, None)
+        self._shim_storage.pop(key, None)
+        self._async_schedule_save()
+
     # ---- upstream HTTP -------------------------------------------------------
 
     def http_client(self, verify_ssl: bool) -> aiohttp.ClientSession:
@@ -464,6 +473,22 @@ class LocalWebUiHub:
         await Store(hass, STORAGE_VERSION, STORAGE_KEY_JAR).async_remove()
 
 
+def iter_devices(registry: dr.DeviceRegistry) -> list[dr.DeviceEntry]:
+    """All device entries, on current and older Home Assistant releases.
+
+    Since 2026.x iterating registry.devices yields entries (using it as a mapping
+    is deprecated); before, it was a mapping whose iteration yields device ids.
+    """
+    devices: list[dr.DeviceEntry] = []
+    for item in registry.devices:
+        if isinstance(item, str):
+            if (device := registry.async_get(item)) is not None:
+                devices.append(device)
+        else:
+            devices.append(item)
+    return devices
+
+
 def _parse_cookie(set_cookie: str) -> Any:
     from http.cookies import SimpleCookie  # noqa: PLC0415
 
@@ -480,6 +505,6 @@ async def async_restore_device_links(hass: HomeAssistant) -> None:
     store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
     originals = (await store.async_load() or {}).get("originals", {})
     registry = dr.async_get(hass)
-    for device in list(registry.devices.values()):
+    for device in iter_devices(registry):
         if device.configuration_url and device.configuration_url.startswith(DEVICE_LINK_PREFIX):
             registry.async_update_device(device.id, configuration_url=originals.get(device.id))

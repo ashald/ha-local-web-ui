@@ -223,6 +223,7 @@ class LocalWebUiPanel extends HTMLElement {
         : ["link-on", "mdi:link", "Use for the device page's Visit link"]);
     }
     if (view.device_id) items.push(["device", "mdi:devices", "Open device page"]);
+    if (!view.hidden && view.mode !== "trusted") items.push(["forget", "mdi:cookie-remove", "Forget saved logins and data"]);
     if (view.source === "discovered") items.push(view.hidden ? ["unhide", "mdi:eye", "Unhide"] : ["hide", "mdi:eye-off", "Hide"]);
     const popup = document.createElement("div");
     popup.className = "popup";
@@ -251,6 +252,11 @@ class LocalWebUiPanel extends HTMLElement {
         await ws({ type: "local_web_ui/pin", view_id: view.view_id });
         // The integration reloads; the pinned web UI is edited on its settings page
         return this._navigate("/config/integrations/integration/local_web_ui");
+      }
+      if (act === "forget") {
+        if (!confirm(`Forget the cookies and stored data ${view.name} keeps for you? You may have to log in to it again.`)) return;
+        await ws({ type: "local_web_ui/clear_site_data", view_id: view.view_id });
+        return;
       }
       if (act === "hide" || act === "unhide") {
         await ws({ type: "local_web_ui/set_hidden", view_id: view.view_id, hidden: act === "hide" });

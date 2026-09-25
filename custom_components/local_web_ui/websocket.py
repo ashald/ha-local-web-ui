@@ -29,7 +29,14 @@ if TYPE_CHECKING:
 
 @callback
 def async_register_commands(hass: HomeAssistant) -> None:
-    for command in (ws_views, ws_session, ws_pin, ws_set_hidden, ws_set_device_link):
+    for command in (
+        ws_views,
+        ws_session,
+        ws_pin,
+        ws_set_hidden,
+        ws_set_device_link,
+        ws_clear_site_data,
+    ):
         websocket_api.async_register_command(hass, command)
 
 
@@ -196,4 +203,19 @@ def ws_set_device_link(
     if (hub := _hub(hass, connection, msg["id"])) is None:
         return
     hub.async_set_device_link(msg["device_id"], msg["enabled"])
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/clear_site_data", vol.Required("view_id"): str}
+)
+@callback
+def ws_clear_site_data(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Forget the calling user's saved cookies and storage for a web UI."""
+    if (hub := _hub(hass, connection, msg["id"])) is None:
+        return
+    hub.async_clear_site_data(connection.user.id, msg["view_id"])
     connection.send_result(msg["id"])

@@ -1,0 +1,20 @@
+# ESPHome host-platform device for end-to-end tests. It reports a web server on
+# port 8080 (served by tests/e2e/fake_device_ui.py), which is what makes Home
+# Assistant's ESPHome integration set the device's "Visit" link, and so what
+# Local Web UIs discovers. web_server itself does not run on the host platform.
+esphome:
+  name: porch-light
+  friendly_name: Porch Light
+  platformio_options:
+    build_flags:
+      - -DUSE_WEBSERVER
+      - -DUSE_WEBSERVER_PORT=8080
+
+host:
+  mac_address: "06:35:69:ab:f6:7a"
+
+logger:
+  level: INFO
+
+api:
+  port: 6053

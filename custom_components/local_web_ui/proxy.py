@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from http.cookies import SimpleCookie
 import json
 import logging
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -279,32 +280,10 @@ def html_rewriter(origin: URL, prefix: str) -> Callable[[bytes], bytes]:
     return lambda body: pattern.sub(replacement, body)
 
 
-SHIM_TEMPLATE = """<script>/* Local Web UIs: storage for an isolated view */(function(){
-var E=%(endpoint)s,L=%(local)s,C=%(cookies)s;
-try{window.localStorage.length;return}catch(e){}
-function store(data,persist){
- var t=null;function save(){if(!persist)return;clearTimeout(t);t=setTimeout(flush,250)}
- function flush(){t=null;try{fetch(E+"storage",{method:"POST",body:JSON.stringify(data),keepalive:true,headers:{"Content-Type":"text/plain"}})}catch(e){}}
- if(persist)addEventListener("pagehide",function(){if(t){clearTimeout(t);flush()}});
- var api={getItem:function(k){k=String(k);return Object.prototype.hasOwnProperty.call(data,k)?data[k]:null},
-  setItem:function(k,v){data[String(k)]=String(v);save()},removeItem:function(k){delete data[String(k)];save()},
-  clear:function(){for(var k in data)delete data[k];save()},key:function(i){var k=Object.keys(data);return i<k.length?k[i]:null}};
- Object.defineProperty(api,"length",{get:function(){return Object.keys(data).length}});
- return new Proxy(api,{get:function(o,p){return p in o?o[p]:(typeof p==="string"&&Object.prototype.hasOwnProperty.call(data,p)?data[p]:undefined)},
-  set:function(o,p,v){if(p in o)return false;api.setItem(p,v);return true},deleteProperty:function(o,p){api.removeItem(p);return true},
-  has:function(o,p){return p in o||Object.prototype.hasOwnProperty.call(data,p)},ownKeys:function(){return Object.keys(data)},
-  getOwnPropertyDescriptor:function(o,p){if(Object.prototype.hasOwnProperty.call(data,p))return{value:data[p],writable:true,enumerable:true,configurable:true}}});
-}
-var ls=store(L,true),ss=store({},false);
-try{Object.defineProperty(window,"localStorage",{configurable:true,get:function(){return ls}});
-Object.defineProperty(window,"sessionStorage",{configurable:true,get:function(){return ss}})}catch(e){}
-try{Object.defineProperty(Document.prototype,"cookie",{configurable:true,
- get:function(){return Object.keys(C).map(function(k){return k+"="+C[k]}).join("; ")},
- set:function(v){v=String(v);var kv=v.split(";")[0],i=kv.indexOf("=");if(i<1)return;
-  var k=kv.slice(0,i).trim(),val=kv.slice(i+1).trim();
-  if(/;\\s*(max-age=(0|-)|expires=thu, 01 jan 1970)/i.test(v))delete C[k];else C[k]=val;
-  try{fetch(E+"cookie",{method:"POST",body:v,keepalive:true,headers:{"Content-Type":"text/plain"}})}catch(e){}}})}catch(e){}
-})();</script>"""
+# Runs before any script of a proxied page; see inject.js
+INJECT_JS = (Path(__file__).parent / "inject.js").read_bytes()
+if b"</script" in INJECT_JS.lower():
+    raise RuntimeError("inject.js must not contain a closing script tag")
 
 
 def _js(value: Any) -> str:
@@ -317,23 +296,32 @@ def _js(value: Any) -> str:
     )
 
 
-def storage_shim(hub: LocalWebUiHub, session: Session, view: View, prefix: str) -> bytes:
-    """Script giving an isolated page localStorage and document.cookie.
-
-    An opaque origin has neither (both throw). The shim keeps them working with
-    data held server side per (user, view), preloaded here and written back to
-    the proxy's internal endpoints.
-    """
-    jar = hub.cookie_jar(session.user_id, view)
-    visible = {morsel.key: morsel.value for morsel in jar if not morsel.get("httponly")}
+def inject_script(ctx: _Context) -> bytes:
+    """The script injected first into a proxied HTML page."""
+    view = ctx.view
+    isolated = view.mode == MODE_ISOLATED
+    config: dict[str, Any] = {
+        "prefix": ctx.prefix,
+        "viewPath": ctx.prefix.rsplit("/", 1)[0] + "/",
+        "site": str(view.origin),
+        "isolated": isolated,
+    }
+    if isolated:
+        jar = ctx.hub.cookie_jar(ctx.session.user_id, view)
+        config["storage"] = ctx.hub.shim_storage(ctx.session.user_id, view.view_id)
+        # Scripts only ever see cookies that are not HttpOnly
+        config["cookies"] = {m.key: m.value for m in jar if not m.get("httponly")}
     return (
-        SHIM_TEMPLATE
-        % {
-            "endpoint": _js(f"{prefix}/{INTERNAL_PATH_PREFIX}"),
-            "local": _js(hub.shim_storage(session.user_id, view.view_id)),
-            "cookies": _js(visible),
-        }
-    ).encode()
+        b"<script>/* local_web_ui */(" + INJECT_JS + b")(" + _js(config).encode() + b");</script>"
+    )
+
+
+_CSS_URL = re.compile(rb"""(url\(\s*["']?|@import\s+["'])/(?!/)""", re.IGNORECASE)
+
+
+def rewrite_css(body: bytes, prefix: str) -> bytes:
+    """Root-relative url(...) and @import in stylesheets."""
+    return _CSS_URL.sub(rb"\1" + prefix.encode() + b"/", body)
 
 
 _HEAD_OPEN = re.compile(rb"<head(\s[^>]*)?>", re.IGNORECASE)
@@ -424,7 +412,7 @@ async def _proxy_request(
     url: URL,
     headers: CIMultiDict[str],
 ) -> web.StreamResponse:
-    hub, session, view, prefix = ctx.hub, ctx.session, ctx.view, ctx.prefix
+    view, prefix = ctx.view, ctx.prefix
     async with client.request(
         request.method,
         url,
@@ -453,8 +441,9 @@ async def _proxy_request(
             if complete:
                 if is_html:
                     body = html_rewriter(view.origin, prefix)(body)
-                    if view.mode == MODE_ISOLATED:
-                        body = inject_first(body, storage_shim(hub, session, view, prefix))
+                    body = inject_first(body, inject_script(ctx))
+                elif content_type == "text/css":
+                    body = rewrite_css(body, prefix)
                 response = web.Response(status=result.status, headers=response_headers, body=body)
                 response.headers[hdrs.CONTENT_TYPE] = result.headers.get(
                     hdrs.CONTENT_TYPE, content_type
