@@ -8,8 +8,9 @@ Everything served here comes from Home Assistant's own origin, so the proxy is
 strict about what it lets through in either direction:
 - towards the device: no browser credentials (Cookie, Authorization) and no
   client-supplied identity or forwarding headers;
-- towards the browser: only an allowlist of the device's response headers, plus
-  security headers set here on every response, streamed or not.
+- towards the browser: the device's response headers except a denylist of ones
+  that would act on Home Assistant's origin, plus security headers set here on
+  every response, streamed or not.
 """
 
 from __future__ import annotations
@@ -123,41 +124,74 @@ REQUEST_HEADER_PREFIXES_DROPPED = (
     "remote-",
 )
 
-# Device response headers that may reach the browser. Everything else is dropped:
-# the response comes from Home Assistant's origin, and several standard headers act
-# on the whole origin (service worker scope, reporting, Clear-Site-Data, HSTS...).
-RESPONSE_HEADERS_ALLOWED = frozenset(
-    {
-        "accept-ranges",
-        "age",
-        "cache-control",
-        "content-disposition",
-        "content-language",
-        "content-range",
-        "date",
-        "etag",
-        "expires",
-        "last-modified",
-        "pragma",
-        "retry-after",
-        "vary",
-    }
-)
-# Custom X- headers carry device data (versions, checksums); these few are not data
-RESPONSE_X_HEADERS_DROPPED = frozenset(
-    {
+# The response is served from Home Assistant's own origin, so any header the browser
+# would act on for that origin must not pass. Everything else is forwarded, including
+# a device's custom data headers (an SLZB-06 returns its values in a "respValuesArr"
+# header, which a page script reads). Body-framing and hop-by-hop headers, and the
+# ones the proxy sets, rewrites or stores itself, are handled elsewhere and dropped
+# here too.
+RESPONSE_HEADERS_DROPPED = frozenset(
+    str(name).lower()
+    for name in {
+        # Body framing and hop-by-hop: aiohttp re-derives these for our response
+        hdrs.CONTENT_LENGTH,
+        hdrs.CONTENT_ENCODING,
+        hdrs.TRANSFER_ENCODING,
+        hdrs.CONNECTION,
+        hdrs.KEEP_ALIVE,
+        hdrs.TE,
+        hdrs.TRAILER,
+        hdrs.UPGRADE,
+        hdrs.PROXY_AUTHENTICATE,
+        # Set, rewritten or stored by the proxy itself
+        hdrs.CONTENT_TYPE,
+        hdrs.LOCATION,
+        hdrs.SERVER,  # the response is served by Home Assistant, not the device
+        hdrs.SET_COOKIE,
+        "set-cookie2",
+        hdrs.WWW_AUTHENTICATE,  # would pop a browser auth dialog on Home Assistant's origin
+        "x-ingress-path",
+        # Security and policy headers that act on the whole (Home Assistant) origin
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "strict-transport-security",
+        "clear-site-data",
         "x-frame-options",
         "x-content-type-options",
+        "referrer-policy",
         "x-xss-protection",
-        "x-ingress-path",
         "x-dns-prefetch-control",
         "x-permitted-cross-domain-policies",
+        "cross-origin-opener-policy",
+        "cross-origin-embedder-policy",
+        "cross-origin-resource-policy",
+        "origin-agent-cluster",
+        "permissions-policy",
+        "permissions-policy-report-only",
+        "feature-policy",
+        "document-policy",
+        "report-to",
+        "reporting-endpoints",
+        "nel",
+        "service-worker-allowed",
+        "set-login",
+        "alt-svc",
+        "link",  # preloads/preconnects would resolve against Home Assistant's origin
+        "refresh",  # would navigate the Home Assistant page
+        # CORS is answered by the proxy itself
+        hdrs.ACCESS_CONTROL_ALLOW_ORIGIN,
+        hdrs.ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        hdrs.ACCESS_CONTROL_ALLOW_METHODS,
+        hdrs.ACCESS_CONTROL_ALLOW_HEADERS,
+        hdrs.ACCESS_CONTROL_EXPOSE_HEADERS,
+        hdrs.ACCESS_CONTROL_MAX_AGE,
         # Instructions to a reverse proxy in front of Home Assistant (nginx, Apache,
         # lighttpd): internal redirects to any file or location, caching
         "x-accel-redirect",
         "x-accel-expires",
         "x-accel-limit-rate",
         "x-accel-charset",
+        "x-accel-buffering",
         "x-sendfile",
         "x-lighttpd-send-file",
         "x-litespeed-location",
@@ -373,10 +407,7 @@ def _response_headers(
 ) -> CIMultiDict[str]:
     headers: CIMultiDict[str] = CIMultiDict()
     for name, value in result.headers.items():
-        lower = name.lower()
-        if lower in RESPONSE_HEADERS_ALLOWED or (
-            lower.startswith("x-") and lower not in RESPONSE_X_HEADERS_DROPPED
-        ):
+        if name.lower() not in RESPONSE_HEADERS_DROPPED:
             headers.add(name, value)
     if is_html:
         # The page will embed this user's site data: never reuse a stored copy

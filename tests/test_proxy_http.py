@@ -292,6 +292,9 @@ class Upstream:
                     "X-DNS-Prefetch-Control": "on",
                     "X-Permitted-Cross-Domain-Policies": "all",
                     "X-Device": "kept",
+                    # A custom data header that does not use the X- convention (an
+                    # SLZB-06 returns its values in exactly such a header)
+                    "respValuesArr": '{"VERSION":"1"}',
                     "Content-Language": "de",
                     "Content-Disposition": 'inline; filename="x.txt"',
                     "Retry-After": "5",
@@ -1081,8 +1084,9 @@ async def test_upstream_security_headers_replaced(env: Env) -> None:
     response = await env.client.get(prefix + "/headers")
     assert response.status == 200
     headers = response.headers
-    # Device data and the content headers of the allowlist pass
+    # Device data passes, including a custom header that does not use the X- convention
     assert headers["X-Device"] == "kept"
+    assert headers["respValuesArr"] == '{"VERSION":"1"}'
     assert headers["Content-Language"] == "de"
     assert headers["Content-Disposition"] == 'inline; filename="x.txt"'
     assert headers["Retry-After"] == "5"

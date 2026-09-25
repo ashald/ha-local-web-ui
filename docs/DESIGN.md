@@ -134,11 +134,16 @@ becomes the hub.
   esp_http_server) cannot read chunked uploads.
 
 **Response headers**
-- Only an allowlist of device headers reaches the browser (`Cache-Control`, `ETag`,
-  `Content-Disposition`, `Content-Range`, `Vary`… and custom `X-*` data headers). The
-  response comes from HA's origin, and several standard headers act on the whole origin
-  (`Clear-Site-Data`, `NEL`/`Report-To`, `Strict-Transport-Security`,
-  `Service-Worker-Allowed`…).
+- Device response headers are forwarded except a denylist, so a device's custom data
+  headers reach the page even when they don't use the `X-` convention (an SLZB-06
+  returns its values in a `respValuesArr` header a script reads). The response comes
+  from HA's origin, so the denylist drops the headers the browser would act on for that
+  origin (`Set-Cookie`, `Content-Security-Policy`, `Strict-Transport-Security`,
+  `Clear-Site-Data`, `X-Frame-Options`, `Cross-Origin-*`, `NEL`/`Report-To`,
+  `Service-Worker-Allowed`, `Permissions-Policy`, `Link`, `Refresh`, `WWW-Authenticate`…),
+  the CORS headers the proxy answers itself, reverse-proxy control headers (`X-Accel-*`,
+  `X-Sendfile`…), and the framing/identity headers the proxy sets (`Content-Length`,
+  `Content-Encoding`, `Content-Type`, `Location`, `Server`…).
 - `Cache-Control` is made `private`; HTML gets `no-store`, without `ETag`/`Last-Modified`.
 - `Set-Cookie` always goes to the server-side jar.
 - `Location` headers pointing at the target origin (absolute, protocol-relative or
