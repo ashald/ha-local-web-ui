@@ -6,6 +6,7 @@ links and redirects, and a page script using localStorage and document.cookie.
 Usage: python fake_router.py [port]
 """
 
+import base64
 import secrets
 import sys
 
@@ -41,8 +42,6 @@ fetch('/api/whoami').then(r => r.json()).then(j =>
 
 @web.middleware
 async def basic_auth(request: web.Request, handler):
-    import base64
-
     header = request.headers.get("Authorization", "")
     expected = "Basic " + base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
     if header != expected:
@@ -81,22 +80,28 @@ async def app_js(request):
 
 
 async def style(request):
-    return web.Response(text="body{font-family:sans-serif;background:#223;color:#eee}", content_type="text/css")
+    return web.Response(
+        text="body{font-family:sans-serif;background:#223;color:#eee}", content_type="text/css"
+    )
 
 
 async def whoami(request):
-    return web.json_response(
-        {"session": logged_in(request), "theme": request.cookies.get("theme")}
-    )
+    return web.json_response({"session": logged_in(request), "theme": request.cookies.get("theme")})
 
 
 def make_app() -> web.Application:
     app = web.Application(middlewares=[basic_auth])
-    app.add_routes([
-        web.get("/", root), web.get("/login", login_form), web.post("/login", login),
-        web.get("/dashboard", dashboard), web.get("/static/app.js", app_js),
-        web.get("/static/style.css", style), web.get("/api/whoami", whoami),
-    ])
+    app.add_routes(
+        [
+            web.get("/", root),
+            web.get("/login", login_form),
+            web.post("/login", login),
+            web.get("/dashboard", dashboard),
+            web.get("/static/app.js", app_js),
+            web.get("/static/style.css", style),
+            web.get("/api/whoami", whoami),
+        ]
+    )
     return app
 
 

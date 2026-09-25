@@ -32,7 +32,7 @@ INDEX = """<!doctype html>
 </section>
 <section class="card"><h2>WebSocket</h2>
   <div class="row"><input id="msg" value="hello device"><button id="send">Send</button></div>
-  <pre id="echo">–</pre></section>
+  <pre id="echo">-</pre></section>
 <section class="card"><h2>What the device sees</h2><pre id="headers">…</pre></section>
 <script src="app.js"></script>
 </body></html>

@@ -42,17 +42,44 @@ function (cfg) {
     return out.href;
   }
 
+  // The page URL holds the session token: a page may not send it to other sites
+  function noReferrer(init) {
+    return init && init.referrerPolicy ? Object.assign({}, init, { referrerPolicy: "no-referrer" }) : init;
+  }
+
   try {
     var nativeFetch = window.fetch;
     if (nativeFetch) {
       window.fetch = function (input, init) {
         if (typeof input === "string" || input instanceof URL) {
           input = rewrite(input);
-        } else if (input && input.url) {
+        } else if (input instanceof Request) {
           var moved = rewrite(input.url);
-          if (moved !== input.url) input = new Request(moved, input);
+          if (moved !== input.url) {
+            // A Request's URL cannot change: copy it, body included
+            var req = input;
+            var self = this;
+            var noBody = req.method === "GET" || req.method === "HEAD";
+            return (noBody ? Promise.resolve(undefined) : req.arrayBuffer()).then(function (body) {
+              var copy = new Request(moved, {
+                method: req.method,
+                headers: req.headers,
+                body: body,
+                mode: req.mode === "navigate" ? "same-origin" : req.mode,
+                credentials: req.credentials,
+                cache: req.cache,
+                redirect: req.redirect,
+                referrerPolicy: "no-referrer",
+                integrity: req.integrity,
+                keepalive: req.keepalive,
+                signal: req.signal,
+              });
+              return nativeFetch.call(self, copy, noReferrer(init));
+            });
+          }
+          if (input.referrerPolicy) input = new Request(input, { referrerPolicy: "no-referrer" });
         }
-        return nativeFetch.call(this, input, init);
+        return nativeFetch.call(this, input, noReferrer(init));
       };
     }
     var open = XMLHttpRequest.prototype.open;
@@ -94,9 +121,23 @@ function (cfg) {
     var setAttribute = Element.prototype.setAttribute;
     var linkAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
     Element.prototype.setAttribute = function (name, value) {
-      if (typeof value === "string" && linkAttrs[String(name).toLowerCase()]) value = rewrite(value);
+      var lower = String(name).toLowerCase();
+      if (lower === "referrerpolicy") return undefined; // See noReferrer
+      if (typeof value === "string" && linkAttrs[lower]) value = rewrite(value);
       return setAttribute.call(this, name, value);
     };
+    ["HTMLAnchorElement", "HTMLAreaElement", "HTMLImageElement", "HTMLIFrameElement",
+     "HTMLLinkElement", "HTMLScriptElement"].forEach(function (name) {
+      var Cls = window[name];
+      var desc = Cls && Object.getOwnPropertyDescriptor(Cls.prototype, "referrerPolicy");
+      if (!desc || !desc.set) return;
+      Object.defineProperty(Cls.prototype, "referrerPolicy", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set: function () {},
+      });
+    });
     [
       ["HTMLImageElement", "src"],
       ["HTMLScriptElement", "src"],

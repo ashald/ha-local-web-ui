@@ -35,7 +35,6 @@ from .const import (
     DOMAIN,
     INTERNAL_PATH_PREFIX,
     MAX_SHIM_STORAGE_BYTES,
-    MAX_SHIM_STORAGE_KEYS,
     MODE_ISOLATED,
     PROXY_URL_PREFIX,
 )
@@ -133,6 +132,16 @@ RESPONSE_X_HEADERS_DROPPED = frozenset(
         "x-ingress-path",
         "x-dns-prefetch-control",
         "x-permitted-cross-domain-policies",
+        # Instructions to a reverse proxy in front of Home Assistant (nginx, Apache,
+        # lighttpd): internal redirects to any file or location, caching
+        "x-accel-redirect",
+        "x-accel-expires",
+        "x-accel-limit-rate",
+        "x-accel-charset",
+        "x-sendfile",
+        "x-lighttpd-send-file",
+        "x-litespeed-location",
+        "x-litespeed-cache-control",
     }
 )
 
@@ -325,7 +334,9 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
     return headers
 
 
-def _response_headers(result: aiohttp.ClientResponse, ctx: _Context) -> CIMultiDict[str]:
+def _response_headers(
+    result: aiohttp.ClientResponse, ctx: _Context, is_html: bool
+) -> CIMultiDict[str]:
     headers: CIMultiDict[str] = CIMultiDict()
     for name, value in result.headers.items():
         lower = name.lower()
@@ -333,16 +344,20 @@ def _response_headers(result: aiohttp.ClientResponse, ctx: _Context) -> CIMultiD
             lower.startswith("x-") and lower not in RESPONSE_X_HEADERS_DROPPED
         ):
             headers.add(name, value)
-    if cache := headers.get(hdrs.CACHE_CONTROL):
+    if is_html:
+        # The page will embed this user's site data: never reuse a stored copy
+        headers[hdrs.CACHE_CONTROL] = "no-store"
+        headers.popall(hdrs.ETAG, None)
+        headers.popall(hdrs.LAST_MODIFIED, None)
+    elif cache := headers.get(hdrs.CACHE_CONTROL):
         # Per-user content: never let a shared cache in front of HA keep it
         directives = [
-            d
+            d.strip()
             for d in cache.split(",")
-            if d.strip().split("=")[0].lower() not in ("public", "s-maxage")
+            if d.strip()
+            and d.strip().split("=")[0].lower() not in ("public", "private", "s-maxage")
         ]
-        headers[hdrs.CACHE_CONTROL] = ", ".join(
-            ["private", *(d.strip() for d in directives if d.strip())]
-        )
+        headers[hdrs.CACHE_CONTROL] = ", ".join(["private", *directives])
     else:
         headers[hdrs.CACHE_CONTROL] = "private"
     if set_cookies := result.headers.getall(hdrs.SET_COOKIE, ()):
@@ -399,11 +414,18 @@ def html_rewriter(origin: URL, prefix: str) -> Callable[[bytes], bytes]:
         re.IGNORECASE,
     )
     replacement = rb"\1" + prefix.encode().replace(b"\\", b"\\\\") + b"/"
-    return lambda body: _META_REFERRER.sub(rb"\1x-referrer-removed", pattern.sub(replacement, body))
+
+    def rewrite(body: bytes) -> bytes:
+        body = pattern.sub(replacement, body)
+        body = _META_REFERRER.sub(rb"\1x-referrer-removed", body)
+        return _REFERRERPOLICY_ATTR.sub(rb"\1x-referrerpolicy-removed", body)
+
+    return rewrite
 
 
 # A page's own referrer policy could send its URL (with the token) to other sites
 _META_REFERRER = re.compile(rb"(<meta\s[^>]*?name\s*=\s*[\"']?)referrer", re.IGNORECASE)
+_REFERRERPOLICY_ATTR = re.compile(rb"(<[a-z][^>]*?\s)referrerpolicy(?=\s*=)", re.IGNORECASE)
 
 
 # Runs before any script of a proxied page; see inject.js
@@ -500,9 +522,8 @@ async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -
     if ctx.cross_origin:
         headers.update(CORS_HEADERS)
     if name == "storage" and request.method == hdrs.METH_GET:
-        await hub.async_wait_for_storage_write(
-            session.user_id, view.view_id, request.query.get("w", "")
-        )
+        if write_id := request.query.get("w"):
+            await hub.async_wait_for_storage_write(session.user_id, view.view_id, write_id)
         headers[hdrs.CACHE_CONTROL] = "no-store"
         return web.json_response(hub.shim_storage(session.user_id, view.view_id), headers=headers)
     if request.method != hdrs.METH_POST or name not in ("storage", "cookie"):
@@ -516,7 +537,7 @@ async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -
         except ValueError:
             raise web.HTTPBadRequest from None
         changes = data.get("set") if isinstance(data, dict) else None
-        if not isinstance(changes, dict) or len(changes) > MAX_SHIM_STORAGE_KEYS:
+        if not isinstance(changes, dict):
             raise web.HTTPBadRequest
         if not hub.async_apply_storage_write(
             session.user_id,
@@ -590,28 +611,27 @@ async def _respond(
 ) -> tuple[web.StreamResponse, bytes | None]:
     """The response for a device response: complete, or to stream (with its head)."""
     view, prefix = ctx.view, ctx.prefix
-    response_headers = _response_headers(result, ctx)
     content_type_header = result.headers.get(hdrs.CONTENT_TYPE, "")
     content_type = content_type_header.partition(";")[0].strip().lower()
     if content_type in GENERIC_TYPES and (
         fixed := TYPES_BY_EXTENSION.get(Path(url.path).suffix.lower())
     ):
         content_type = content_type_header = fixed
+    is_html = content_type in ("text/html", "application/xhtml+xml")
+    response_headers = _response_headers(result, ctx, is_html)
     if must_be_empty_body(request.method, result.status):
         if content_type_header:
             response_headers[hdrs.CONTENT_TYPE] = content_type_header
         return web.Response(status=result.status, headers=response_headers), None
 
-    is_html = content_type in ("text/html", "application/xhtml+xml")
-    if is_html:
-        # The page will embed this user's site data: never reuse a stored copy
-        response_headers[hdrs.CACHE_CONTROL] = "no-store"
-        response_headers.popall(hdrs.ETAG, None)
-        response_headers.popall(hdrs.LAST_MODIFIED, None)
     length = result.headers.get(hdrs.CONTENT_LENGTH)
     body = b""
-    if is_html or (
-        length is not None and length.isdigit() and int(length) <= MAX_SIMPLE_RESPONSE_SIZE
+    # Pages and stylesheets are rewritten, so they are buffered even when their
+    # length is not known up front (chunked, as small device servers often send)
+    if (
+        is_html
+        or content_type == "text/css"
+        or (length is not None and length.isdigit() and int(length) <= MAX_SIMPLE_RESPONSE_SIZE)
     ):
         body, complete = await read_limited(result.content, MAX_SIMPLE_RESPONSE_SIZE)
         if is_html:
