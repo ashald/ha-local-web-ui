@@ -267,6 +267,8 @@ class LocalWebUiHub:
         self._unsubs: list[Callable[[], None]] = []
         self._own_hosts: frozenset[tuple[str, int]] = frozenset()
         self._loaded = False  # Never save over storage that was not loaded
+        # Our own registry writes fire registry events too; those need no handling
+        self._writing = 0
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -328,14 +330,27 @@ class LocalWebUiHub:
 
     @callback
     def async_restore_device_links(self) -> None:
-        """Give every device we linked its original URL back."""
+        """Give every device we linked its original URL back (entry disabled)."""
+        # Stop following the registry first, or the restored links get linked again
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
         registry = dr.async_get(self.hass)
         for device_id, original in list(self.originals.items()):
             device = main_device(registry, device_id)
             if device and (device.configuration_url or "").startswith(DEVICE_LINK_PREFIX):
-                registry.async_update_device(device_id, configuration_url=original)
+                self._write(registry.async_update_device, device_id, configuration_url=original)
         self.originals.clear()
         self._async_schedule_save()
+
+    @callback
+    def _write(self, method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Change the device registry without handling the events it fires."""
+        self._writing += 1
+        try:
+            return method(*args, **kwargs)
+        finally:
+            self._writing -= 1
 
     async def async_unload(self) -> None:
         for unsub in self._unsubs:
@@ -533,46 +548,43 @@ class LocalWebUiHub:
             assert view is not None
             target = f"{DEVICE_LINK_PREFIX}{view.view_id}"
             if current != target:
-                registry.async_update_device(device.id, configuration_url=target)
+                self._write(registry.async_update_device, device.id, configuration_url=target)
         else:
             original = self.originals.pop(device.id, None)
             self._async_schedule_save()
-            registry.async_update_device(device.id, configuration_url=original)
+            self._write(registry.async_update_device, device.id, configuration_url=original)
 
     @callback
     def _async_device_registry_updated(
         self, event: Event[dr.EventDeviceRegistryUpdatedData]
     ) -> None:
+        if self._writing:
+            return
         device_id = event.data["device_id"]
         if event.data["action"] == "remove":
-            self._index = None
             if self.originals.pop(device_id, None) is not None:
                 self._async_schedule_save()
             self._async_forget_view(f"{DISCOVERED_PREFIX}{device_id}")
-            self.async_sync_linked_devices()
-            return
-        if event.data["action"] == "update" and not (
+        elif event.data["action"] == "update" and not (
             {"configuration_url", "disabled_by", "name", "name_by_user", "connections"}
             & set(event.data.get("changes", {}))
         ):
             return
-        registry = dr.async_get(self.hass)
-        if (device := main_device(registry, device_id)) is None:
-            return
-        if device.config_entry_id == self.entry.entry_id:
-            return  # One of our linked devices
+        else:
+            device = main_device(dr.async_get(self.hass), device_id)
+            if device is None or device.config_entry_id == self.entry.entry_id:
+                return  # A child device, or one of our linked devices
+        # Any device can change which device owns a shared URL's view, so every
+        # link is checked; only the ones that change are written
         self._index = None
-        self._async_sync_device_link(device)
+        self.async_sync_device_links()
         self.async_sync_linked_devices()
 
     @callback
     def async_set_hidden(self, view_id: str, hidden: bool) -> None:
         (self.hidden.add if hidden else self.hidden.discard)(view_id)
         self._async_schedule_save()
-        if (view := self.get_view(view_id)) is not None and view.device_id:
-            for device in iter_devices(dr.async_get(self.hass)):
-                if self.view_for_device(device.id) == view:
-                    self._async_sync_device_link(device)
+        self.async_sync_device_links()
         self.async_sync_linked_devices()
 
     @callback
@@ -610,7 +622,7 @@ class LocalWebUiHub:
         for device in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
             view_id = next((i for d, i in device.identifiers if d == DOMAIN), None)
             if view_id is None or view_id not in wanted or view_id in existing:
-                registry.async_remove_device(device.id)
+                self._write(registry.async_remove_device, device.id)
             else:
                 existing[view_id] = device
         # Connections are unique within a config entry: two devices of one physical
@@ -628,10 +640,11 @@ class LocalWebUiHub:
             if device is not None and (
                 device.connections != connections or device.identifiers != identifiers
             ):
-                registry.async_remove_device(device.id)
+                self._write(registry.async_remove_device, device.id)
                 device = None
             if device is None:
-                registry.async_get_or_create(
+                self._write(
+                    registry.async_get_or_create,
                     config_entry_id=self.entry.entry_id,
                     identifiers=identifiers,
                     connections=connections,
@@ -642,7 +655,9 @@ class LocalWebUiHub:
                     configuration_url=url,
                 )
             elif device.name != name or device.configuration_url != url:
-                registry.async_update_device(device.id, name=name, configuration_url=url)
+                self._write(
+                    registry.async_update_device, device.id, name=name, configuration_url=url
+                )
 
     # ---- per-user site state -------------------------------------------------
 
