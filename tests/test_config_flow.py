@@ -2,31 +2,45 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from pathlib import Path
+import re
 from typing import Any
+from unittest.mock import patch
 
+from homeassistant.components import websocket_api
 from homeassistant.config_entries import (
     SOURCE_RECONFIGURE,
     SOURCE_USER,
     ConfigEntryState,
     ConfigSubentry,
 )
+from homeassistant.const import EVENT_PANELS_UPDATED
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType, InvalidData, UnknownHandler
+from homeassistant.data_entry_flow import AbortFlow, FlowResultType, InvalidData, UnknownHandler
 from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    MockUser,
+    async_capture_events,
+)
+from pytest_homeassistant_custom_component.typing import (
+    ClientSessionGenerator,
+    WebSocketGenerator,
+)
 import voluptuous as vol
 
 from custom_components.local_web_ui import config_flow
-from custom_components.local_web_ui.hub import basic_authorization
 from custom_components.local_web_ui.const import (
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
     CONF_ICON,
     CONF_LINK_DEVICE_PAGES,
+    CONF_LINKED_DEVICES,
     CONF_MODE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
@@ -43,11 +57,23 @@ from custom_components.local_web_ui.const import (
     NAME,
     PANEL_COMPONENT,
     PANEL_URL_PATH,
+    PROXY_URL_PREFIX,
+    STATIC_URL_PATH,
+    STORAGE_KEY_JAR,
     SUBENTRY_TYPE_VIEW,
 )
+from custom_components.local_web_ui.hub import basic_authorization, pinned_unique_id
 
 COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / DOMAIN
+PANEL_FILE = COMPONENT_DIR / "www" / "local-web-ui-panel.js"
 CONF_NAME = "name"
+
+# What the config flow creates
+DEFAULT_OPTIONS: dict[str, bool] = {
+    CONF_DISCOVERY: True,
+    CONF_LINK_DEVICE_PAGES: True,
+    CONF_LINKED_DEVICES: False,
+}
 
 VIEW_INPUT: dict[str, Any] = {
     CONF_NAME: "Router",
@@ -137,6 +163,47 @@ def _add_subentry_directly(
     return subentry
 
 
+async def _set_options(
+    hass: HomeAssistant, entry: MockConfigEntry, user_input: dict[str, Any]
+) -> dict[str, Any]:
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(result["flow_id"], user_input)
+    await hass.async_block_till_done()
+    return result
+
+
+def _device_with_web_ui(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    name: str = "Kitchen",
+    url: str = "http://192.168.1.50/",
+) -> dr.DeviceEntry:
+    """A device of another integration whose "Visit" link is a local web UI."""
+    owner = MockConfigEntry(domain="fake_esphome")
+    owner.add_to_hass(hass)
+    return device_registry.async_get_or_create(
+        config_entry_id=owner.entry_id,
+        identifiers={("fake_esphome", name.lower())},
+        connections={(dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:01")},
+        name=name,
+        configuration_url=url,
+    )
+
+
+def _our_devices(
+    device_registry: dr.DeviceRegistry, entry: MockConfigEntry
+) -> list[dr.DeviceEntry]:
+    return dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+
+def _store_site_data(entry: MockConfigEntry, user_id: str, view_id: str, value: str) -> None:
+    """What a site leaves behind for a user: a cookie and a localStorage item."""
+    hub = entry.runtime_data
+    view = hub.static_views[view_id]
+    hub.async_store_cookies(user_id, view, [f"sid={value}; Path=/"], view.origin)
+    assert hub.async_apply_storage_write(user_id, view_id, "w1", {"token": value}, clear=False)
+
+
 # ---- fixtures ----------------------------------------------------------------
 
 
@@ -152,7 +219,7 @@ async def entry(hass: HomeAssistant, http: None) -> MockConfigEntry:
         domain=DOMAIN,
         title=NAME,
         data={},
-        options={CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True},
+        options=DEFAULT_OPTIONS,
     )
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -178,12 +245,12 @@ async def test_user_flow_creates_entry_with_default_options(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == NAME
     assert result["data"] == {}
-    assert result["options"] == {CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True}
+    assert result["options"] == DEFAULT_OPTIONS
 
     entries = hass.config_entries.async_entries(DOMAIN)
     assert len(entries) == 1
     created = entries[0]
-    assert created.options == {CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True}
+    assert created.options == DEFAULT_OPTIONS
     assert created.subentries == {}
     assert created.state is ConfigEntryState.LOADED
     assert PANEL_URL_PATH in _panels(hass)
@@ -223,7 +290,8 @@ async def test_options_flow_prefills_current_options(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
     hass.config_entries.async_update_entry(
-        entry, options={CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: True}
+        entry,
+        options={CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: True, CONF_LINKED_DEVICES: True},
     )
     await hass.async_block_till_done()
 
@@ -231,45 +299,111 @@ async def test_options_flow_prefills_current_options(
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
     fields = _fields(result["data_schema"])
-    assert set(fields) == {CONF_DISCOVERY, CONF_LINK_DEVICE_PAGES}
+    assert list(fields) == [CONF_DISCOVERY, CONF_LINK_DEVICE_PAGES, CONF_LINKED_DEVICES]
+    assert all(isinstance(marker, vol.Required) for marker in fields.values())
     assert _default(fields[CONF_DISCOVERY]) is False
     assert _default(fields[CONF_LINK_DEVICE_PAGES]) is True
+    assert _default(fields[CONF_LINKED_DEVICES]) is True
 
 
-async def test_options_flow_defaults_when_options_missing(hass: HomeAssistant, http: None) -> None:
-    """Entries created before options existed fall back to the defaults (both on)."""
-    entry = MockConfigEntry(domain=DOMAIN, title=NAME, options={})
+@pytest.mark.parametrize(
+    "options",
+    [
+        # Entries created before options existed
+        {},
+        # Entries created before the linked devices option existed
+        {CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True},
+    ],
+)
+async def test_options_flow_defaults_when_options_missing(
+    hass: HomeAssistant, http: None, options: dict[str, Any]
+) -> None:
+    """Missing options fall back to the defaults: discovery and links on, linked devices off."""
+    entry = MockConfigEntry(domain=DOMAIN, title=NAME, options=options)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    assert entry.runtime_data.linked_devices_enabled is False
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
     fields = _fields(result["data_schema"])
     assert _default(fields[CONF_DISCOVERY]) is True
     assert _default(fields[CONF_LINK_DEVICE_PAGES]) is True
+    assert _default(fields[CONF_LINKED_DEVICES]) is False
 
-
-async def test_options_flow_saves_and_reloads(hass: HomeAssistant, entry: MockConfigEntry) -> None:
-    old_hub = entry.runtime_data
-    assert old_hub.discovery_enabled is True
-    assert old_hub.link_default is True
-
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False}
-    )
+    # Submitting the form as shown stores all three
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
     await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == DEFAULT_OPTIONS
+
+
+async def test_options_flow_saves_and_applies_in_place(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> None:
+    _, subentry = await _add_view(hass, entry, VIEW_INPUT | {CONF_SHOW_IN_SIDEBAR: True})
+    assert subentry is not None
+    hub = entry.runtime_data
+    assert hub.discovery_enabled is True
+    assert hub.link_default is True
+    assert hub.linked_devices_enabled is False
+    main_panel = _panels(hass)[PANEL_URL_PATH]
+    view_panel = _panels(hass)[_view_panel_path(subentry.subentry_id)]
+
+    result = await _set_options(
+        hass,
+        entry,
+        {CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False, CONF_LINKED_DEVICES: True},
+    )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert entry.options == {CONF_DISCOVERY: False, CONF_LINK_DEVICE_PAGES: False}
+    assert entry.options == {
+        CONF_DISCOVERY: False,
+        CONF_LINK_DEVICE_PAGES: False,
+        CONF_LINKED_DEVICES: True,
+    }
     assert entry.state is ConfigEntryState.LOADED
-    # The update listener reloaded the entry: a fresh hub reads the new options
-    new_hub = entry.runtime_data
-    assert new_hub is not old_hub
-    assert hass.data[DOMAIN] is new_hub
-    assert new_hub.discovery_enabled is False
-    assert new_hub.link_default is False
-    assert PANEL_URL_PATH in _panels(hass)
+    # Not reloaded: the same hub applies the new options
+    assert entry.runtime_data is hub
+    assert hass.data[DOMAIN] is hub
+    assert hub.discovery_enabled is False
+    assert hub.link_default is False
+    assert hub.linked_devices_enabled is True
+    assert subentry.subentry_id in hub.static_views
+    # Panels are left alone
+    assert _panels(hass)[PANEL_URL_PATH] is main_panel
+    assert _panels(hass)[_view_panel_path(subentry.subentry_id)] is view_panel
+
+
+async def test_options_linked_devices_applied_in_place(
+    hass: HomeAssistant, entry: MockConfigEntry, device_registry: dr.DeviceRegistry
+) -> None:
+    device = _device_with_web_ui(hass, device_registry)
+    await hass.async_block_till_done()
+    hub = entry.runtime_data
+    view_id = f"{DISCOVERED_PREFIX}{device.id}"
+    assert _our_devices(device_registry, entry) == []
+
+    await _set_options(hass, entry, DEFAULT_OPTIONS | {CONF_LINKED_DEVICES: True})
+    assert entry.runtime_data is hub
+    [linked] = _our_devices(device_registry, entry)
+    assert linked.name == "Kitchen web UI"
+    assert linked.configuration_url == f"{DEVICE_LINK_PREFIX}{view_id}"
+    assert linked.connections == device.connections
+    # The device itself keeps its own Visit link to the web UI
+    assert device_registry.async_get(device.id).configuration_url == (
+        f"{DEVICE_LINK_PREFIX}{view_id}"
+    )
+
+    # Leaving the option out of the form keeps the current value
+    await _set_options(hass, entry, {CONF_DISCOVERY: True, CONF_LINK_DEVICE_PAGES: True})
+    assert entry.options[CONF_LINKED_DEVICES] is True
+    assert [d.id for d in _our_devices(device_registry, entry)] == [linked.id]
+
+    await _set_options(hass, entry, DEFAULT_OPTIONS)
+    assert entry.runtime_data is hub
+    assert _our_devices(device_registry, entry) == []
+    assert device_registry.async_get(device.id) is not None
 
 
 async def test_options_link_device_pages_toggles_device_visit_link(
@@ -359,6 +493,7 @@ async def test_view_user_step_form(hass: HomeAssistant, entry: MockConfigEntry) 
 
 
 async def test_view_user_step_creates_subentry(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    hub = entry.runtime_data
     result, subentry = await _add_view(hass, entry, VIEW_INPUT)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
@@ -373,9 +508,13 @@ async def test_view_user_step_creates_subentry(hass: HomeAssistant, entry: MockC
         CONF_VERIFY_SSL: True,
         CONF_SHOW_IN_SIDEBAR: False,
     }
-    # The automatic reload picked the new view up, keyed by the subentry id
+    assert subentry.unique_id is None
+    # Applied in place: the same hub has the new view, keyed by the subentry id
     assert entry.state is ConfigEntryState.LOADED
-    view = entry.runtime_data.static_views[subentry.subentry_id]
+    assert entry.runtime_data is hub
+    assert hass.data[DOMAIN] is hub
+    view = hub.get_view(subentry.subentry_id)
+    assert view is hub.static_views[subentry.subentry_id]
     assert view.name == "Router"
     assert view.url == "http://192.168.1.1/admin/?tab=1"
     assert view.source == "static"
@@ -639,12 +778,12 @@ async def test_reconfigure_form_is_prefilled(hass: HomeAssistant, entry: MockCon
     assert "hunter2" not in repr(result["data_schema"].schema)
 
 
-async def test_reconfigure_updates_subentry_and_reloads(
+async def test_reconfigure_updates_subentry_in_place(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
     _, subentry = await _add_view(hass, entry, VIEW_INPUT)
     assert subentry is not None
-    old_hub = entry.runtime_data
+    hub = entry.runtime_data
 
     result = await _reconfigure(
         hass,
@@ -670,23 +809,32 @@ async def test_reconfigure_updates_subentry_and_reloads(
         CONF_SHOW_IN_SIDEBAR: False,
     }
     assert len(entry.subentries) == 1
-    assert entry.runtime_data is not old_hub
-    view = entry.runtime_data.static_views[subentry.subentry_id]
+    # Not reloaded: the same hub shows the renamed view under the same id
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is hub
+    view = hub.get_view(subentry.subentry_id)
+    assert view is not None
     assert view.name == "Gateway"
     assert view.url == "https://192.168.1.2:8443/"
     assert view.verify_ssl is False
+    assert list(hub.static_views) == [subentry.subentry_id]
 
 
-async def test_reconfigure_unchanged_does_not_reload(
+async def test_reconfigure_unchanged_applies_nothing(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
     _, subentry = await _add_view(hass, entry, VIEW_INPUT)
     assert subentry is not None
     hub = entry.runtime_data
-    result = await _reconfigure(hass, entry, subentry.subentry_id, VIEW_INPUT)
+    view = hub.static_views[subentry.subentry_id]
+    with patch.object(hub, "async_update_config", wraps=hub.async_update_config) as update:
+        result = await _reconfigure(hass, entry, subentry.subentry_id, VIEW_INPUT)
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     assert entry.runtime_data is hub
+    # Home Assistant only calls the update listener when something changed
+    update.assert_not_called()
+    assert hub.static_views[subentry.subentry_id] is view
 
 
 @pytest.mark.parametrize("password_input", [{}, {CONF_PASSWORD: ""}])
@@ -794,6 +942,90 @@ async def test_reconfigure_preserves_device_id(hass: HomeAssistant, entry: MockC
     assert entry.runtime_data.static_views[subentry.subentry_id].device_id == "device123"
 
 
+async def test_reconfigure_pinned_subentry_keeps_unique_id_and_device(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    device_registry: dr.DeviceRegistry,
+    hass_ws_client: WebSocketGenerator,
+) -> None:
+    """A web UI created with "pin" stays the device's one web UI through edits."""
+    device = _device_with_web_ui(hass, device_registry)
+    await hass.async_block_till_done()
+    hub = entry.runtime_data
+    discovered_id = f"{DISCOVERED_PREFIX}{device.id}"
+    assert hub.get_view(discovered_id) is not None
+
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": f"{DOMAIN}/pin", "view_id": discovered_id})
+    msg = await client.receive_json()
+    assert msg["success"], msg
+    subentry_id = msg["result"]["view_id"]
+    await hass.async_block_till_done()
+    pinned = entry.subentries[subentry_id]
+    assert pinned.unique_id == pinned_unique_id(device.id) == f"device:{device.id}"
+    assert pinned.data[CONF_DEVICE_ID] == device.id
+
+    result = await _start_reconfigure(hass, entry, subentry_id)
+    fields = _fields(result["data_schema"])
+    assert CONF_DEVICE_ID not in fields
+    assert _form_value(fields[CONF_URL]) == "http://192.168.1.50/"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Kitchen display",
+            CONF_URL: "http://192.168.1.50/",
+            CONF_MODE: MODE_ISOLATED,
+            CONF_TRUSTED_ACK: False,
+            CONF_VERIFY_SSL: False,
+            CONF_SHOW_IN_SIDEBAR: True,
+            CONF_ICON: "mdi:monitor",
+        },
+    )
+    await hass.async_block_till_done()
+    assert result["reason"] == "reconfigure_successful"
+
+    updated = entry.subentries[subentry_id]
+    assert updated.unique_id == pinned_unique_id(device.id)
+    assert updated.title == "Kitchen display"
+    assert updated.data[CONF_DEVICE_ID] == device.id
+    assert updated.data[CONF_SHOW_IN_SIDEBAR] is True
+    # Applied in place, still tied to the device
+    assert entry.runtime_data is hub
+    view = hub.get_view(subentry_id)
+    assert view is not None
+    assert view.name == "Kitchen display"
+    assert view.device_id == device.id
+    assert hub.view_for_device(device.id) is view
+    assert hub.get_view(discovered_id) is None
+    assert device_registry.async_get(device.id).configuration_url == (
+        f"{DEVICE_LINK_PREFIX}{subentry_id}"
+    )
+    assert _panels(hass)[_view_panel_path(subentry_id)].sidebar_title == "Kitchen display"
+    # The unique id still stops a second web UI for the same device
+    with pytest.raises(AbortFlow):
+        hass.config_entries.async_add_subentry(
+            entry,
+            ConfigSubentry(
+                data=dict(updated.data),
+                subentry_type=SUBENTRY_TYPE_VIEW,
+                title="Kitchen again",
+                unique_id=pinned_unique_id(device.id),
+            ),
+        )
+    assert list(entry.subentries) == [subentry_id]
+
+    # Removing it gives the device back to discovery, right away
+    hass.config_entries.async_remove_subentry(entry, subentry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data is hub
+    assert hub.get_view(subentry_id) is None
+    assert hub.get_view(discovered_id) is not None
+    assert device_registry.async_get(device.id).configuration_url == (
+        f"{DEVICE_LINK_PREFIX}{discovered_id}"
+    )
+    assert _view_panel_path(subentry_id) not in _panels(hass)
+
+
 @pytest.mark.parametrize(
     ("changes", "errors"),
     [
@@ -817,12 +1049,16 @@ async def test_reconfigure_validation_errors(
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "reconfigure"
     assert result["errors"] == errors
-    # Nothing was saved and the entry was not reloaded
+    # Nothing was saved or applied
     unchanged = entry.subentries[subentry.subentry_id]
     assert unchanged.title == "Router"
     assert unchanged.data[CONF_URL] == VIEW_INPUT[CONF_URL]
     assert unchanged.data[CONF_MODE] == MODE_ISOLATED
     assert entry.runtime_data is hub
+    view = hub.static_views[subentry.subentry_id]
+    assert view.name == "Router"
+    assert view.url == VIEW_INPUT[CONF_URL]
+    assert view.mode == MODE_ISOLATED
 
 
 async def test_reconfigure_trusted_with_ack(hass: HomeAssistant, entry: MockConfigEntry) -> None:
@@ -861,7 +1097,8 @@ async def test_reconfigure_error_keeps_user_input(
 async def test_show_in_sidebar_registers_panel_and_removal_removes_it(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
-    assert set(_panels(hass)) & {PANEL_URL_PATH} == {PANEL_URL_PATH}
+    main_panel = _panels(hass)[PANEL_URL_PATH]
+    hub = entry.runtime_data
 
     _, subentry = await _add_view(
         hass,
@@ -871,21 +1108,23 @@ async def test_show_in_sidebar_registers_panel_and_removal_removes_it(
     assert subentry is not None
     path = _view_panel_path(subentry.subentry_id)
     panel = _panels(hass).get(path)
-    assert panel is not None, "sidebar panel not registered after the automatic reload"
+    assert panel is not None, "sidebar panel not registered when the web UI was added"
     assert panel.sidebar_title == "Printer"
     assert panel.sidebar_icon == "mdi:printer"
     assert panel.require_admin is True
     assert panel.config["view_id"] == subentry.subentry_id
     assert panel.config["_panel_custom"]["name"] == PANEL_COMPONENT
-    # The main panel survives the reload
-    assert PANEL_URL_PATH in _panels(hass)
+    # The main panel is left alone
+    assert _panels(hass)[PANEL_URL_PATH] is main_panel
 
     hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
     await hass.async_block_till_done()
     assert path not in _panels(hass)
-    assert PANEL_URL_PATH in _panels(hass)
+    assert _panels(hass)[PANEL_URL_PATH] is main_panel
     assert entry.state is ConfigEntryState.LOADED
-    assert subentry.subentry_id not in entry.runtime_data.static_views
+    assert entry.runtime_data is hub
+    assert subentry.subentry_id not in hub.static_views
+    assert hub.get_view(subentry.subentry_id) is None
 
 
 async def test_sidebar_panel_default_icon(hass: HomeAssistant, entry: MockConfigEntry) -> None:
@@ -945,6 +1184,80 @@ async def test_reconfigure_toggles_and_renames_sidebar_panel(
     assert PANEL_URL_PATH in _panels(hass)
 
 
+async def test_sidebar_panel_replaced_only_when_title_or_icon_changes(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> None:
+    """panel_custom cannot update a panel, so a new title or icon re-registers it."""
+    shown = VIEW_INPUT | {CONF_SHOW_IN_SIDEBAR: True, CONF_ICON: "mdi:router"}
+    _, subentry = await _add_view(hass, entry, shown)
+    assert subentry is not None
+    subentry_id = subentry.subentry_id
+    path = _view_panel_path(subentry_id)
+    first = _panels(hass)[path]
+    main_panel = _panels(hass)[PANEL_URL_PATH]
+    panel_events = async_capture_events(hass, EVENT_PANELS_UPDATED)
+
+    # Changes the sidebar does not show keep the panel
+    await _reconfigure(
+        hass,
+        entry,
+        subentry_id,
+        shown | {CONF_URL: "https://192.168.1.2/", CONF_VERIFY_SSL: False},
+    )
+    assert entry.subentries[subentry_id].data[CONF_URL] == "https://192.168.1.2/"
+    assert entry.runtime_data.static_views[subentry_id].url == "https://192.168.1.2/"
+    assert _panels(hass)[path] is first
+    assert panel_events == []
+
+    await _reconfigure(hass, entry, subentry_id, shown | {CONF_NAME: "Gateway"})
+    second = _panels(hass)[path]
+    assert second is not first
+    assert (second.sidebar_title, second.sidebar_icon) == ("Gateway", "mdi:router")
+    assert second.config["view_id"] == subentry_id
+    assert second.require_admin is True
+    assert second.config["_panel_custom"] == first.config["_panel_custom"]
+    assert panel_events
+
+    panel_events.clear()
+    await _reconfigure(
+        hass, entry, subentry_id, shown | {CONF_NAME: "Gateway", CONF_ICON: "mdi:lan"}
+    )
+    third = _panels(hass)[path]
+    assert third is not second
+    assert (third.sidebar_title, third.sidebar_icon) == ("Gateway", "mdi:lan")
+    assert panel_events
+
+    # Dropping the icon falls back to the default one
+    await _reconfigure(hass, entry, subentry_id, shown | {CONF_NAME: "Gateway", CONF_ICON: ""})
+    assert _panels(hass)[path].sidebar_icon == "mdi:web"
+    assert _panels(hass)[PANEL_URL_PATH] is main_panel
+
+
+async def test_panel_module_url_is_versioned_by_content(
+    hass: HomeAssistant, entry: MockConfigEntry, hass_client: ClientSessionGenerator
+) -> None:
+    module_url = _panels(hass)[PANEL_URL_PATH].config["_panel_custom"]["module_url"]
+    assert re.fullmatch(
+        re.escape(f"{STATIC_URL_PATH}/{PANEL_FILE.name}") + r"\?v=[0-9a-f]{12}", module_url
+    )
+    # The version is the start of the file's SHA-256
+    content = await hass.async_add_executor_job(PANEL_FILE.read_bytes)
+    assert module_url.endswith(f"?v={hashlib.sha256(content).hexdigest()[:12]}")
+
+    # Sidebar entries of single web UIs load the same module
+    _, subentry = await _add_view(hass, entry, VIEW_INPUT | {CONF_SHOW_IN_SIDEBAR: True})
+    assert subentry is not None
+    panel = _panels(hass)[_view_panel_path(subentry.subentry_id)]
+    assert panel.config["_panel_custom"]["module_url"] == module_url
+
+    # Served with long-lived cache headers; the version changes with the file
+    client = await hass_client()
+    response = await client.get(module_url)
+    assert response.status == 200
+    assert await response.read() == content
+    assert "max-age" in response.headers["Cache-Control"]
+
+
 async def test_unloading_entry_removes_sidebar_panels(
     hass: HomeAssistant, entry: MockConfigEntry
 ) -> None:
@@ -961,6 +1274,166 @@ async def test_unloading_entry_removes_sidebar_panels(
     assert PANEL_URL_PATH in _panels(hass)
 
 
+# ---- web UI (subentry) removal and site data ----------------------------------
+
+
+async def test_removing_subentry_drops_its_site_data(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    hass_admin_user: MockUser,
+    hass_storage: dict[str, Any],
+) -> None:
+    _, removed = await _add_view(hass, entry, VIEW_INPUT)
+    _, kept = await _add_view(
+        hass, entry, VIEW_INPUT | {CONF_NAME: "Printer", CONF_URL: "http://192.168.1.9/"}
+    )
+    assert removed is not None
+    assert kept is not None
+    hub = entry.runtime_data
+    user_id = hass_admin_user.id
+    removed_view = hub.static_views[removed.subentry_id]
+    kept_view = hub.static_views[kept.subentry_id]
+    _store_site_data(entry, user_id, removed.subentry_id, "router")
+    _store_site_data(entry, user_id, kept.subentry_id, "printer")
+
+    hass.config_entries.async_remove_subentry(entry, removed.subentry_id)
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data is hub
+    assert hub.shim_storage(user_id, removed.subentry_id) == {}
+    assert hub.applied_writes(user_id, removed.subentry_id) == []
+    assert list(hub.cookie_jar(user_id, removed_view)) == []
+    # The other web UI keeps its data
+    assert hub.shim_storage(user_id, kept.subentry_id) == {"token": "printer"}
+    assert hub.applied_writes(user_id, kept.subentry_id) == ["w1"]
+    assert {m.key: m.value for m in hub.cookie_jar(user_id, kept_view)} == {"sid": "printer"}
+
+    # Nothing of the removed web UI is written to disk
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    saved = hass_storage[STORAGE_KEY_JAR]["data"]
+    assert set(saved["storage"]) == {f"{user_id}|{kept.subentry_id}"}
+    assert set(saved["cookies"]) == {f"{user_id}|{kept.subentry_id}"}
+
+
+async def test_editing_subentry_keeps_its_site_data(
+    hass: HomeAssistant, entry: MockConfigEntry, hass_admin_user: MockUser
+) -> None:
+    """Renaming a web UI or opening another page of the same site keeps its logins."""
+    _, subentry = await _add_view(hass, entry, VIEW_INPUT)
+    assert subentry is not None
+    hub = entry.runtime_data
+    user_id = hass_admin_user.id
+    _store_site_data(entry, user_id, subentry.subentry_id, "router")
+
+    await _reconfigure(
+        hass,
+        entry,
+        subentry.subentry_id,
+        VIEW_INPUT | {CONF_NAME: "Gateway", CONF_URL: "http://192.168.1.1/status"},
+    )
+    view = hub.static_views[subentry.subentry_id]
+    assert view.name == "Gateway"
+    assert hub.shim_storage(user_id, subentry.subentry_id) == {"token": "router"}
+    assert {m.key: m.value for m in hub.cookie_jar(user_id, view)} == {"sid": "router"}
+
+
+async def test_editing_subentry_to_another_site_drops_old_site_data(
+    hass: HomeAssistant, entry: MockConfigEntry, hass_admin_user: MockUser
+) -> None:
+    _, subentry = await _add_view(hass, entry, VIEW_INPUT)
+    assert subentry is not None
+    hub = entry.runtime_data
+    user_id = hass_admin_user.id
+    _store_site_data(entry, user_id, subentry.subentry_id, "router-secret")
+
+    await _reconfigure(
+        hass, entry, subentry.subentry_id, VIEW_INPUT | {CONF_URL: "http://192.168.1.9/"}
+    )
+    view = hub.static_views[subentry.subentry_id]
+    assert str(view.origin) == "http://192.168.1.9"
+    # A browser would never give one site's cookies and storage to another
+    assert hub.shim_storage(user_id, subentry.subentry_id) == {}
+    assert list(hub.cookie_jar(user_id, view)) == []
+
+
+# ---- lifecycle ------------------------------------------------------------------
+
+
+async def test_routes_and_commands_registered_once(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    hass_client: ClientSessionGenerator,
+    hass_ws_client: WebSocketGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Routes cannot be unregistered: entry unload/setup cycles must not add them again."""
+
+    def our_routes() -> list[tuple[str, str]]:
+        return sorted(
+            (route.method, route.resource.canonical)
+            for route in hass.http.app.router.routes()
+            if route.resource is not None
+            and route.resource.canonical.startswith((PROXY_URL_PREFIX, STATIC_URL_PATH))
+        )
+
+    routes = our_routes()
+    assert [r for r in routes if r[1].startswith(PROXY_URL_PREFIX)] == [
+        ("*", f"{PROXY_URL_PREFIX}/{{view_id}}/{{token}}/{{path}}")
+    ]
+    assert any(r[1].startswith(STATIC_URL_PATH) for r in routes)
+    route_count = len(hass.http.app.router.routes())
+    module_url = _panels(hass)[PANEL_URL_PATH].config["_panel_custom"]["module_url"]
+
+    with (
+        patch.object(
+            websocket_api, "async_register_command", wraps=websocket_api.async_register_command
+        ) as register_command,
+        patch.object(
+            hass.http,
+            "async_register_static_paths",
+            wraps=hass.http.async_register_static_paths,
+        ) as register_static_paths,
+    ):
+        for _ in range(2):
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            await hass.async_block_till_done()
+            assert PANEL_URL_PATH not in _panels(hass)
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+            assert entry.state is ConfigEntryState.LOADED
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # Removed and set up again through the config flow
+        await hass.config_entries.async_remove(entry.entry_id)
+        await hass.async_block_till_done()
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        await hass.async_block_till_done()
+
+    new_entry = result["result"]
+    assert new_entry.state is ConfigEntryState.LOADED
+    register_command.assert_not_called()
+    register_static_paths.assert_not_called()
+    assert our_routes() == routes
+    assert len(hass.http.app.router.routes()) == route_count
+    assert _panels(hass)[PANEL_URL_PATH].config["_panel_custom"]["module_url"] == module_url
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    # The commands and the proxy use the current hub
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": f"{DOMAIN}/views"})
+    msg = await ws.receive_json()
+    assert msg["success"], msg
+    assert msg["result"]["entry_id"] == new_entry.entry_id
+    assert hass.data[DOMAIN] is new_entry.runtime_data
+    client = await hass_client()
+    response = await client.get(f"{PROXY_URL_PREFIX}/nope/nope/")
+    assert response.status == 404
+
+
 # ---- translations ------------------------------------------------------------
 
 
@@ -969,12 +1442,14 @@ def test_translations_cover_flows(filename: str) -> None:
     strings = json.loads((COMPONENT_DIR / filename).read_text())
 
     assert "single_instance_allowed" in strings["config"]["abort"]
-    options_data = strings["options"]["step"]["init"]["data"]
-    assert set(options_data) == {CONF_DISCOVERY, CONF_LINK_DEVICE_PAGES}
+    options_step = strings["options"]["step"]["init"]
+    assert set(options_step["data"]) == set(DEFAULT_OPTIONS)
+    assert set(options_step["data_description"]) == set(DEFAULT_OPTIONS)
 
     view = strings["config_subentries"][SUBENTRY_TYPE_VIEW]
     assert view["initiate_flow"]["user"]
-    assert "reconfigure_successful" in view["abort"]
+    assert view["initiate_flow"]["reconfigure"] == "Edit web UI"
+    assert {"reconfigure_successful", "already_configured"} <= set(view["abort"])
     assert set(view["error"]) == {"name_required", "invalid_url", "trusted_not_acknowledged"}
     form_fields = set(_fields(config_flow._view_schema({})))
     for step in ("user", "reconfigure"):

@@ -310,11 +310,13 @@ class LocalWebUiHub:
     @callback
     def async_update_config(self) -> None:
         """Apply the entry's current options and web UIs (subentries) in place."""
-        previous = set(self._static)
+        previous = self._static
         self._static = self._load_static_views()
         self._index = None
-        for view_id in previous - set(self._static):
-            self._async_forget_view(view_id)
+        for view_id, old in previous.items():
+            # A web UI moved to another site must not hand it the old site's data
+            if (view := self._static.get(view_id)) is None or view.origin != old.origin:
+                self._async_forget_view(view_id)
         self.async_sync_device_links()
         self.async_sync_linked_devices()
         if trusted := [v.name for v in self._static.values() if v.mode == MODE_TRUSTED]:
