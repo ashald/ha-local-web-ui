@@ -65,7 +65,7 @@ from custom_components.local_web_ui.const import (
     SUBENTRY_TYPE_VIEW,
 )
 from custom_components.local_web_ui.hub import LocalWebUiHub
-from custom_components.local_web_ui.proxy import ISOLATION_CSP
+from custom_components.local_web_ui.proxy import ISOLATION_CSP, https_upgrade
 
 ISO = "isoview"
 TRUSTED = "trustedview"
@@ -1178,7 +1178,8 @@ async def test_trusted_no_csp_and_no_storage_shim(env: Env) -> None:
         ("//example.com/elsewhere", "//example.com/elsewhere"),
         ("//127.0.0.1:1/other-port", "//127.0.0.1:1/other-port"),
         ("http://127.0.0.1:1/other-port", "http://127.0.0.1:1/other-port"),
-        ("https://127.0.0.1:{port}/other-scheme", "https://127.0.0.1:{port}/other-scheme"),
+        # The same host moving to https is followed inside the proxy
+        ("https://127.0.0.1:{port}/other-scheme", "{prefix}/other-scheme"),
         ("relative/page", "relative/page"),
     ],
 )
@@ -1852,3 +1853,38 @@ async def test_not_modified_response(env: Env) -> None:
     assert response.headers[hdrs.ETAG] == '"v1"'
     assert await response.read() == b""
     assert env.upstream.last.headers[hdrs.IF_NONE_MATCH] == '"v1"'
+
+
+async def test_redirect_to_https_on_same_host_followed_in_proxy(env: Env) -> None:
+    prefix = await env.prefix(ISO)
+    host = URL(env.upstream.origin).host
+    env.upstream.redirects["r"] = f"https://{host}:8443/login?next=home"
+
+    response = await env.client.get(prefix + "/redirect/r", allow_redirects=False)
+    assert response.status == 302
+    # Stays in the proxy: the browser never leaves for the LAN address
+    assert response.headers[hdrs.LOCATION] == prefix + "/login?next=home"
+    view = env.hub.get_view(ISO)
+    assert view is not None
+    assert env.hub.effective_view(view).origin == URL(f"https://{host}:8443")
+
+    # Later requests go to the https site (nothing listens there in this test)
+    assert (await env.client.get(prefix + "/login")).status == 502
+    # The http site saw only the redirect request
+    assert len(env.upstream.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("location", "origin", "expected"),
+    [
+        ("https://192.168.1.5/", "http://192.168.1.5", "https://192.168.1.5"),
+        ("https://192.168.1.5:8443/x", "http://192.168.1.5:8080", "https://192.168.1.5:8443"),
+        ("https://other.lan/", "http://192.168.1.5", None),
+        ("http://192.168.1.5:81/", "http://192.168.1.5", None),
+        ("https://192.168.1.5/", "https://192.168.1.5:8443", None),
+        ("/relative", "http://192.168.1.5", None),
+    ],
+)
+def test_https_upgrade(location: str, origin: str, expected: str | None) -> None:
+    result = https_upgrade(location, URL(origin))
+    assert (None if result is None else str(result)) == expected

@@ -6,7 +6,7 @@ import asyncio
 import base64
 from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
 import logging
@@ -300,6 +300,8 @@ class LocalWebUiHub:
         self._page_writes: OrderedDict[tuple[str, str], int] = OrderedDict()
         self._http: dict[str | bool, aiohttp.ClientSession] = {}
         self._limiters: dict[str, asyncio.Semaphore] = {}
+        # view_id -> (configured origin, https origin the site redirected to)
+        self._upgrades: dict[str, tuple[URL, URL]] = {}
         self._static: dict[str, View] = {}
         self._index: _DiscoveredIndex | None = None
         # device_id -> (what the view was computed from, the view)
@@ -703,6 +705,17 @@ class LocalWebUiHub:
             self._async_sync_device_link(device)
 
     # ---- linked devices --------------------------------------------------------
+
+    def effective_view(self, view: View) -> View:
+        """The view, on https if its site redirected there (http to https, same host)."""
+        if (upgrade := self._upgrades.get(view.view_id)) is not None and upgrade[0] == view.origin:
+            return replace(view, origin=upgrade[1])
+        return view
+
+    @callback
+    def async_upgrade_to_https(self, view: View, origin: URL) -> None:
+        """Remember that a site moved its pages from http to https on the same host."""
+        self._upgrades[view.view_id] = (view.origin, origin)
 
     def linked_device_id(self, view_id: str) -> str | None:
         """Our "<name> web UI" device for a view, if there is one."""

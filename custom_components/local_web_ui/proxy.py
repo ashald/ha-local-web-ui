@@ -281,6 +281,7 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
         raise web.HTTPNotFound
     if (view := hub.get_view(view_id)) is None:
         raise web.HTTPNotFound
+    view = hub.effective_view(view)
 
     if request.headers.get("Service-Worker") == "script":
         # Registered from HA's origin, a service worker could outlive the view and
@@ -396,7 +397,13 @@ def _response_headers(
     if set_cookies := result.headers.getall(hdrs.SET_COOKIE, ()):
         ctx.hub.async_store_cookies(ctx.session.user_id, ctx.view, set_cookies, result.url)
     if (location := result.headers.get(hdrs.LOCATION)) is not None:
-        headers[hdrs.LOCATION] = rewrite_location(location, ctx.view.origin, ctx.prefix)
+        origin = ctx.view.origin
+        if (upgraded := https_upgrade(location, origin)) is not None:
+            # Printers, NAS and routers often move to https on the same host: follow
+            # them inside the proxy, instead of sending the browser to the LAN address
+            ctx.hub.async_upgrade_to_https(ctx.view, upgraded)
+            origin = upgraded
+        headers[hdrs.LOCATION] = rewrite_location(location, origin, ctx.prefix)
     headers.update(SECURITY_HEADERS)
     if ctx.view.mode == MODE_ISOLATED:
         headers["Content-Security-Policy"] = ISOLATION_CSP
@@ -410,6 +417,19 @@ def _response_headers(
         if exposed:
             headers[hdrs.ACCESS_CONTROL_EXPOSE_HEADERS] = ", ".join(exposed)
     return headers
+
+
+def https_upgrade(location: str, origin: URL) -> URL | None:
+    """The https origin of a redirect from an http site to https on the same host."""
+    if origin.scheme != "http":
+        return None
+    try:
+        url = URL(location)
+    except ValueError:
+        return None
+    if url.scheme != "https" or not url.host or url.host.lower() != (origin.host or "").lower():
+        return None
+    return url.origin()
 
 
 def rewrite_location(location: str, origin: URL, prefix: str) -> str:
