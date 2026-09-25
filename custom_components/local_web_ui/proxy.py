@@ -659,7 +659,7 @@ async def _proxy_websocket(
     url: URL,
     headers: CIMultiDict[str],
 ) -> web.StreamResponse:
-    if not ctx.hub.sessions.can_open_websocket(ctx.session.token):
+    if (slot := ctx.hub.sessions.reserve_websocket(ctx.session.token)) is None:
         return _error(503, "Too many open connections for this web UI")
     protocols: Iterable[str] = [
         proto.strip()
@@ -667,26 +667,29 @@ async def _proxy_websocket(
         if proto.strip()
     ]
     ws_url = url.with_scheme("wss" if url.scheme == "https" else "ws")
-    async with client.ws_connect(
-        ws_url,
-        headers=headers,
-        protocols=protocols,
-        autoclose=False,
-        autoping=False,
-        max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
-        timeout=aiohttp.ClientWSTimeout(ws_close=10),
-    ) as ws_client:
-        ws_server = web.WebSocketResponse(
-            protocols=[ws_client.protocol] if ws_client.protocol else (),
+    try:
+        async with client.ws_connect(
+            ws_url,
+            headers=headers,
+            protocols=protocols,
             autoclose=False,
             autoping=False,
             max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
-        )
-        ws_server.headers.update(SECURITY_HEADERS)
-        await ws_server.prepare(request)
-        # Closed when the session ends (expiry, logout), not only by either side
-        release = ctx.hub.sessions.track_websocket(ctx.session.token, ws_server, ws_client)
-        try:
+            timeout=aiohttp.ClientWSTimeout(ws_close=10),
+        ) as ws_client:
+            slot.add(ws_client)
+            ws_server = web.WebSocketResponse(
+                protocols=[ws_client.protocol] if ws_client.protocol else (),
+                autoclose=False,
+                autoping=False,
+                max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
+            )
+            ws_server.headers.update(SECURITY_HEADERS)
+            await ws_server.prepare(request)
+            slot.add(ws_server)
+            if slot.ended:
+                # The session ended while connecting (expiry, logout)
+                await slot.close()
             tasks = [
                 asyncio.create_task(_websocket_forward(ws_server, ws_client)),
                 asyncio.create_task(_websocket_forward(ws_client, ws_server)),
@@ -694,8 +697,8 @@ async def _proxy_websocket(
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
-        finally:
-            release()
+    finally:
+        slot.release()
     await ws_server.close()
     return ws_server
 

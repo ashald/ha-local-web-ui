@@ -201,23 +201,39 @@ class SessionManager:
             self._hass.async_create_task(close())
         session.websockets.clear()
 
-    def can_open_websocket(self, token: str) -> bool:
+    @callback
+    def reserve_websocket(self, token: str) -> WebSocketSlot | None:
+        """Claim one of the session's WebSockets before connecting; None if all taken.
+
+        The claim is made before any await, so sockets opened at the same time
+        cannot get past the limit. Release it with slot.release().
+        """
         session = self._sessions.get(token)
-        return session is not None and len(session.websockets) < MAX_WEBSOCKETS_PER_SESSION
+        if session is None or len(session.websockets) >= MAX_WEBSOCKETS_PER_SESSION:
+            return None
+        slot = WebSocketSlot(session)
+        session.websockets.add(slot.close)
+        return slot
 
-    def track_websocket(self, token: str, *sockets: Any) -> Callable[[], None]:
-        """Close these sockets when the session ends; returns the release callback."""
-        session = self._sessions.get(token)
 
-        async def close() -> None:
-            for sock in sockets:
-                await sock.close()
+class WebSocketSlot:
+    """One proxied WebSocket of a session: closed when the session ends."""
 
-        if session is None:
-            self._hass.async_create_task(close())
-            return lambda: None
-        session.websockets.add(close)
-        return lambda: session.websockets.discard(close)
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._sockets: list[Any] = []
+        self.ended = False
+
+    def add(self, sock: Any) -> None:
+        self._sockets.append(sock)
+
+    async def close(self) -> None:
+        self.ended = True
+        for sock in self._sockets:
+            await sock.close()
+
+    def release(self) -> None:
+        self._session.websockets.discard(self.close)
 
 
 @callback
@@ -304,7 +320,10 @@ class LocalWebUiHub:
         )
         self._unsubs.append(
             async_track_time_interval(
-                self.hass, lambda _now: self.sessions.expire(), timedelta(seconds=30)
+                # A callback: it runs in the event loop, like everything that uses sessions
+                self.hass,
+                callback(lambda _now: self.sessions.expire()),
+                timedelta(seconds=30),
             )
         )
         self.async_update_config()
