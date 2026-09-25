@@ -124,7 +124,8 @@ def ws_session(
         if session is not None and session.user_id != user_id:
             session = None
     if session is None:
-        session = hub.sessions.create(view.view_id, user_id)
+        # Bound to this login: logging out ends the session
+        session = hub.sessions.create(view.view_id, user_id, connection.refresh_token_id)
     connection.send_result(
         msg["id"],
         {

@@ -3,6 +3,13 @@
 Requests arrive at /api/local_web_ui/<view_id>/<session token>/<path>. The token
 names a session created over the authenticated websocket API; the view decides
 where the request goes. Nothing in the request can choose the upstream host.
+
+Everything served here comes from Home Assistant's own origin, so the proxy is
+strict about what it lets through in either direction:
+- towards the device: no browser credentials (Cookie, Authorization) and no
+  client-supplied identity or forwarding headers;
+- towards the browser: only an allowlist of the device's response headers, plus
+  security headers set here on every response, streamed or not.
 """
 
 from __future__ import annotations
@@ -10,7 +17,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from http.cookies import SimpleCookie
 import json
 import logging
 from pathlib import Path
@@ -29,9 +35,17 @@ from .const import (
     DOMAIN,
     INTERNAL_PATH_PREFIX,
     MAX_SHIM_STORAGE_BYTES,
+    MAX_SHIM_STORAGE_KEYS,
     MODE_ISOLATED,
     PROXY_URL_PREFIX,
 )
+
+try:
+    from homeassistant.components.http.auth_util import async_user_not_allowed_do_auth
+except ImportError:  # Home Assistant before the helper moved
+    from homeassistant.components.http.auth import (  # type: ignore[attr-defined,no-redef]
+        async_user_not_allowed_do_auth,
+    )
 
 if TYPE_CHECKING:
     from .hub import LocalWebUiHub, Session, View
@@ -48,50 +62,99 @@ HOP_BY_HOP = {
     hdrs.TRANSFER_ENCODING,
     hdrs.UPGRADE,
 }
-REQUEST_HEADERS_FILTER = HOP_BY_HOP | {
-    hdrs.HOST,
-    # HA already authenticated the user. Browsers send HA's origin (or "null"),
-    # which device UIs such as ESPHome's web_server reject as cross-origin.
-    hdrs.ORIGIN,
-    hdrs.REFERER,  # Contains the session token
-    hdrs.ACCEPT_ENCODING,  # aiohttp negotiates what it can decode
-    hdrs.CONTENT_LENGTH,
-    hdrs.SEC_WEBSOCKET_EXTENSIONS,
-    hdrs.SEC_WEBSOCKET_PROTOCOL,
-    hdrs.SEC_WEBSOCKET_VERSION,
-    hdrs.SEC_WEBSOCKET_KEY,
-    hdrs.COOKIE,  # Re-added per mode below
-}
-RESPONSE_HEADERS_FILTER = HOP_BY_HOP | {
-    hdrs.CONTENT_LENGTH,
-    hdrs.CONTENT_TYPE,
-    hdrs.CONTENT_ENCODING,
-    # The UI is framed by HA; HA's own policy applies
-    "X-Frame-Options",
-    "Content-Security-Policy",
-    "Content-Security-Policy-Report-Only",
-    hdrs.ACCESS_CONTROL_ALLOW_ORIGIN,
-    hdrs.ACCESS_CONTROL_ALLOW_CREDENTIALS,
-    hdrs.SET_COOKIE,
-    hdrs.LOCATION,
-    "Referrer-Policy",
-    "Clear-Site-Data",  # Would clear Home Assistant's own storage in trusted mode
-}
+REQUEST_HEADERS_DROPPED = frozenset(
+    name.lower()
+    for name in HOP_BY_HOP
+    | {
+        hdrs.HOST,
+        # HA already authenticated the user. Browsers send HA's origin (or "null"),
+        # which device UIs such as ESPHome's web_server reject as cross-origin.
+        hdrs.ORIGIN,
+        hdrs.REFERER,  # Contains the session token
+        hdrs.ACCEPT_ENCODING,  # aiohttp negotiates what it can decode
+        hdrs.CONTENT_LENGTH,
+        hdrs.SEC_WEBSOCKET_EXTENSIONS,
+        hdrs.SEC_WEBSOCKET_PROTOCOL,
+        hdrs.SEC_WEBSOCKET_VERSION,
+        hdrs.SEC_WEBSOCKET_KEY,
+        # Credentials the browser holds for Home Assistant's origin (a reverse
+        # proxy's Basic auth, SSO cookies) must never reach a device. Site cookies
+        # live in the server-side jar; site logins come from the view's settings.
+        hdrs.COOKIE,
+        hdrs.AUTHORIZATION,
+        # Set from Home Assistant's validated view of the request, never passed on
+        hdrs.FORWARDED,
+        hdrs.X_FORWARDED_FOR,
+        hdrs.X_FORWARDED_HOST,
+        hdrs.X_FORWARDED_PROTO,
+        "X-Real-IP",
+        "X-Ingress-Path",
+        # Identity headers some reverse proxies add for the logged-in user
+        "Remote-User",
+        "Remote-Email",
+        "Remote-Groups",
+        "Remote-Name",
+        "X-Remote-User",
+        "X-Forwarded-User",
+        "X-Forwarded-Email",
+        "X-Forwarded-Preferred-Username",
+        "X-Forwarded-Groups",
+        "X-Forwarded-Access-Token",
+    }
+)
+REQUEST_HEADER_PREFIXES_DROPPED = ("x-auth-request-", "cf-access-")
+
+# Device response headers that may reach the browser. Everything else is dropped:
+# the response comes from Home Assistant's origin, and several standard headers act
+# on the whole origin (service worker scope, reporting, Clear-Site-Data, HSTS...).
+RESPONSE_HEADERS_ALLOWED = frozenset(
+    {
+        "accept-ranges",
+        "age",
+        "cache-control",
+        "content-disposition",
+        "content-language",
+        "content-range",
+        "date",
+        "etag",
+        "expires",
+        "last-modified",
+        "pragma",
+        "retry-after",
+        "vary",
+    }
+)
+# Custom X- headers carry device data (versions, checksums); these few are not data
+RESPONSE_X_HEADERS_DROPPED = frozenset(
+    {
+        "x-frame-options",
+        "x-content-type-options",
+        "x-xss-protection",
+        "x-ingress-path",
+        "x-dns-prefetch-control",
+        "x-permitted-cross-domain-policies",
+    }
+)
 
 # Isolated views get an opaque origin: they cannot read Home Assistant's storage
 # (which holds its access tokens) or script its pages. As a response header this
-# also holds when a view is opened in a tab of its own.
-# Popups may escape the sandbox so links to other sites work normally; a popup
-# showing another proxied page is sandboxed again by this same header.
+# also holds when a view is opened in a tab of its own. Popups may escape the
+# sandbox so links to other sites work normally; a popup showing another proxied
+# page is sandboxed again by this same header.
 ISOLATION_CSP = (
     "sandbox allow-scripts allow-forms allow-popups "
     "allow-popups-to-escape-sandbox allow-modals allow-downloads"
 )
-# Never let a device page pick a policy that leaks the session token to other sites
-REFERRER_POLICY = "strict-origin-when-cross-origin"
+# Set on every response, including streamed ones, which Home Assistant's own
+# headers middleware cannot reach once they are prepared
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    # The session token is in the URL
+    "Referrer-Policy": "no-referrer",
+}
 
 MAX_SIMPLE_RESPONSE_SIZE = 4 * 1024 * 1024
-MAX_WEBSOCKET_MESSAGE_SIZE = 16 * 1024 * 1024
+MAX_WEBSOCKET_MESSAGE_SIZE = 4 * 1024 * 1024
 UPSTREAM_TIMEOUT = ClientTimeout(total=None, sock_connect=10)
 
 
@@ -120,50 +183,78 @@ def async_register_proxy(hass: HomeAssistant) -> None:
     resource.add_route(hdrs.METH_ANY, _handle)
 
 
+def _error(status: int, text: str) -> web.Response:
+    """Errors carry the sandbox too: nothing under the prefix runs unsandboxed."""
+    return web.Response(
+        status=status,
+        text=text,
+        headers={**SECURITY_HEADERS, "Content-Security-Policy": ISOLATION_CSP},
+    )
+
+
 async def _handle(request: web.Request) -> web.StreamResponse:
+    try:
+        return await _handle_request(request)
+    except web.HTTPException as err:
+        # Never let an HTTPUnauthorized escape: HA's ban middleware would count it
+        status = 404 if err.status == 401 else err.status
+        return _error(status, err.text or err.reason)
+
+
+async def _handle_request(request: web.Request) -> web.StreamResponse:
     hass = request.app[KEY_HASS]
     hub: LocalWebUiHub | None = hass.data.get(DOMAIN)
     view_id = request.match_info["view_id"]
     token = request.match_info["token"]
+    prefix = f"{PROXY_URL_PREFIX}/{view_id}/{token}"
+    raw = request.rel_url.raw_path
+    # Percent-encoded ids would decode to a valid session but shift the path below
+    if not (raw == prefix or raw.startswith(prefix + "/")):
+        raise web.HTTPNotFound
     if hub is None or (session := hub.sessions.touch(token, view_id)) is None:
         raise web.HTTPNotFound
     user = await hass.auth.async_get_user(session.user_id)
-    if user is None or not user.is_active or not user.is_admin:
+    if (
+        user is None
+        or not user.is_admin
+        or async_user_not_allowed_do_auth(hass, user, request) is not None
+    ):
         hub.sessions.revoke_user(session.user_id)
         raise web.HTTPNotFound
     if (view := hub.get_view(view_id)) is None:
         raise web.HTTPNotFound
 
-    prefix = f"{PROXY_URL_PREFIX}/{view_id}/{token}"
-    raw_path = request.rel_url.raw_path[len(prefix) :] or "/"
+    raw_path = raw[len(prefix) :] or "/"
     # Isolated pages have an opaque origin, so their requests to us are cross-origin
     cross_origin = request.headers.get(hdrs.ORIGIN) == "null"
     if (
         cross_origin
         and request.method == hdrs.METH_OPTIONS
-        and (hdrs.ACCESS_CONTROL_REQUEST_METHOD in request.headers)
+        and hdrs.ACCESS_CONTROL_REQUEST_METHOD in request.headers
     ):
         return _preflight_response(request)
     ctx = _Context(hub, session, view, prefix, cross_origin)
     if raw_path.startswith("/" + INTERNAL_PATH_PREFIX):
         return await _handle_internal(request, ctx, raw_path)
 
-    url = view.origin.with_path(raw_path, encoded=True).with_query(request.rel_url.raw_query_string)
-    if not request.rel_url.raw_query_string:
-        url = url.with_query(None)
+    url = view.origin.with_path(raw_path, encoded=True)
+    if query := request.rel_url.raw_query_string:
+        url = url.with_query(query)
     headers = _request_headers(request, ctx, url)
-    client = hub.http_client(view.verify_ssl)
+    client = hub.http_client(view)
     try:
         if _is_websocket(request):
-            return await _proxy_websocket(request, client, url, headers)
+            return await _proxy_websocket(request, ctx, client, url, headers)
         return await _proxy_request(request, ctx, client, url, headers)
-    except (aiohttp.ClientError, TimeoutError) as err:
+    except (aiohttp.ClientError, OSError, TimeoutError) as err:
         _LOGGER.debug("Proxying %s for %s failed: %s", url.path, view.name, err)
-        raise web.HTTPBadGateway(text=f"{view.name} is not reachable") from None
+        return _error(502, f"{view.name} is not reachable")
 
 
 def _preflight_response(request: web.Request) -> web.Response:
     headers = {
+        **SECURITY_HEADERS,
+        "Content-Security-Policy": ISOLATION_CSP,
         hdrs.ACCESS_CONTROL_ALLOW_ORIGIN: "*",
         hdrs.ACCESS_CONTROL_ALLOW_METHODS: "GET, HEAD, POST, PUT, PATCH, DELETE",
         hdrs.ACCESS_CONTROL_MAX_AGE: "600",
@@ -174,75 +265,57 @@ def _preflight_response(request: web.Request) -> web.Response:
 
 
 def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDict[str]:
-    hub, session, view, prefix = ctx.hub, ctx.session, ctx.view, ctx.prefix
     headers = CIMultiDict(
         (name, value)
         for name, value in request.headers.items()
-        if name not in REQUEST_HEADERS_FILTER
+        if name.lower() not in REQUEST_HEADERS_DROPPED
+        and not name.lower().startswith(REQUEST_HEADER_PREFIXES_DROPPED)
     )
-    if view.mode == MODE_ISOLATED:
-        # The browser holds no cookies for an opaque origin; the jar stands in
-        cookies = hub.cookie_jar(session.user_id, view).filter_cookies(url)
-        if cookies:
-            headers[hdrs.COOKIE] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
-    elif cookie := request.headers.get(hdrs.COOKIE):
-        headers[hdrs.COOKIE] = cookie
-    if view.authorization is not None and hdrs.AUTHORIZATION not in headers:
-        headers[hdrs.AUTHORIZATION] = view.authorization
+    cookies = ctx.hub.cookie_jar(ctx.session.user_id, ctx.view).filter_cookies(url)
+    if cookies:
+        headers[hdrs.COOKIE] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
+    if ctx.view.authorization is not None:
+        headers[hdrs.AUTHORIZATION] = ctx.view.authorization
     # Same header Supervisor ingress uses, so UIs built for ingress can adapt links
-    headers["X-Ingress-Path"] = prefix
-    if request.transport and (peername := request.transport.get_extra_info("peername")):
-        forwarded = request.headers.get(hdrs.X_FORWARDED_FOR)
-        headers[hdrs.X_FORWARDED_FOR] = (
-            f"{forwarded}, {peername[0]}" if forwarded else str(peername[0])
-        )
-    headers[hdrs.X_FORWARDED_HOST] = request.headers.get(hdrs.X_FORWARDED_HOST, request.host)
-    headers[hdrs.X_FORWARDED_PROTO] = request.headers.get(hdrs.X_FORWARDED_PROTO, request.scheme)
+    headers["X-Ingress-Path"] = ctx.prefix
+    # Validated by Home Assistant's forwarded middleware against trusted_proxies
+    if request.remote:
+        headers[hdrs.X_FORWARDED_FOR] = request.remote
+    headers[hdrs.X_FORWARDED_PROTO] = request.scheme
     return headers
 
 
 def _response_headers(result: aiohttp.ClientResponse, ctx: _Context) -> CIMultiDict[str]:
-    hub, session, view, prefix = ctx.hub, ctx.session, ctx.view, ctx.prefix
-    headers = CIMultiDict(
-        (name, value)
-        for name, value in result.headers.items()
-        if name not in RESPONSE_HEADERS_FILTER
-    )
-    set_cookies = result.headers.getall(hdrs.SET_COOKIE, ())
-    if set_cookies and view.mode == MODE_ISOLATED:
-        jar = hub.cookie_jar(session.user_id, view)
-        for set_cookie in set_cookies:
-            cookie: SimpleCookie = SimpleCookie()
-            try:
-                cookie.load(set_cookie)
-            except Exception:  # noqa: BLE001 - malformed cookie from a device
-                continue
-            jar.update_cookies(cookie, result.url)
-        hub.async_cookies_changed(session.user_id, view)
+    headers: CIMultiDict[str] = CIMultiDict()
+    for name, value in result.headers.items():
+        lower = name.lower()
+        if lower in RESPONSE_HEADERS_ALLOWED or (
+            lower.startswith("x-") and lower not in RESPONSE_X_HEADERS_DROPPED
+        ):
+            headers.add(name, value)
+    if cache := headers.get(hdrs.CACHE_CONTROL):
+        # Per-user content: never let a shared cache in front of HA keep it
+        directives = [
+            d
+            for d in cache.split(",")
+            if d.strip().split("=")[0].lower() not in ("public", "s-maxage")
+        ]
+        headers[hdrs.CACHE_CONTROL] = ", ".join(
+            ["private", *(d.strip() for d in directives if d.strip())]
+        )
     else:
-        view_path = prefix.rsplit("/", 1)[0] + "/"
-        for set_cookie in set_cookies:
-            headers.add(hdrs.SET_COOKIE, scope_cookie(set_cookie, view_path))
+        headers[hdrs.CACHE_CONTROL] = "private"
+    if set_cookies := result.headers.getall(hdrs.SET_COOKIE, ()):
+        ctx.hub.async_store_cookies(ctx.session.user_id, ctx.view, set_cookies, result.url)
     if (location := result.headers.get(hdrs.LOCATION)) is not None:
-        headers[hdrs.LOCATION] = rewrite_location(location, view.origin, prefix)
-    if view.mode == MODE_ISOLATED:
+        headers[hdrs.LOCATION] = rewrite_location(location, ctx.view.origin, ctx.prefix)
+    headers.update(SECURITY_HEADERS)
+    if ctx.view.mode == MODE_ISOLATED:
         headers["Content-Security-Policy"] = ISOLATION_CSP
-    headers["Referrer-Policy"] = REFERRER_POLICY
     if ctx.cross_origin:
         headers[hdrs.ACCESS_CONTROL_ALLOW_ORIGIN] = "*"
         headers[hdrs.ACCESS_CONTROL_EXPOSE_HEADERS] = "*"
     return headers
-
-
-def scope_cookie(set_cookie: str, path: str) -> str:
-    """Keep a site cookie under its view's prefix, never on HA's own paths."""
-    parts = [
-        part
-        for part in set_cookie.split(";")
-        if part.strip().split("=", 1)[0].strip().lower() not in ("path", "domain")
-    ]
-    parts.append(f" Path={path}")
-    return ";".join(parts)
 
 
 def rewrite_location(location: str, origin: URL, prefix: str) -> str:
@@ -291,6 +364,8 @@ def _js(value: Any) -> str:
     return (
         json.dumps(value)
         .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
         .replace(chr(0x2028), "\\u2028")
         .replace(chr(0x2029), "\\u2029")
     )
@@ -300,17 +375,18 @@ def inject_script(ctx: _Context) -> bytes:
     """The script injected first into a proxied HTML page."""
     view = ctx.view
     isolated = view.mode == MODE_ISOLATED
+    jar = ctx.hub.cookie_jar(ctx.session.user_id, view)
     config: dict[str, Any] = {
         "prefix": ctx.prefix,
         "viewPath": ctx.prefix.rsplit("/", 1)[0] + "/",
         "site": str(view.origin),
         "isolated": isolated,
+        # Site cookies live server side in both modes; scripts see the ones that
+        # are not HttpOnly, as they would in a browser
+        "cookies": {m.key: m.value for m in jar if not m.get("httponly")},
     }
     if isolated:
-        jar = ctx.hub.cookie_jar(ctx.session.user_id, view)
         config["storage"] = ctx.hub.shim_storage(ctx.session.user_id, view.view_id)
-        # Scripts only ever see cookies that are not HttpOnly
-        config["cookies"] = {m.key: m.value for m in jar if not m.get("httponly")}
     return (
         b"<script>/* local_web_ui */(" + INJECT_JS + b")(" + _js(config).encode() + b");</script>"
     )
@@ -355,12 +431,13 @@ async def read_limited(stream: aiohttp.StreamReader, limit: int) -> tuple[bytes,
 
 
 async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -> web.Response:
-    """Endpoints the storage shim writes to."""
+    """Endpoints the injected script writes to (emulated storage and cookies)."""
     hub, session, view = ctx.hub, ctx.session, ctx.view
-    headers = {hdrs.ACCESS_CONTROL_ALLOW_ORIGIN: "*"} if ctx.cross_origin else {}
-    if request.method != hdrs.METH_POST or view.mode != MODE_ISOLATED:
-        raise web.HTTPNotFound
     name = raw_path[len(INTERNAL_PATH_PREFIX) + 1 :]
+    if request.method != hdrs.METH_POST or name not in ("storage", "cookie"):
+        raise web.HTTPNotFound
+    if name == "storage" and view.mode != MODE_ISOLATED:
+        raise web.HTTPNotFound  # Trusted pages have real localStorage
     body, complete = await read_limited(request.content, MAX_SHIM_STORAGE_BYTES)
     if not complete:
         raise web.HTTPRequestEntityTooLarge(max_size=MAX_SHIM_STORAGE_BYTES, actual_size=len(body))
@@ -369,21 +446,16 @@ async def _handle_internal(request: web.Request, ctx: _Context, raw_path: str) -
             data = json.loads(body)
         except ValueError:
             raise web.HTTPBadRequest from None
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or len(data) > MAX_SHIM_STORAGE_KEYS:
             raise web.HTTPBadRequest
         hub.async_set_shim_storage(
             session.user_id, view.view_id, {str(k): str(v) for k, v in data.items()}
         )
-    elif name == "cookie":
-        cookie: SimpleCookie = SimpleCookie()
-        try:
-            cookie.load(body.decode())
-        except Exception:  # noqa: BLE001 - whatever the page wrote
-            raise web.HTTPBadRequest from None
-        hub.cookie_jar(session.user_id, view).update_cookies(cookie, view.origin)
-        hub.async_cookies_changed(session.user_id, view)
     else:
-        raise web.HTTPNotFound
+        hub.async_store_cookies(session.user_id, view, [body.decode(errors="replace")], view.origin)
+    headers = {**SECURITY_HEADERS, "Content-Security-Policy": ISOLATION_CSP}
+    if ctx.cross_origin:
+        headers[hdrs.ACCESS_CONTROL_ALLOW_ORIGIN] = "*"
     return web.Response(status=204, headers=headers)
 
 
@@ -442,6 +514,8 @@ async def _proxy_request(
                 if is_html:
                     body = html_rewriter(view.origin, prefix)(body)
                     body = inject_first(body, inject_script(ctx))
+                    # The page now embeds this user's stored site data
+                    response_headers[hdrs.CACHE_CONTROL] = "no-store"
                 elif content_type == "text/css":
                     body = rewrite_css(body, prefix)
                 response = web.Response(status=result.status, headers=response_headers, body=body)
@@ -482,10 +556,13 @@ async def _stream(
 
 async def _proxy_websocket(
     request: web.Request,
+    ctx: _Context,
     client: aiohttp.ClientSession,
     url: URL,
     headers: CIMultiDict[str],
-) -> web.WebSocketResponse:
+) -> web.StreamResponse:
+    if not ctx.hub.sessions.can_open_websocket(ctx.session.token):
+        return _error(503, "Too many open connections for this web UI")
     protocols: Iterable[str] = [
         proto.strip()
         for proto in request.headers.get(hdrs.SEC_WEBSOCKET_PROTOCOL, "").split(",")
@@ -507,14 +584,20 @@ async def _proxy_websocket(
             autoping=False,
             max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
         )
+        ws_server.headers.update(SECURITY_HEADERS)
         await ws_server.prepare(request)
-        tasks = [
-            asyncio.create_task(_websocket_forward(ws_server, ws_client)),
-            asyncio.create_task(_websocket_forward(ws_client, ws_server)),
-        ]
-        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
+        # Closed when the session ends (expiry, logout), not only by either side
+        release = ctx.hub.sessions.track_websocket(ctx.session.token, ws_server, ws_client)
+        try:
+            tasks = [
+                asyncio.create_task(_websocket_forward(ws_server, ws_client)),
+                asyncio.create_task(_websocket_forward(ws_client, ws_server)),
+            ]
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+        finally:
+            release()
     await ws_server.close()
     return ws_server
 

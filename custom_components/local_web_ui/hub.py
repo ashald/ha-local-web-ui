@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
+from datetime import timedelta
+from functools import partial
 import logging
 import secrets
 import time
@@ -12,9 +14,10 @@ from typing import Any
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers import area_registry as ar, device_registry as dr
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
+from homeassistant.helpers import aiohttp_client, area_registry as ar, device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.helpers.storage import Store
 from homeassistant.loader import async_get_loaded_integration
@@ -36,14 +39,19 @@ from .const import (
     DEVICE_LINK_PREFIX,
     DISCOVERED_PREFIX,
     DOMAIN,
+    MAX_COOKIE_BYTES,
+    MAX_COOKIES_PER_SITE,
+    MAX_WEBSOCKETS_PER_SESSION,
     MODE_ISOLATED,
+    MODE_TRUSTED,
+    SESSION_MAX_AGE,
     SESSION_TTL,
     STORAGE_KEY,
     STORAGE_KEY_JAR,
     STORAGE_VERSION,
     SUBENTRY_TYPE_VIEW,
 )
-from .discovery import is_local_ui_url, parse_http_url
+from .discovery import LanOnlyResolver, is_local_ui_url, parse_http_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,49 +103,109 @@ class Session:
     token: str
     view_id: str
     user_id: str
+    refresh_token_id: str | None
+    created: float
     expires: float
+    websockets: set[Callable[[], Coroutine[Any, Any, Any]]] = field(default_factory=set)
 
 
 class SessionManager:
-    """Sessions outlive config entry reloads, so open views keep working."""
+    """Sessions outlive config entry reloads, so open views keep working.
 
-    def __init__(self) -> None:
+    A session ends after SESSION_TTL without use, SESSION_MAX_AGE after creation,
+    or as soon as the Home Assistant login (refresh token) that created it is
+    revoked, whichever comes first. Its WebSockets are closed with it.
+    """
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._sessions: dict[str, Session] = {}
+        self._revoke_unsubs: dict[str, CALLBACK_TYPE] = {}
 
-    def create(self, view_id: str, user_id: str) -> Session:
-        self._expire()
+    def create(self, view_id: str, user_id: str, refresh_token_id: str | None) -> Session:
+        self.expire()
+        now = time.monotonic()
         session = Session(
-            secrets.token_urlsafe(32), view_id, user_id, time.monotonic() + SESSION_TTL
+            secrets.token_urlsafe(32),
+            view_id,
+            user_id,
+            refresh_token_id,
+            now,
+            now + SESSION_TTL,
         )
         self._sessions[session.token] = session
+        if refresh_token_id is not None and refresh_token_id not in self._revoke_unsubs:
+            self._revoke_unsubs[refresh_token_id] = (
+                self._hass.auth.async_register_revoke_token_callback(
+                    refresh_token_id, partial(self._revoked, refresh_token_id)
+                )
+            )
         return session
 
     def touch(self, token: str, view_id: str) -> Session | None:
         """Return the live session for this view and extend it."""
         session = self._sessions.get(token)
         now = time.monotonic()
-        if session is None or session.expires < now:
-            self._sessions.pop(token, None)
+        if session is None:
+            return None
+        if session.expires < now or now - session.created > SESSION_MAX_AGE:
+            self._end(session)
             return None
         if not secrets.compare_digest(session.view_id, view_id):
             return None
-        session.expires = now + SESSION_TTL
+        session.expires = min(now + SESSION_TTL, session.created + SESSION_MAX_AGE)
         return session
 
     def revoke_user(self, user_id: str) -> None:
-        for token in [t for t, s in self._sessions.items() if s.user_id == user_id]:
-            del self._sessions[token]
+        for session in [s for s in self._sessions.values() if s.user_id == user_id]:
+            self._end(session)
 
-    def _expire(self) -> None:
+    @callback
+    def _revoked(self, refresh_token_id: str) -> None:
+        self._revoke_unsubs.pop(refresh_token_id, None)
+        for session in [
+            s for s in self._sessions.values() if s.refresh_token_id == refresh_token_id
+        ]:
+            self._end(session)
+
+    def expire(self) -> None:
         now = time.monotonic()
-        for token in [t for t, s in self._sessions.items() if s.expires < now]:
-            del self._sessions[token]
+        for session in [
+            s
+            for s in self._sessions.values()
+            if s.expires < now or now - s.created > SESSION_MAX_AGE
+        ]:
+            self._end(session)
+
+    def _end(self, session: Session) -> None:
+        self._sessions.pop(session.token, None)
+        for close in list(session.websockets):
+            self._hass.async_create_task(close())
+        session.websockets.clear()
+
+    def can_open_websocket(self, token: str) -> bool:
+        session = self._sessions.get(token)
+        return session is not None and len(session.websockets) < MAX_WEBSOCKETS_PER_SESSION
+
+    def track_websocket(self, token: str, *sockets: Any) -> Callable[[], None]:
+        """Close these sockets when the session ends; returns the release callback."""
+        session = self._sessions.get(token)
+
+        async def close() -> None:
+            for sock in sockets:
+                await sock.close()
+
+        if session is None:
+            self._hass.async_create_task(close())
+            return lambda: None
+        session.websockets.add(close)
+        return lambda: session.websockets.discard(close)
 
 
 @callback
 def async_get_sessions(hass: HomeAssistant) -> SessionManager:
     if (sessions := hass.data.get(DATA_SESSIONS)) is None:
-        sessions = hass.data[DATA_SESSIONS] = SessionManager()
+        sessions = hass.data[DATA_SESSIONS] = SessionManager(hass)
     return sessions
 
 
@@ -158,7 +226,7 @@ class LocalWebUiHub:
         self._cookies: dict[str, list[dict[str, str]]] = {}
         self._shim_storage: dict[str, dict[str, str]] = {}
         self._jars: dict[str, aiohttp.CookieJar] = {}
-        self._http: dict[bool, aiohttp.ClientSession] = {}
+        self._http: dict[str | bool, aiohttp.ClientSession] = {}
         self._static: dict[str, View] = {}
         self._unsubs: list[Callable[[], None]] = []
         self._own_hosts: frozenset[tuple[str, int]] = frozenset()
@@ -189,6 +257,17 @@ class LocalWebUiHub:
             )
         )
         self.async_sync_device_links()
+        self._unsubs.append(
+            async_track_time_interval(
+                self.hass, lambda _now: self.sessions.expire(), timedelta(seconds=30)
+            )
+        )
+        if trusted := [v.name for v in self._static.values() if v.mode == MODE_TRUSTED]:
+            _LOGGER.warning(
+                "These web UIs run in trusted mode and can act as the logged-in admin "
+                "in Home Assistant: %s",
+                ", ".join(trusted),
+            )
 
     async def async_unload(self) -> None:
         for unsub in self._unsubs:
@@ -416,9 +495,23 @@ class LocalWebUiHub:
         return jar
 
     @callback
-    def async_cookies_changed(self, user_id: str, view: View) -> None:
+    def async_store_cookies(
+        self, user_id: str, view: View, set_cookies: list[str], url: URL
+    ) -> None:
+        """Keep cookies a site set (Set-Cookie or document.cookie) for this user."""
+        jar = self.cookie_jar(user_id, view)
+        for set_cookie in set_cookies:
+            if len(set_cookie) > MAX_COOKIE_BYTES:
+                continue
+            cookie = _parse_cookie(set_cookie)
+            if not cookie:
+                continue
+            existing = {morsel.key for morsel in jar}
+            if len(existing) >= MAX_COOKIES_PER_SITE and not set(cookie) <= existing:
+                _LOGGER.debug("%s set too many cookies; ignoring more", view.name)
+                continue
+            jar.update_cookies(cookie, url)
         key = self._state_key(user_id, view.view_id)
-        jar = self._jars[key]
         self._cookies[key] = [
             {"cookie": morsel.OutputString(), "url": str(view.origin)} for morsel in jar
         ]
@@ -443,15 +536,34 @@ class LocalWebUiHub:
 
     # ---- upstream HTTP -------------------------------------------------------
 
-    def http_client(self, verify_ssl: bool) -> aiohttp.ClientSession:
-        if (client := self._http.get(verify_ssl)) is None:
+    def http_client(self, view: View) -> aiohttp.ClientSession:
+        """HTTP client for a view's upstream requests."""
+        if view.source == "discovered":
+            # URLs chosen by devices and integrations: only connect to LAN addresses
+            key: str | bool = "discovered"
+        else:
+            key = view.verify_ssl
+        if (client := self._http.get(key)) is not None:
+            return client
+        if key == "discovered":
+            try:
+                # Home Assistant's shared resolver, which also resolves .local over mDNS
+                inner = aiohttp_client._async_get_or_create_resolver(self.hass)
+            except Exception:  # noqa: BLE001 - private helper; fall back to the default
+                inner = aiohttp.ThreadedResolver()
+            client = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False, resolver=LanOnlyResolver(inner)),
+                cookie_jar=aiohttp.DummyCookieJar(),
+            )
+        else:
             # HA's shared connector resolves .local names over mDNS
-            client = self._http[verify_ssl] = async_create_clientsession(
+            client = async_create_clientsession(
                 self.hass,
-                verify_ssl=verify_ssl,
+                verify_ssl=view.verify_ssl,
                 auto_cleanup=False,
                 cookie_jar=aiohttp.DummyCookieJar(),
             )
+        self._http[key] = client
         return client
 
     # ---- persistence ---------------------------------------------------------

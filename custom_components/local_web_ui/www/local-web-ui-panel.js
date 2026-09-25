@@ -242,8 +242,9 @@ class LocalWebUiPanel extends HTMLElement {
     const ws = (msg) => this._hass.callWS(msg);
     try {
       if (act === "open-tab") {
+        const tab = window.open("about:blank", "_blank");
         const s = await ws({ type: "local_web_ui/session", view_id: view.view_id });
-        window.open(s.url, "_blank", "noopener");
+        if (tab) tab.location = s.url;
         return;
       }
       if (act === "edit") return this._navigate("/config/integrations/integration/local_web_ui");
@@ -301,7 +302,7 @@ class LocalWebUiPanel extends HTMLElement {
       this._toolbar(view.name, [view.area, view.subtitle].filter(Boolean).join(" · "),
         `${badge}
          <button class="reload" title="Reload">${icon("mdi:refresh", "⟳")}</button>
-         <a class="button newtab" title="Open in a new tab" target="_blank" rel="noopener" href="${esc(session.url)}">${icon("mdi:open-in-new", "↗")}</a>`,
+         <button class="newtab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>`,
         back) +
       `<iframe title="${esc(view.name)}" src="${esc(session.url)}" ${isolated ? `sandbox="${SANDBOX}"` : ""}
                allow="fullscreen; clipboard-write" referrerpolicy="same-origin"></iframe>`;
@@ -310,6 +311,17 @@ class LocalWebUiPanel extends HTMLElement {
     root.querySelector(".reload").addEventListener("click", () => {
       root.querySelector("iframe").src = this._session.url;
     });
+    // A tab of its own gets its own session, separate from the iframe's
+    root.querySelector(".newtab").addEventListener("click", async () => {
+      const tab = window.open("about:blank", "_blank");
+      try {
+        const own = await this._openSession(viewId);
+        if (tab) tab.location = own.url;
+      } catch (err) {
+        tab?.close();
+        alert(err.message || err);
+      }
+    });
     // Keep the session alive while the view is open, even if the page goes quiet
     this._timer = setInterval(async () => {
       try {
@@ -317,7 +329,6 @@ class LocalWebUiPanel extends HTMLElement {
         if (next.token !== this._session.token) {
           this._session = next;
           root.querySelector("iframe").src = next.url;
-          root.querySelector(".newtab").href = next.url;
         }
       } catch {
         /* HA unreachable or the view is gone; the iframe shows the proxy's error */

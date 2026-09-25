@@ -4,9 +4,11 @@
 // 1. Keeps URLs a page builds at runtime inside the proxy: "/api/x",
 //    location.host + "/ws" and absolute links to the device itself would
 //    otherwise escape to Home Assistant's own paths.
-// 2. Isolated views only: gives the page localStorage, sessionStorage and
-//    document.cookie, which an opaque origin lacks (they throw), backed by
-//    server-side storage per (user, view).
+// 2. Keeps site cookies server side (both modes): document.cookie is backed by
+//    the per-(user, view) cookie jar the proxy keeps, never by the browser's jar
+//    for Home Assistant's origin.
+// 3. Isolated views only: gives the page localStorage and sessionStorage, which
+//    an opaque origin lacks (they throw), backed by server-side storage.
 function (cfg) {
   "use strict";
   var loc = window.location;
@@ -137,21 +139,22 @@ function (cfg) {
       },
       true
     );
+    // A service worker registered from Home Assistant's origin would outlive the
+    // view and could intercept Home Assistant itself
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.register = function () {
+        return Promise.reject(new DOMException("Service workers are not available here", "SecurityError"));
+      };
+    }
   } catch (e) {
     /* A page that breaks one of these still gets the others */
   }
 
-  if (!cfg.isolated) return;
-  try {
-    window.localStorage.length;
-    return; // Storage works natively (not actually sandboxed)
-  } catch (e) {
-    /* Opaque origin: emulate below */
-  }
   var own = Object.prototype.hasOwnProperty;
+  var nativePost = nativeFetch || window.fetch;
   function post(name, body) {
     try {
-      nativeFetch.call(window, prefix + "/__lwu/" + name, {
+      nativePost.call(window, prefix + "/__lwu/" + name, {
         method: "POST",
         body: body,
         keepalive: true,
@@ -160,6 +163,42 @@ function (cfg) {
     } catch (e) {
       /* Best effort */
     }
+  }
+
+  // Site cookies are kept server side in both modes: device cookies must not land
+  // in (or read) Home Assistant's own cookie jar. Scripts see the non-HttpOnly ones.
+  var cookies = cfg.cookies || {};
+  try {
+    Object.defineProperty(Document.prototype, "cookie", {
+      configurable: true,
+      get: function () {
+        return Object.keys(cookies)
+          .map(function (key) {
+            return key + "=" + cookies[key];
+          })
+          .join("; ");
+      },
+      set: function (value) {
+        value = String(value);
+        var pair = value.split(";")[0];
+        var eq = pair.indexOf("=");
+        if (eq < 1) return;
+        var key = pair.slice(0, eq).trim();
+        if (/;\s*(max-age=(0|-)|expires=thu, 01 jan 1970)/i.test(value)) delete cookies[key];
+        else cookies[key] = pair.slice(eq + 1).trim();
+        post("cookie", value);
+      },
+    });
+  } catch (e) {
+    /* Not overridable in this browser */
+  }
+
+  if (!cfg.isolated) return;
+  try {
+    window.localStorage.length;
+    return; // Storage works natively (not actually sandboxed)
+  } catch (e) {
+    /* Opaque origin: emulate below */
   }
   function makeStorage(data, persist) {
     var timer = null;
@@ -242,31 +281,6 @@ function (cfg) {
   try {
     Object.defineProperty(window, "localStorage", { configurable: true, get: function () { return local; } });
     Object.defineProperty(window, "sessionStorage", { configurable: true, get: function () { return session; } });
-  } catch (e) {
-    /* Not overridable in this browser */
-  }
-  var cookies = cfg.cookies || {};
-  try {
-    Object.defineProperty(Document.prototype, "cookie", {
-      configurable: true,
-      get: function () {
-        return Object.keys(cookies)
-          .map(function (key) {
-            return key + "=" + cookies[key];
-          })
-          .join("; ");
-      },
-      set: function (value) {
-        value = String(value);
-        var pair = value.split(";")[0];
-        var eq = pair.indexOf("=");
-        if (eq < 1) return;
-        var key = pair.slice(0, eq).trim();
-        if (/;\s*(max-age=(0|-)|expires=thu, 01 jan 1970)/i.test(value)) delete cookies[key];
-        else cookies[key] = pair.slice(eq + 1).trim();
-        post("cookie", value);
-      },
-    });
   } catch (e) {
     /* Not overridable in this browser */
   }

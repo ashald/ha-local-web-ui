@@ -38,11 +38,18 @@ MODE_ISOLATED: Final = "isolated"
 MODE_TRUSTED: Final = "trusted"
 MODES: Final = (MODE_ISOLATED, MODE_TRUSTED)
 
-# A session expires this long after its last proxied request or panel keepalive
+# A session expires this long after its last proxied request or panel keepalive,
+# and in any case this long after it was created
 SESSION_TTL: Final = 300.0
+SESSION_MAX_AGE: Final = 12 * 3600.0
+# Open WebSockets per session (a page typically needs one or two)
+MAX_WEBSOCKETS_PER_SESSION: Final = 8
 
 STORAGE_VERSION: Final = 1
 STORAGE_KEY: Final = DOMAIN
 STORAGE_KEY_JAR: Final = f"{DOMAIN}.jar"
-# Per (user, view) cap for the emulated localStorage of isolated views
+# Per (user, view) caps for what a site can make Home Assistant store
 MAX_SHIM_STORAGE_BYTES: Final = 1024 * 1024
+MAX_SHIM_STORAGE_KEYS: Final = 1000
+MAX_COOKIES_PER_SITE: Final = 50
+MAX_COOKIE_BYTES: Final = 4096

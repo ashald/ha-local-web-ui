@@ -39,7 +39,7 @@
             "name": "Name",
             "url": "URL",
             "mode": "Mode",
-            "trusted_acknowledged": "I understand that a trusted web UI can act as me in Home Assistant",
+            "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
             "verify_ssl": "Verify SSL certificate",
             "username": "Username",
             "password": "Password",
@@ -48,7 +48,7 @@
           },
           "data_description": {
             "url": "The full address of the page, including http or https and the port if it is not the default.",
-            "mode": "Isolated keeps the page away from Home Assistant; it cannot read Home Assistant's data or act as you. Trusted runs it with Home Assistant's own origin, which some pages need (for example ones that rely on browser storage APIs the isolation shim does not cover), but the page's scripts could then control Home Assistant as you. Only use it for pages you fully trust.",
+            "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
             "trusted_acknowledged": "Required for trusted mode.",
             "verify_ssl": "Turn off for devices with self-signed certificates.",
             "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
@@ -62,7 +62,7 @@
             "name": "Name",
             "url": "URL",
             "mode": "Mode",
-            "trusted_acknowledged": "I understand that a trusted web UI can act as me in Home Assistant",
+            "trusted_acknowledged": "I understand that a trusted web UI gets full administrator control of Home Assistant",
             "verify_ssl": "Verify SSL certificate",
             "username": "Username",
             "password": "Password",
@@ -70,7 +70,7 @@
             "icon": "Icon"
           },
           "data_description": {
-            "mode": "Isolated keeps the page away from Home Assistant. Trusted runs it with Home Assistant's own origin: its scripts could control Home Assistant as you.",
+            "mode": "Isolated (recommended) keeps the page away from Home Assistant. Trusted runs it with Home Assistant's own origin: its scripts get full administrator control of Home Assistant.",
             "password": "Leave empty to keep the stored password."
           }
         }
