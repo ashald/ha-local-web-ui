@@ -119,7 +119,7 @@ class LocalWebUiPanel extends HTMLElement {
     return `<style>${STYLE}</style>
       <div class="toolbar">
         <button class="menu-toggle" title="Menu">${icon("mdi:menu", "☰")}</button>
-        ${back ? `<button class="back" title="All web UIs">${icon("mdi:arrow-left", "←")}</button>` : ""}
+        ${back ? `<button class="back" title="Back">${icon("mdi:arrow-left", "←")}</button>` : ""}
         <div class="title"><div class="main">${esc(title)}</div>${subtitle ? `<div class="sub">${esc(subtitle)}</div>` : ""}</div>
         ${actions}
       </div>`;
@@ -129,7 +129,7 @@ class LocalWebUiPanel extends HTMLElement {
     const root = this.shadowRoot;
     root.querySelector(".menu-toggle").addEventListener("click", () =>
       this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true })));
-    root.querySelector(".back")?.addEventListener("click", () => this._navigate(PANEL_PATH));
+    root.querySelector(".back")?.addEventListener("click", () => this._navigate(this._backTarget || PANEL_PATH));
   }
 
   _closePopups() {
@@ -185,7 +185,9 @@ class LocalWebUiPanel extends HTMLElement {
       const view = views.find((v) => v.view_id === row.dataset.id);
       row.addEventListener("click", (ev) => {
         if (ev.target.closest("button, a")) return;
-        if (!view.hidden) this._navigate(`${PANEL_PATH}/${view.view_id}`);
+        if (view.hidden) return;
+        this._fromList = true;
+        this._navigate(`${PANEL_PATH}/${view.view_id}`);
       });
       row.querySelector(".more").addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -288,6 +290,11 @@ class LocalWebUiPanel extends HTMLElement {
   async _showView(viewId) {
     const key = this._key;
     const back = !this._singleView;
+    // Back leads to where the view was opened from: the list, or else the device
+    // page whose "Visit" button leads here
+    const fromList = this._fromList;
+    this._fromList = false;
+    this._backTarget = null;
     this.shadowRoot.innerHTML = this._toolbar("Local Web UIs", "", "", back) +
       `<div class="content"><div class="message">Connecting…</div></div>`;
     this._bindToolbar();
@@ -301,6 +308,7 @@ class LocalWebUiPanel extends HTMLElement {
     if (this._key !== key) return;
     this._session = session;
     const view = session.view;
+    if (!fromList && view.device_id) this._backTarget = `/config/devices/device/${view.device_id}`;
     const isolated = view.mode !== "trusted";
     const badge = isolated
       ? `<span class="badge" title="Isolated: this page cannot access Home Assistant">${icon("mdi:shield-lock", "🔒")}<span>Isolated</span></span>`
@@ -308,6 +316,8 @@ class LocalWebUiPanel extends HTMLElement {
     this.shadowRoot.innerHTML =
       this._toolbar(view.name, [view.area, view.subtitle].filter(Boolean).join(" · "),
         `${badge}
+         ${view.device_id ? `<button class="device" title="Device page">${icon("mdi:devices", "▣")}</button>` : ""}
+         ${view.linked_device_id ? `<button class="linked" title="Web UI device page">${icon("mdi:link-variant", "⛓")}</button>` : ""}
          <button class="reload" title="Reload">${icon("mdi:refresh", "⟳")}</button>
          <button class="newtab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>`,
         back) +
@@ -315,6 +325,10 @@ class LocalWebUiPanel extends HTMLElement {
                allow="fullscreen; clipboard-write" referrerpolicy="same-origin"></iframe>`;
     this._bindToolbar();
     const root = this.shadowRoot;
+    root.querySelector(".device")?.addEventListener("click", () =>
+      this._navigate(`/config/devices/device/${view.device_id}`));
+    root.querySelector(".linked")?.addEventListener("click", () =>
+      this._navigate(`/config/devices/device/${view.linked_device_id}`));
     root.querySelector(".reload").addEventListener("click", () => {
       root.querySelector("iframe").src = this._session.url;
     });

@@ -36,7 +36,10 @@ You don't need to open ports or change any firmware.
   Assistant shows it in the **Linked devices** card of the device's page, and its Visit
   button opens the web UI here. The device itself is left alone.
 - **Standalone pages.** Every web UI has its own address (`/local-web-ui/<id>`), an optional
-  sidebar entry, and *open in a new tab* for a full-page view.
+  sidebar entry, and *open in a new tab* for a full-page view. A web UI opened from a device
+  page has buttons back to that device page (and to its linked device).
+- **Your sidebar.** The name and icon of the Local Web UIs entry can be changed in the
+  integration's options.
 - **Isolated by default.** See the next section.
 
 ## Isolated and trusted

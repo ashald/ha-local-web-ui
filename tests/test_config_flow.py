@@ -42,6 +42,8 @@ from custom_components.local_web_ui.const import (
     CONF_LINK_DEVICE_PAGES,
     CONF_LINKED_DEVICES,
     CONF_MODE,
+    CONF_PANEL_ICON,
+    CONF_PANEL_TITLE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
     CONF_TRUSTED_ACK,
@@ -299,8 +301,20 @@ async def test_options_flow_prefills_current_options(
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
     fields = _fields(result["data_schema"])
-    assert list(fields) == [CONF_DISCOVERY, CONF_LINK_DEVICE_PAGES, CONF_LINKED_DEVICES]
-    assert all(isinstance(marker, vol.Required) for marker in fields.values())
+    assert list(fields) == [
+        CONF_DISCOVERY,
+        CONF_LINK_DEVICE_PAGES,
+        CONF_LINKED_DEVICES,
+        CONF_PANEL_TITLE,
+        CONF_PANEL_ICON,
+    ]
+    assert all(
+        isinstance(fields[key], vol.Required)
+        for key in (CONF_DISCOVERY, CONF_LINK_DEVICE_PAGES, CONF_LINKED_DEVICES)
+    )
+    # Left empty, the sidebar keeps its default name and icon
+    assert isinstance(fields[CONF_PANEL_TITLE], vol.Optional)
+    assert isinstance(fields[CONF_PANEL_ICON], vol.Optional)
     assert _default(fields[CONF_DISCOVERY]) is False
     assert _default(fields[CONF_LINK_DEVICE_PAGES]) is True
     assert _default(fields[CONF_LINKED_DEVICES]) is True
@@ -373,6 +387,35 @@ async def test_options_flow_saves_and_applies_in_place(
     # Panels are left alone
     assert _panels(hass)[PANEL_URL_PATH] is main_panel
     assert _panels(hass)[_view_panel_path(subentry.subentry_id)] is view_panel
+
+
+async def test_sidebar_name_and_icon_from_options(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> None:
+    panel = _panels(hass)[PANEL_URL_PATH]
+    assert (panel.sidebar_title, panel.sidebar_icon) == ("Local Web UIs", "mdi:web-box")
+
+    await _set_options(
+        hass, entry, {**entry.options, CONF_PANEL_TITLE: "Devices", CONF_PANEL_ICON: "mdi:lan"}
+    )
+    panel = _panels(hass)[PANEL_URL_PATH]
+    assert (panel.sidebar_title, panel.sidebar_icon) == ("Devices", "mdi:lan")
+    assert entry.runtime_data is not None
+
+    # Unrelated changes leave the panel alone
+    await _set_options(hass, entry, {**entry.options, CONF_DISCOVERY: False})
+    assert _panels(hass)[PANEL_URL_PATH] is panel
+
+    # Cleared: back to the defaults
+    options = {
+        k: v for k, v in entry.options.items() if k not in (CONF_PANEL_TITLE, CONF_PANEL_ICON)
+    }
+    await _set_options(hass, entry, options)
+    panel = _panels(hass)[PANEL_URL_PATH]
+    assert (panel.sidebar_title, panel.sidebar_icon) == ("Local Web UIs", "mdi:web-box")
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert PANEL_URL_PATH not in _panels(hass)
 
 
 async def test_options_linked_devices_applied_in_place(
@@ -1443,8 +1486,9 @@ def test_translations_cover_flows(filename: str) -> None:
 
     assert "single_instance_allowed" in strings["config"]["abort"]
     options_step = strings["options"]["step"]["init"]
-    assert set(options_step["data"]) == set(DEFAULT_OPTIONS)
-    assert set(options_step["data_description"]) == set(DEFAULT_OPTIONS)
+    all_options = {*DEFAULT_OPTIONS, CONF_PANEL_TITLE, CONF_PANEL_ICON}
+    assert set(options_step["data"]) == all_options
+    assert set(options_step["data_description"]) == all_options
 
     view = strings["config_subentries"][SUBENTRY_TYPE_VIEW]
     assert view["initiate_flow"]["user"]

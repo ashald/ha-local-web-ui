@@ -32,6 +32,8 @@ from .const import (
     CONF_LINK_DEVICE_PAGES,
     CONF_LINKED_DEVICES,
     CONF_MODE,
+    CONF_PANEL_ICON,
+    CONF_PANEL_TITLE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
     CONF_TRUSTED_ACK,
@@ -41,6 +43,7 @@ from .const import (
     DEFAULT_DISCOVERY,
     DEFAULT_LINK_DEVICE_PAGES,
     DEFAULT_LINKED_DEVICES,
+    DEFAULT_PANEL_ICON,
     DOMAIN,
     MODE_ISOLATED,
     MODE_TRUSTED,
@@ -89,7 +92,8 @@ class LocalWebUiOptionsFlow(OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            # Left empty: the default name and icon
+            return self.async_create_entry(data={k: v for k, v in user_input.items() if v != ""})
         options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
@@ -107,6 +111,16 @@ class LocalWebUiOptionsFlow(OptionsFlow):
                         CONF_LINKED_DEVICES,
                         default=options.get(CONF_LINKED_DEVICES, DEFAULT_LINKED_DEVICES),
                     ): BooleanSelector(),
+                    vol.Optional(
+                        CONF_PANEL_TITLE,
+                        description={"suggested_value": options.get(CONF_PANEL_TITLE)},
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                    vol.Optional(
+                        CONF_PANEL_ICON,
+                        description={
+                            "suggested_value": options.get(CONF_PANEL_ICON, DEFAULT_PANEL_ICON)
+                        },
+                    ): IconSelector(),
                 }
             ),
         )

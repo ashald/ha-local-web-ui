@@ -349,6 +349,7 @@ async def test_views_lists_static_and_discovered(
         "show_in_sidebar": True,
         "hidden": False,
         "device_link": None,
+        "linked_device_id": None,
     }
     # Credentials never reach the panel
     assert "hunter2" not in json.dumps(result)

@@ -77,6 +77,7 @@ def _view_json(hub: LocalWebUiHub, view: View) -> dict[str, Any]:
         "show_in_sidebar": view.show_in_sidebar,
         "hidden": view.view_id in hub.hidden,
         "device_link": device_link,
+        "linked_device_id": hub.linked_device_id(view.view_id),
     }
 
 

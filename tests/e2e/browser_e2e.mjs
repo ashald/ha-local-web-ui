@@ -77,6 +77,11 @@ check("Isolated: page has an opaque origin and cannot read HA tokens",
       isolation.origin === "null" && isolation.haTokens === "blocked", JSON.stringify(isolation));
 await page.waitForTimeout(1200);
 await page.screenshot({ path: `${outDir}/3-porch-light.png` });
+check("View toolbar has a device page button", (await page.locator("local-web-ui-panel button.device").count()) === 1);
+await page.locator("local-web-ui-panel button.back").click();
+await page.waitForURL(`**/config/devices/device/${porch.device_id}`, { timeout: 10000 }).catch(() => {});
+check("Back returns to the device page the view was opened from",
+      new URL(page.url()).pathname === `/config/devices/device/${porch.device_id}`, new URL(page.url()).pathname);
 
 // 2) Router: sidebar entry, stored Basic credentials, cookie login, redirects,
 //    root-relative links, runtime-built URLs, localStorage and document.cookie shims

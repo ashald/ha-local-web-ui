@@ -704,6 +704,12 @@ class LocalWebUiHub:
 
     # ---- linked devices --------------------------------------------------------
 
+    def linked_device_id(self, view_id: str) -> str | None:
+        """Our "<name> web UI" device for a view, if there is one."""
+        registry = dr.async_get(self.hass)
+        device = registry.async_get_device_by_identifier((DOMAIN, view_id), self.entry.entry_id)
+        return device.id if device else None
+
     @callback
     def async_sync_linked_devices(self) -> None:
         """Keep one "<name> web UI" device next to each device that has a web UI.
