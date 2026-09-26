@@ -15,6 +15,7 @@ const STYLE = `
           background: var(--primary-background-color); color: var(--primary-text-color);
           font-family: var(--ha-font-family-body, Roboto, sans-serif); }
   .toolbar { display: flex; align-items: center; gap: 4px; flex: none; box-sizing: border-box;
+             position: relative;
              height: var(--header-height, 56px); padding: 0 8px;
              background: var(--app-header-background-color); color: var(--app-header-text-color, white);
              border-bottom: var(--app-header-border-bottom, none); }
@@ -28,6 +29,17 @@ const STYLE = `
   button:hover, a.button:hover { background: rgba(127,127,127,.18); }
   .menu-toggle { display: none; } :host([narrow]) .menu-toggle { display: inline-flex; }
   :host([narrow]) .badge span, :host([narrow]) .toolbar .label { display: none; }
+  :host([narrow]) .toolbar .device,
+  :host([narrow]) .toolbar .linked,
+  :host([narrow]) .toolbar .forget,
+  :host([narrow]) .toolbar .newtab { display: none; }
+  .toolbar .more { display: none; }
+  :host([narrow]) .toolbar .more { display: inline-flex; }
+  .popup { position: absolute; right: 8px; top: 52px; z-index: 10; min-width: 220px; padding: 4px 0;
+           background: var(--card-background-color); border-radius: 8px;
+           box-shadow: 0 4px 16px rgba(0,0,0,.35); border: 1px solid var(--divider-color); }
+  .popup button { width: 100%; justify-content: flex-start; border-radius: 0; padding: 10px 16px;
+                  gap: 12px; color: var(--primary-text-color); }
   .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 12px;
            font-size: 12px; background: rgba(127,127,127,.2); }
   .badge.trusted { background: var(--warning-color, #ffa600); color: #000; }
@@ -75,6 +87,7 @@ class LocalWebUiPanel extends HTMLElement {
     this._key = null;
     this._session = null;
     this._timer = null;
+    this._onDocClick = () => this._closePopups();
   }
 
   set hass(hass) {
@@ -87,9 +100,11 @@ class LocalWebUiPanel extends HTMLElement {
   set panel(panel) { this._panel = panel; if (this._hass) this._update(); }
 
   connectedCallback() {
+    document.addEventListener("click", this._onDocClick);
     if (this._hass) this._update();
   }
   disconnectedCallback() {
+    document.removeEventListener("click", this._onDocClick);
     clearInterval(this._timer);
     this._timer = null;
     this._key = null;
@@ -97,7 +112,12 @@ class LocalWebUiPanel extends HTMLElement {
 
   get _singleView() { return this._panel?.config?.view_id || null; }
 
+  _closePopups() {
+    this.shadowRoot?.querySelectorAll(".popup").forEach((p) => p.remove());
+  }
+
   _update() {
+    this._closePopups();
     const viewId = this._singleView || (this._route?.path || "").split("/").filter(Boolean)[0] || null;
     const key = viewId ? `view:${viewId}` : "list";
     if (key === this._key) return;
@@ -268,12 +288,35 @@ class LocalWebUiPanel extends HTMLElement {
          ${view.linked_device_id ? `<button class="linked" title="Web UI device page">${icon("mdi:link-variant", "⛓")}</button>` : ""}
          <button class="forget" title="Forget my saved logins and data">${icon("mdi:cookie-remove", "✕")}</button>
          <button class="reload" title="Reload">${icon("mdi:refresh", "⟳")}</button>
-         <button class="newtab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>`,
+         <button class="newtab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>
+         <button class="more" title="More">${icon("mdi:dots-vertical", "⋮")}</button>`,
         back) +
       `<iframe title="${esc(view.name)}" src="${esc(session.url)}" ${isolated ? `sandbox="${SANDBOX}"` : ""}
                allow="fullscreen; clipboard-write" referrerpolicy="same-origin"></iframe>`;
     this._bindToolbar();
     const root = this.shadowRoot;
+    root.querySelector(".more")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const existing = root.querySelector(".popup");
+      if (existing) { existing.remove(); return; }
+      const popup = document.createElement("div");
+      popup.className = "popup";
+      let items = `<button data-act="newtab">${icon("mdi:open-in-new", "↗")} Open in a new tab</button>`;
+      if (view.device_id) items += `<button data-act="device">${icon("mdi:devices", "▣")} Device page</button>`;
+      if (view.linked_device_id) items += `<button data-act="linked">${icon("mdi:link-variant", "⛓")} Web UI device page</button>`;
+      items += `<button data-act="forget">${icon("mdi:cookie-remove", "✕")} Forget my saved data</button>`;
+      popup.innerHTML = items;
+      popup.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const act = e.target.closest("button")?.dataset.act;
+        popup.remove();
+        if (act === "newtab") root.querySelector(".newtab")?.click();
+        else if (act === "device") root.querySelector(".device")?.click();
+        else if (act === "linked") root.querySelector(".linked")?.click();
+        else if (act === "forget") root.querySelector(".forget")?.click();
+      });
+      root.querySelector(".toolbar").appendChild(popup);
+    });
     root.querySelector(".device")?.addEventListener("click", () =>
       this._navigate(`/config/devices/device/${view.device_id}`));
     root.querySelector(".linked")?.addEventListener("click", () =>
