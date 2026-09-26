@@ -1250,8 +1250,14 @@ async def test_chunked_css_rewritten(env: Env) -> None:
         ("style.css", None, "text/css"),
         ("style.css", "text/plain", "text/css"),
         ("STYLE.CSS", "application/octet-stream", "text/css"),
-        # A specific type is the site's choice
+        # A specific type the browser accepts is the site's choice
         ("app.js", "application/javascript", "application/javascript"),
+        ("app.mjs", "text/javascript", "text/javascript"),
+        # A type the browser would refuse under nosniff is corrected from the
+        # extension: an SLZB-06 serves its stylesheet as text/javascript
+        ("style.css", "text/javascript", "text/css"),
+        ("style.css", "application/javascript", "text/css"),
+        ("app.js", "text/css", "text/javascript"),
         # Other files are not guessed at
         ("data.json", "text/plain", "text/plain"),
         ("data", None, "application/octet-stream"),
