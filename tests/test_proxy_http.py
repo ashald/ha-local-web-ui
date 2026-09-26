@@ -2092,3 +2092,14 @@ async def test_redirect_to_https_on_same_host_followed_in_proxy(env: Env) -> Non
 def test_https_upgrade(location: str, origin: str, expected: str | None) -> None:
     result = https_upgrade(location, URL(origin))
     assert (None if result is None else str(result)) == expected
+
+
+def test_inject_script_attributes_and_pathname_hooks() -> None:
+    """The injected script hooks getAttribute, getAttributeNS and pathname to unprefix links."""
+    assert b"function unprefix(val)" in proxy_module.INJECT_JS
+    assert b"Element.prototype.getAttribute = function (name)" in proxy_module.INJECT_JS
+    assert b"Element.prototype.getAttributeNS = function (ns, name)" in proxy_module.INJECT_JS
+    assert b'desc = Object.getOwnPropertyDescriptor(Cls.prototype, "pathname")' in proxy_module.INJECT_JS
+    for attr in ("src", "href", "action", "formaction", "poster", "data", "background"):
+        assert f"{attr}: 1".encode() in proxy_module.INJECT_JS
+

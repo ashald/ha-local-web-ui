@@ -48,6 +48,20 @@ function (cfg) {
     return out.href;
   }
 
+  function unprefix(val) {
+    if (typeof val !== "string") return val;
+    if (val.indexOf(prefix) === 0) {
+      var rest = val.slice(prefix.length);
+      return rest.charAt(0) === "/" ? rest : "/" + rest;
+    }
+    var full = here + prefix;
+    if (val.indexOf(full) === 0) {
+      var rest = val.slice(full.length);
+      return rest.charAt(0) === "/" ? rest : "/" + rest;
+    }
+    return val;
+  }
+
   // The page URL holds the session token: a page may not send it to other sites
   function noReferrer(init) {
     return init && init.referrerPolicy ? Object.assign({}, init, { referrerPolicy: "no-referrer" }) : init;
@@ -125,13 +139,48 @@ function (cfg) {
       return nativeOpen.apply(this, args);
     };
     var setAttribute = Element.prototype.setAttribute;
-    var linkAttrs = { src: 1, href: 1, action: 1, formaction: 1, poster: 1 };
+    var setAttributeNS = Element.prototype.setAttributeNS;
+    var getAttribute = Element.prototype.getAttribute;
+    var getAttributeNS = Element.prototype.getAttributeNS;
+    var linkAttrs = {
+      src: 1,
+      href: 1,
+      action: 1,
+      formaction: 1,
+      poster: 1,
+      data: 1,
+      background: 1,
+    };
     Element.prototype.setAttribute = function (name, value) {
       var lower = String(name).toLowerCase();
       if (lower === "referrerpolicy") return undefined; // See noReferrer
       if (typeof value === "string" && linkAttrs[lower]) value = rewrite(value);
       return setAttribute.call(this, name, value);
     };
+    if (setAttributeNS) {
+      Element.prototype.setAttributeNS = function (ns, name, value) {
+        var lower = String(name).toLowerCase();
+        if (lower === "referrerpolicy") return undefined;
+        if (typeof value === "string" && linkAttrs[lower]) value = rewrite(value);
+        return setAttributeNS.call(this, ns, name, value);
+      };
+    }
+    Element.prototype.getAttribute = function (name) {
+      var val = getAttribute.call(this, name);
+      if (typeof val === "string" && linkAttrs[String(name).toLowerCase()]) {
+        return unprefix(val);
+      }
+      return val;
+    };
+    if (getAttributeNS) {
+      Element.prototype.getAttributeNS = function (ns, name) {
+        var val = getAttributeNS.call(this, ns, name);
+        if (typeof val === "string" && linkAttrs[String(name).toLowerCase()]) {
+          return unprefix(val);
+        }
+        return val;
+      };
+    }
     ["HTMLAnchorElement", "HTMLAreaElement", "HTMLImageElement", "HTMLIFrameElement",
      "HTMLLinkElement", "HTMLScriptElement"].forEach(function (name) {
       var Cls = window[name];
@@ -164,6 +213,30 @@ function (cfg) {
         get: desc.get,
         set: function (value) {
           desc.set.call(this, rewrite(value));
+        },
+      });
+    });
+    ["HTMLAnchorElement", "HTMLAreaElement"].forEach(function (name) {
+      var Cls = window[name];
+      if (!Cls) return;
+      var desc = Object.getOwnPropertyDescriptor(Cls.prototype, "pathname");
+      if (!desc || !desc.get || !desc.set) return;
+      Object.defineProperty(Cls.prototype, "pathname", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () {
+          return unprefix(desc.get.call(this));
+        },
+        set: function (value) {
+          if (typeof value === "string") {
+            var current = desc.get.call(this);
+            if (current && (current.indexOf(prefix) === 0 || (this.origin === here && current.indexOf(viewPath) === 0))) {
+              var path = value.charAt(0) === "/" ? value : "/" + value;
+              desc.set.call(this, prefix + path);
+              return;
+            }
+          }
+          desc.set.call(this, value);
         },
       });
     });
