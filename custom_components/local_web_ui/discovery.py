@@ -8,6 +8,8 @@ import socket
 from aiohttp.abc import AbstractResolver, ResolveResult
 from yarl import URL
 
+from .const import DEFAULT_LOCAL_SUFFIXES
+
 # Names that point at the Home Assistant host itself or its internal services
 # (Supervisor, apps). Proxying to them from a URL a device or integration chose
 # would turn discovery into a way to reach services that are not device UIs.
@@ -27,7 +29,6 @@ _BLOCKED_HOSTS = frozenset(
         "metadata.google.internal",
     }
 )
-from .const import DEFAULT_LOCAL_SUFFIXES
 
 # Supervisor's internal network on HA OS / Supervised installs
 _SUPERVISOR_NETWORK = ipaddress.ip_network("172.30.32.0/23")

@@ -2099,7 +2099,9 @@ def test_inject_script_attributes_and_pathname_hooks() -> None:
     assert b"function unprefix(val)" in proxy_module.INJECT_JS
     assert b"Element.prototype.getAttribute = function (name)" in proxy_module.INJECT_JS
     assert b"Element.prototype.getAttributeNS = function (ns, name)" in proxy_module.INJECT_JS
-    assert b'desc = Object.getOwnPropertyDescriptor(Cls.prototype, "pathname")' in proxy_module.INJECT_JS
+    assert (
+        b'desc = Object.getOwnPropertyDescriptor(Cls.prototype, "pathname")'
+        in proxy_module.INJECT_JS
+    )
     for attr in ("src", "href", "action", "formaction", "poster", "data", "background"):
         assert f"{attr}: 1".encode() in proxy_module.INJECT_JS
-
