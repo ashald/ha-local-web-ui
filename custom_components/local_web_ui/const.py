@@ -48,10 +48,12 @@ VISIT_DEVICE: Final = "device"
 VISIT_CHOICES: Final = (VISIT_DEFAULT, VISIT_HERE, VISIT_DEVICE)
 CONF_PANEL_TITLE: Final = "panel_title"
 CONF_PANEL_ICON: Final = "panel_icon"
+CONF_LOCAL_DOMAINS: Final = "local_domains"
 DEFAULT_PANEL_ICON: Final = "mdi:web-box"
 DEFAULT_DISCOVERY: Final = True
 DEFAULT_LINK_DEVICE_PAGES: Final = True
 DEFAULT_SHOW_PANEL: Final = True
+DEFAULT_LOCAL_SUFFIXES: Final = (".local", ".home.arpa")
 
 MODE_ISOLATED: Final = "isolated"
 MODE_TRUSTED: Final = "trusted"

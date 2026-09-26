@@ -35,6 +35,7 @@ from custom_components.local_web_ui.const import (
     CONF_DISCOVERY,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
+    CONF_LOCAL_DOMAINS,
     CONF_MODE,
     CONF_SHOW_IN_SIDEBAR,
     CONF_SHOW_PANEL,
@@ -315,11 +316,7 @@ LOCAL_URLS = [
     # local names
     "http://esp-porch.local/",
     "http://ESP-PORCH.LOCAL./",  # case and trailing dot
-    "http://router.lan/",
-    "http://nas.home/",
     "http://printer.home.arpa:631/",
-    "http://box.internal/",
-    "http://nas.localdomain/",
     # single-label host names
     "http://printer/",
     "http://wled-kitchen:8080/",
@@ -334,6 +331,11 @@ NON_LOCAL_URLS = [
     "http://example.com/",
     "https://device.example.org:8443/",
     "http://esp.local.example.com/",
+    # unreserved suffixes (not local by default)
+    "http://router.lan/",
+    "http://nas.home/",
+    "http://box.internal/",
+    "http://nas.localdomain/",
     # loopback
     "http://127.0.0.1:8123/",
     "http://127.1.2.3/",
@@ -414,9 +416,9 @@ def test_is_local_ui_url_rejects_aliases_of_excluded_targets(value: str) -> None
         ("http://homeassistant.local:8123/", {("homeassistant.local", 8123)}, False),
         ("http://HomeAssistant.Local.:8123/", {("homeassistant.local", 8123)}, False),
         # the default port counts as the port
-        ("http://ha.lan/", {("ha.lan", 80)}, False),
-        ("https://ha.lan/", {("ha.lan", 443)}, False),
-        ("https://ha.lan/", {("ha.lan", 80)}, True),
+        ("http://ha.local/", {("ha.local", 80)}, False),
+        ("https://ha.local/", {("ha.local", 443)}, False),
+        ("https://ha.local/", {("ha.local", 80)}, True),
     ],
 )
 def test_is_local_ui_url_excludes_home_assistant_itself(
@@ -425,6 +427,21 @@ def test_is_local_ui_url_excludes_home_assistant_itself(
     url = parse_http_url(value)
     assert url is not None
     assert is_local_ui_url(url, frozenset(own_hosts)) is expected
+
+
+def test_is_local_ui_url_with_custom_suffixes() -> None:
+    custom = (".local", ".home.arpa", ".lan", ".lan.ashald.net")
+    url1 = parse_http_url("http://router.lan/")
+    assert url1 is not None
+    assert is_local_ui_url(url1, local_suffixes=custom) is True
+
+    url2 = parse_http_url("https://nas.lan.ashald.net:443")
+    assert url2 is not None
+    assert is_local_ui_url(url2, local_suffixes=custom) is True
+
+    url3 = parse_http_url("http://nas.home/")
+    assert url3 is not None
+    assert is_local_ui_url(url3, local_suffixes=custom) is False
 
 
 @pytest.mark.parametrize(
@@ -606,6 +623,47 @@ async def test_discovery_excludes_home_assistant_itself(
 
     await setup_hub(hass)
     assert set(offers(hass)) == {other_port.id}
+
+
+@pytest.mark.usefixtures("http")
+async def test_discovery_with_configured_local_domains(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry, owner: MockConfigEntry
+) -> None:
+    nas = add_device(
+        device_registry, owner, "nas", "https://nas.lan.ashald.net:443", name="Synology NAS"
+    )
+    hub_entry = await setup_hub(hass)
+
+    # By default (.local and .home.arpa), nas.lan.ashald.net is not offered
+    assert offers(hass) == {}
+
+    # Configuring local_domains in hub options discovers it
+    await set_options(hass, hub_entry, **{CONF_LOCAL_DOMAINS: "lan.ashald.net"})
+    assert set(offers(hass)) == {nas.id}
+    assert (await offer_details(hass, offers(hass)[nas.id])) == {
+        "name": "Synology NAS",
+        "url": "https://nas.lan.ashald.net/",
+        "subtitle": "nas.lan.ashald.net",
+    }
+
+
+@pytest.mark.usefixtures("http")
+async def test_discovery_inherits_internal_domain_suffix(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry, owner: MockConfigEntry
+) -> None:
+    await hass.config.async_update(
+        internal_url="https://ha.lan.ashald.net:8123", external_url="https://ha.example.com"
+    )
+    nas = add_device(
+        device_registry, owner, "nas", "https://nas.lan.ashald.net:443", name="Synology NAS"
+    )
+    add_device(
+        device_registry, owner, "other", "https://router.other.net:8443", name="Other Router"
+    )
+
+    await setup_hub(hass)
+    # Inherits .lan.ashald.net from internal_url, so nas is offered, but not other.net or ha.example.com
+    assert set(offers(hass)) == {nas.id}
 
 
 @pytest.mark.usefixtures("http")

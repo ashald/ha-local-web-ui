@@ -215,15 +215,43 @@ async def test_disabled_target_keeps_the_web_ui_device(
     device = _owner_device(hass, owner)
     entry = await _device_web_ui(hass, device)
     [ours] = _ours(hass, entry)
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
 
     registry.async_update_device(device.id, disabled_by=dr.DeviceEntryDisabler.USER)
     await hass.async_block_till_done()
     assert entry.runtime_data.get_view(entry.entry_id) is None
-    assert [d.id for d in _ours(hass, entry)] == [ours.id]
+    [ours] = _ours(hass, entry)
+    assert ours.configuration_url is None
 
     registry.async_update_device(device.id, disabled_by=None)
     await hass.async_block_till_done()
-    assert [d.id for d in _ours(hass, entry)] == [ours.id]
+    [ours] = _ours(hass, entry)
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+
+
+@pytest.mark.usefixtures("setup")
+async def test_target_url_change_updates_linked_device_visit_url(
+    hass: HomeAssistant, owner: MockConfigEntry
+) -> None:
+    registry = dr.async_get(hass)
+    device = _owner_device(hass, owner)
+    entry = await _device_web_ui(hass, device)
+    [ours] = _ours(hass, entry)
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+
+    # Target URL changed to a non-local URL: view becomes inactive, visit link cleared
+    registry.async_update_device(device.id, configuration_url="https://external.example.com")
+    await hass.async_block_till_done()
+    assert entry.runtime_data.get_view(entry.entry_id) is None
+    [ours] = _ours(hass, entry)
+    assert ours.configuration_url is None
+
+    # Target URL restored to local URL: view is restored, visit link restored
+    registry.async_update_device(device.id, configuration_url=PORCH_URL)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.get_view(entry.entry_id) is not None
+    [ours] = _ours(hass, entry)
+    assert ours.configuration_url == f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
 
 
 @pytest.mark.usefixtures("setup")

@@ -56,14 +56,16 @@
           "link_device_pages": "Open device \"Visit\" buttons here",
           "show_panel": "Show the list of web UIs in the sidebar",
           "panel_title": "Sidebar name",
-          "panel_icon": "Sidebar icon"
+          "panel_icon": "Sidebar icon",
+          "local_domains": "Local domain suffixes"
         },
         "data_description": {
           "discovery": "Offer devices whose integration links to a local web page (their \"Visit\" button), such as ESPHome devices with web_server, WLED or printers. They appear under Discovered, where you add or ignore each.",
           "link_device_pages": "The default for each web UI of a device: point the device's own \"Visit\" button at its web UI here, so it also works away from home. Each web UI can choose otherwise in its settings. Turning it off restores the original links.",
           "show_panel": "The web UIs' own pages keep working when the list is hidden.",
           "panel_title": "Leave empty for \"Local Web UIs\".",
-          "panel_icon": "Icon of the list in the sidebar."
+          "panel_icon": "Icon of the list in the sidebar.",
+          "local_domains": "Additional domain suffixes to treat as local network for discovery (space- or comma-separated). By default, .local and .home.arpa are accepted."
         }
       },
       "web_ui": {

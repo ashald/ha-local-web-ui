@@ -33,6 +33,7 @@ from .const import (
     CONF_ICON,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
+    CONF_LOCAL_DOMAINS,
     CONF_MODE,
     CONF_PANEL_ICON,
     CONF_PANEL_TITLE,
@@ -198,6 +199,12 @@ class HubOptionsFlow(OptionsFlow):
                 description={"suggested_value": options.get(CONF_PANEL_ICON, DEFAULT_PANEL_ICON)},
             )
         ] = IconSelector()
+        schema[
+            vol.Optional(
+                CONF_LOCAL_DOMAINS,
+                description={"suggested_value": options.get(CONF_LOCAL_DOMAINS)},
+            )
+        ] = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT))
         return self.async_show_form(
             step_id="hub",
             data_schema=vol.Schema(schema),

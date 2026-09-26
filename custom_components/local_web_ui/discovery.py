@@ -27,7 +27,8 @@ _BLOCKED_HOSTS = frozenset(
         "metadata.google.internal",
     }
 )
-_LOCAL_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
+from .const import DEFAULT_LOCAL_SUFFIXES
+
 # Supervisor's internal network on HA OS / Supervised installs
 _SUPERVISOR_NETWORK = ipaddress.ip_network("172.30.32.0/23")
 # Carrier-grade NAT space, which Tailscale uses for devices on a tailnet
@@ -84,7 +85,11 @@ def is_lan_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bo
     return address.is_private or (address.version == 4 and address in _SHARED_NETWORK)
 
 
-def is_local_ui_url(url: URL, own_hosts: frozenset[tuple[str, int]] = frozenset()) -> bool:
+def is_local_ui_url(
+    url: URL,
+    own_hosts: frozenset[tuple[str, int]] = frozenset(),
+    local_suffixes: tuple[str, ...] = DEFAULT_LOCAL_SUFFIXES,
+) -> bool:
     """Return True if a discovered URL points at a device on the local network.
 
     Deliberately conservative: loopback, link-local, cloud metadata, Supervisor's
@@ -104,7 +109,7 @@ def is_local_ui_url(url: URL, own_hosts: frozenset[tuple[str, int]] = frozenset(
             or host.startswith(("a0d7b954-", "core-", "local-"))
         ):
             return False  # App hostnames on the Supervisor network
-        return "." not in host or host.endswith(_LOCAL_SUFFIXES)
+        return "." not in host or host.endswith(local_suffixes)
     return is_lan_address(address)
 
 

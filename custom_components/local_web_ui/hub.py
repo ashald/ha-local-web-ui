@@ -9,6 +9,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
+import ipaddress
 import logging
 import secrets
 import time
@@ -37,6 +38,7 @@ from .const import (
     CONF_ICON,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
+    CONF_LOCAL_DOMAINS,
     CONF_MODE,
     CONF_PASSWORD,
     CONF_PREVIOUS_VIEW_ID,
@@ -47,6 +49,7 @@ from .const import (
     CONF_VISIT_LINK,
     DEFAULT_DISCOVERY,
     DEFAULT_LINK_DEVICE_PAGES,
+    DEFAULT_LOCAL_SUFFIXES,
     DEVICE_LINK_PREFIX,
     DISCOVERED_PREFIX,
     DOMAIN,
@@ -350,6 +353,46 @@ class LocalWebUiHub:
         choice = self.visit_link(view_id)
         return self.link_default if choice == VISIT_DEFAULT else choice == VISIT_HERE
 
+    def _compute_own_domain_suffixes(self) -> frozenset[str]:
+        suffixes: set[str] = set()
+        try:
+            url = URL(
+                get_url(self.hass, allow_internal=True, allow_external=False, allow_cloud=False)
+            )
+        except NoURLAvailableError:
+            try:
+                url = URL(get_url(self.hass, allow_cloud=False, prefer_external=False))
+            except NoURLAvailableError:
+                return frozenset()
+        if not url.host:
+            return frozenset()
+        try:
+            ipaddress.ip_address(url.host)
+            return frozenset()
+        except ValueError:
+            pass
+        labels = url.host.lower().split(".")
+        if len(labels) >= 3:
+            suffixes.add("." + ".".join(labels[1:]))
+        elif len(labels) == 2:
+            suffixes.add(f".{labels[1]}")
+        return frozenset(suffixes)
+
+    @property
+    def local_suffixes(self) -> tuple[str, ...]:
+        suffixes = set(DEFAULT_LOCAL_SUFFIXES)
+        suffixes.update(self._compute_own_domain_suffixes())
+        configured = self._hub_option(CONF_LOCAL_DOMAINS, "")
+        if isinstance(configured, str):
+            domains = [d.strip() for d in configured.replace(",", " ").split() if d.strip()]
+        elif isinstance(configured, (list, tuple)):
+            domains = [str(d).strip() for d in configured if str(d).strip()]
+        else:
+            domains = []
+        for domain in domains:
+            suffixes.add(domain if domain.startswith(".") else f".{domain}")
+        return tuple(sorted(suffixes))
+
     # ---- lifecycle ---------------------------------------------------------
 
     @property
@@ -558,7 +601,7 @@ class LocalWebUiHub:
         if current and current.startswith(DEVICE_LINK_PREFIX):
             current = self.originals.get(device.id)
         url = parse_http_url(current)
-        if url is None or not is_local_ui_url(url, self._own_hosts):
+        if url is None or not is_local_ui_url(url, self._own_hosts, self.local_suffixes):
             return None
         return url
 
@@ -599,6 +642,7 @@ class LocalWebUiHub:
             device.name,
             device.name_by_user,
             device.config_entry_id,
+            self.local_suffixes,
         )
         if (cached := self._device_views.get(device.id)) is not None and cached[0] == key:
             return cached[1]
@@ -768,7 +812,8 @@ class LocalWebUiHub:
         if target is not None and not connections:
             identifiers |= set(target.identifiers)
         name = f"{entry.title} web UI"
-        url = f"{DEVICE_LINK_PREFIX}{entry.entry_id}"
+        # Only point to the web UI if it is currently active, so we don't leave a dead "Visit" link
+        url = f"{DEVICE_LINK_PREFIX}{entry.entry_id}" if entry.entry_id in self._views else None
         device = registry.async_get_device_by_identifier((DOMAIN, entry.entry_id), entry.entry_id)
         if device is not None and (
             device.identifiers != identifiers or device.connections != connections

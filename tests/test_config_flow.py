@@ -47,6 +47,7 @@ from custom_components.local_web_ui.const import (
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_LINKED_DEVICES,
+    CONF_LOCAL_DOMAINS,
     CONF_MODE,
     CONF_PANEL_ICON,
     CONF_PANEL_TITLE,
@@ -753,11 +754,13 @@ async def test_hub_options_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_SHOW_PANEL,
         CONF_PANEL_TITLE,
         CONF_PANEL_ICON,
+        CONF_LOCAL_DOMAINS,
     ]
     assert {k: _form_value(m) for k, m in fields.items()} == {
         **HUB_OPTIONS,
         CONF_PANEL_TITLE: vol.UNDEFINED,
         CONF_PANEL_ICON: DEFAULT_PANEL_ICON,
+        CONF_LOCAL_DOMAINS: vol.UNDEFINED,
     }
 
 
@@ -770,6 +773,7 @@ async def test_hub_options_form_prefills_current_options(
         CONF_SHOW_PANEL: False,
         CONF_PANEL_TITLE: "Devices",
         CONF_PANEL_ICON: "mdi:lan",
+        CONF_LOCAL_DOMAINS: "lan.example.com",
     }
     hass.config_entries.async_update_entry(hub_entry, options=current)
     await hass.async_block_till_done()
@@ -1783,7 +1787,7 @@ def test_translations_cover_options_flows(filename: str) -> None:
     assert set(options["step"]) == {"hub", "web_ui"}
 
     hub = options["step"]["hub"]
-    hub_fields = {*HUB_OPTIONS, CONF_PANEL_TITLE, CONF_PANEL_ICON}
+    hub_fields = {*HUB_OPTIONS, CONF_PANEL_TITLE, CONF_PANEL_ICON, CONF_LOCAL_DOMAINS}
     assert set(hub["data"]) == hub_fields
     assert set(hub["data_description"]) <= hub_fields
     assert "{panel_url}" in hub["description"]
