@@ -11,6 +11,7 @@ import asyncio
 import base64
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import PurePosixPath
 import random
@@ -74,12 +75,19 @@ from custom_components.local_web_ui.const import (
     SESSION_TTL,
     STORAGE_KEY_JAR,
 )
-from custom_components.local_web_ui.hub import LocalWebUiHub, device_unique_id
+from custom_components.local_web_ui.hub import (
+    DigestChallenge,
+    LocalWebUiHub,
+    compute_digest_authorization,
+    device_unique_id,
+    parse_digest_challenge,
+)
 from custom_components.local_web_ui.proxy import ISOLATION_CSP, https_upgrade
 
 ISO = "isoview"
 TRUSTED = "trustedview"
 AUTH = "authview"
+TOKEN = "tokenview"
 DOWN = "downview"
 
 SHIM_MARKER = b"<script>/* local_web_ui */("
@@ -364,6 +372,62 @@ class Upstream:
                 event = self._holds.setdefault(hold_id, asyncio.Event())
                 await asyncio.wait_for(event.wait(), 10)
             return web.Response(text=f"held {hold_id}")
+        if path == "/digest":
+            auth = request.headers.get(hdrs.AUTHORIZATION, "")
+            if not auth.startswith("Digest "):
+                return web.Response(
+                    status=401,
+                    text="auth required",
+                    headers={
+                        hdrs.WWW_AUTHENTICATE: 'Digest realm="Test Realm", nonce="testnonce123"'
+                    },
+                )
+            ha1 = hashlib.md5(b"admin:Test Realm:s3cret").hexdigest()
+            ha2 = hashlib.md5(f"{request.method}:{request.raw_path}".encode()).hexdigest()
+            expected_resp = hashlib.md5(f"{ha1}:testnonce123:{ha2}".encode()).hexdigest()
+            if f'response="{expected_resp}"' in auth:
+                return web.Response(text="digest authenticated")
+            return web.Response(status=401, text="invalid digest")
+        if path == "/digest-qop":
+            auth = request.headers.get(hdrs.AUTHORIZATION, "")
+            if not auth.startswith("Digest "):
+                return web.Response(
+                    status=401,
+                    text="auth required",
+                    headers={
+                        hdrs.WWW_AUTHENTICATE: (
+                            'Digest realm="QOP Realm", nonce="qopnonce456", qop="auth"'
+                        )
+                    },
+                )
+            if "qop=auth" in auth and 'nonce="qopnonce456"' in auth and "response=" in auth:
+                return web.Response(text="digest qop authenticated")
+            return web.Response(status=401, text="invalid digest qop")
+        if path == "/digest-stale":
+            auth = request.headers.get(hdrs.AUTHORIZATION, "")
+            if 'nonce="freshnonce789"' in auth:
+                return web.Response(text="stale recovered")
+            if not auth.startswith("Digest "):
+                return web.Response(
+                    status=401,
+                    headers={
+                        hdrs.WWW_AUTHENTICATE: (
+                            'Digest realm="Stale Realm", nonce="oldnonce", stale=false'
+                        )
+                    },
+                )
+            return web.Response(
+                status=401,
+                headers={
+                    hdrs.WWW_AUTHENTICATE: (
+                        'Digest realm="Stale Realm", nonce="freshnonce789", stale=true'
+                    )
+                },
+            )
+        if path == "/token-auth":
+            auth = request.headers.get(hdrs.AUTHORIZATION, "")
+            api_key = request.headers.get("X-Api-Key", "")
+            return web.Response(text=f"auth={auth} key={api_key}")
         return web.Response(text=f"echo {request.method} {request.raw_path}")
 
 
@@ -518,6 +582,12 @@ async def env(
             "Site with login",
             f"{upstream.origin}/",
             **{CONF_USERNAME: "admin", CONF_PASSWORD: "s3cret"},
+        ),
+        _web_ui(
+            TOKEN,
+            "Site with token",
+            f"{upstream.origin}/",
+            **{CONF_PASSWORD: "token12345"},
         ),
         _web_ui(DOWN, "Unplugged", f"http://127.0.0.1:{_free_port()}/"),
     ]
@@ -2105,3 +2175,134 @@ def test_inject_script_attributes_and_pathname_hooks() -> None:
     )
     for attr in ("src", "href", "action", "formaction", "poster", "data", "background"):
         assert f"{attr}: 1".encode() in proxy_module.INJECT_JS
+
+
+def test_parse_digest_challenge() -> None:
+    assert parse_digest_challenge(None) is None
+    assert parse_digest_challenge("Basic realm=foo") is None
+    assert parse_digest_challenge("Digest foo=bar") is None
+
+    # Standard RFC 2617 challenge
+    c = parse_digest_challenge('Digest realm="Printer API", nonce="c2725fa89f7069dd", stale=false')
+    assert c is not None
+    assert c.realm == "Printer API"
+    assert c.nonce == "c2725fa89f7069dd"
+    assert c.qop is None
+    assert c.algorithm is None
+
+    # Full challenge with qop and algorithm
+    c2 = parse_digest_challenge(
+        'Digest realm="Protected", nonce="abc123nonce", qop="auth,auth-int", '
+        'opaque="opaque555", algorithm="MD5"'
+    )
+    assert c2 is not None
+    assert c2.realm == "Protected"
+    assert c2.nonce == "abc123nonce"
+    assert c2.qop == "auth"
+    assert c2.opaque == "opaque555"
+    assert c2.algorithm == "MD5"
+
+
+def test_compute_digest_authorization_rfc2069() -> None:
+    # RFC 2069 (legacy, no qop, as used by Prusa MINI)
+    challenge = DigestChallenge(realm="Printer API", nonce="c2725fa89f7069dd")
+    auth = compute_digest_authorization(
+        username="maker",
+        password="password123",
+        method="GET",
+        raw_path="/api/v1/status",
+        challenge=challenge,
+    )
+    assert auth.startswith("Digest ")
+    assert 'username="maker"' in auth
+    assert 'realm="Printer API"' in auth
+    assert 'nonce="c2725fa89f7069dd"' in auth
+    assert 'uri="/api/v1/status"' in auth
+    assert "response=" in auth
+    # Algorithm must NOT be sent if not specified in challenge
+    assert "algorithm=" not in auth
+    assert "qop=" not in auth
+    assert "nc=" not in auth
+    assert "cnonce=" not in auth
+
+
+def test_compute_digest_authorization_rfc2617_qop() -> None:
+    # RFC 2617 with qop="auth"
+    challenge = DigestChallenge(
+        realm="Protected",
+        nonce="testnonce",
+        qop="auth",
+        opaque="opq",
+        algorithm="MD5",
+    )
+    auth1 = compute_digest_authorization(
+        username="user",
+        password="pwd",
+        method="POST",
+        raw_path="/submit",
+        challenge=challenge,
+        cnonce="clientnonce1",
+    )
+    assert "qop=auth" in auth1
+    assert "nc=00000001" in auth1
+    assert 'cnonce="clientnonce1"' in auth1
+    assert 'opaque="opq"' in auth1
+    assert "algorithm=MD5" in auth1
+
+    # Second request increments nc
+    auth2 = compute_digest_authorization(
+        username="user",
+        password="pwd",
+        method="GET",
+        raw_path="/page",
+        challenge=challenge,
+        cnonce="clientnonce2",
+    )
+    assert "nc=00000002" in auth2
+    assert 'cnonce="clientnonce2"' in auth2
+
+
+async def test_digest_auth_challenge_and_retry(env: Env) -> None:
+    prefix = await env.prefix(AUTH)
+    # First request: challenges with 401, proxy catches challenge, computes digest, and retries
+    response = await env.client.get(prefix + "/digest")
+    assert response.status == 200
+    assert await response.text() == "digest authenticated"
+
+    # Upstream recorded 2 requests (initial with Basic auth, retry with Digest auth)
+    assert len(env.upstream.requests) >= 2
+    assert env.upstream.requests[-2].headers.get(hdrs.AUTHORIZATION, "").startswith("Basic ")
+    assert env.upstream.requests[-1].headers.get(hdrs.AUTHORIZATION, "").startswith("Digest ")
+
+    # Second request: pre-emptively sends Digest auth from cache
+    req_count = len(env.upstream.requests)
+    response2 = await env.client.get(prefix + "/digest")
+    assert response2.status == 200
+    assert await response2.text() == "digest authenticated"
+    assert len(env.upstream.requests) == req_count + 1
+    assert env.upstream.requests[-1].headers.get(hdrs.AUTHORIZATION, "").startswith("Digest ")
+
+
+async def test_digest_qop_auth(env: Env) -> None:
+    prefix = await env.prefix(AUTH)
+    response = await env.client.get(prefix + "/digest-qop")
+    assert response.status == 200
+    assert await response.text() == "digest qop authenticated"
+
+
+async def test_digest_stale_nonce_recovery(env: Env) -> None:
+    prefix = await env.prefix(AUTH)
+    # Seed the hub cache with an expired nonce so the request starts with Digest auth
+    env.hub._digest_challenges[AUTH] = DigestChallenge(realm="Stale Realm", nonce="oldnonce")
+    response = await env.client.get(prefix + "/digest-stale")
+    assert response.status == 200
+    assert await response.text() == "stale recovered"
+
+
+async def test_token_only_auth(env: Env) -> None:
+    prefix = await env.prefix(TOKEN)
+    response = await env.client.get(prefix + "/token-auth")
+    assert response.status == 200
+    text = await response.text()
+    assert "auth=Bearer token12345" in text
+    assert "key=token12345" in text

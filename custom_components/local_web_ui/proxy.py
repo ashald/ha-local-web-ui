@@ -415,8 +415,12 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
     cookies = ctx.hub.cookie_jar(ctx.session.user_id, ctx.view).filter_cookies(url)
     if cookies:
         headers[hdrs.COOKIE] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
-    if ctx.view.authorization is not None:
+    if digest_auth := ctx.hub.cached_digest_header(ctx.view, request.method, url):
+        headers[hdrs.AUTHORIZATION] = digest_auth
+    elif ctx.view.authorization is not None:
         headers[hdrs.AUTHORIZATION] = ctx.view.authorization
+    if ctx.view.password and not ctx.view.username:
+        headers.setdefault("X-Api-Key", ctx.view.password)
     # Same header Supervisor ingress uses, so UIs built for ingress can adapt links
     headers["X-Ingress-Path"] = ctx.prefix
     # Validated by Home Assistant's forwarded middleware against trusted_proxies
@@ -732,39 +736,68 @@ async def _proxy_request(
         # The time limit runs from the end of the upload, however long that takes
         # (firmware over a slow link), to the response headers
         loop = asyncio.get_running_loop()
-        async with asyncio.timeout(None) as deadline:
+        req_body: bytes | None = None
+        if (
+            request.body_exists
+            and request.content_length is not None
+            and request.content_length <= MAX_SIMPLE_RESPONSE_SIZE
+        ):
+            req_body = await request.read()
 
-            def start_deadline() -> None:
-                deadline.reschedule(loop.time() + UPSTREAM_HEADERS_TIMEOUT)
+        for attempt in range(2):
+            async with asyncio.timeout(None) as deadline:
 
-            body = None
-            if request.body_exists:
-                body = _upload(request.content, start_deadline)
-            else:
-                start_deadline()
-            result = await client.request(
-                request.method,
-                url,
-                headers=headers,
-                data=body,
-                allow_redirects=False,
-                timeout=UPSTREAM_TIMEOUT,
-                skip_auto_headers={hdrs.CONTENT_TYPE, hdrs.USER_AGENT},
-            )
-        async with result:
-            response, stream_head = await _respond(request, ctx, result, url)
-            if stream_head is None:
-                if ctx.view.mode == MODE_ISOLATED:
-                    # Sent here, before Home Assistant's headers middleware would add
-                    # X-Frame-Options: SAMEORIGIN, which an isolated page's own
-                    # frames can never meet (its origin is opaque)
-                    await response.prepare(request)
-                    await response.write_eof()
-                return response
-            # Streams (downloads, server-sent events) can last long; let others in
-            limiter.release()
-            held = False
-            return await _stream(request, ctx, result, response, stream_head)
+                def start_deadline() -> None:
+                    deadline.reschedule(loop.time() + UPSTREAM_HEADERS_TIMEOUT)
+
+                body: Any = None
+                if req_body is not None:
+                    body = req_body
+                    start_deadline()
+                elif request.body_exists:
+                    body = _upload(request.content, start_deadline)
+                else:
+                    start_deadline()
+                result = await client.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    data=body,
+                    allow_redirects=False,
+                    timeout=UPSTREAM_TIMEOUT,
+                    skip_auto_headers={hdrs.CONTENT_TYPE, hdrs.USER_AGENT},
+                )
+            if attempt == 0 and result.status == 401:
+                digest_header = None
+                for auth_header in result.headers.getall(hdrs.WWW_AUTHENTICATE, ()):
+                    digest_header = ctx.hub.handle_digest_challenge(
+                        ctx.view, request.method, url, auth_header
+                    )
+                    if digest_header:
+                        break
+                if (
+                    digest_header
+                    and digest_header != headers.get(hdrs.AUTHORIZATION)
+                    and (not request.body_exists or req_body is not None)
+                ):
+                    headers[hdrs.AUTHORIZATION] = digest_header
+                    result.close()
+                    continue
+            async with result:
+                response, stream_head = await _respond(request, ctx, result, url)
+                if stream_head is None:
+                    if ctx.view.mode == MODE_ISOLATED:
+                        # Sent here, before Home Assistant's headers middleware would add
+                        # X-Frame-Options: SAMEORIGIN, which an isolated page's own
+                        # frames can never meet (its origin is opaque)
+                        await response.prepare(request)
+                        await response.write_eof()
+                    return response
+                # Streams (downloads, server-sent events) can last long; let others in
+                limiter.release()
+                held = False
+                return await _stream(request, ctx, result, response, stream_head)
+        return _error(502, f"{ctx.view.name} authorization failed")
     finally:
         if held:
             limiter.release()

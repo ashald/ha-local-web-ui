@@ -9,8 +9,10 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
+import hashlib
 import ipaddress
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -95,6 +97,8 @@ class View:
     show_in_sidebar: bool
     icon: str | None
     subtitle: str
+    username: str | None = None
+    password: str | None = None
 
     @property
     def url(self) -> str:
@@ -115,6 +119,104 @@ def basic_authorization(username: str, password: str) -> str:
     """HTTP Basic credentials (RFC 7617, UTF-8)."""
     token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
     return f"Basic {token}"
+
+
+@dataclass
+class DigestChallenge:
+    """Parsed HTTP Digest Authentication challenge (RFC 2617 / RFC 7616)."""
+
+    realm: str
+    nonce: str
+    qop: str | None = None
+    opaque: str | None = None
+    algorithm: str | None = None
+    nc: int = 0
+
+
+_DIGEST_PARAM = re.compile(r'(\w+)=(?:"([^"]*)"|([^\s,]+))')
+
+
+def parse_digest_challenge(header: str | None) -> DigestChallenge | None:
+    """Parse a WWW-Authenticate Digest challenge header."""
+    if not header:
+        return None
+    scheme, _, params = header.partition(" ")
+    if scheme.strip().lower() != "digest":
+        return None
+    parsed: dict[str, str] = {}
+    for match in _DIGEST_PARAM.finditer(params):
+        key = match.group(1).lower()
+        val = match.group(2) if match.group(2) is not None else match.group(3)
+        parsed[key] = val
+    if "realm" not in parsed or "nonce" not in parsed:
+        return None
+    raw_qop = parsed.get("qop", "")
+    qop = "auth" if "auth" in [x.strip() for x in raw_qop.split(",")] else None
+    return DigestChallenge(
+        realm=parsed["realm"],
+        nonce=parsed["nonce"],
+        qop=qop,
+        opaque=parsed.get("opaque"),
+        algorithm=parsed.get("algorithm"),
+    )
+
+
+def compute_digest_authorization(
+    username: str,
+    password: str,
+    method: str,
+    raw_path: str,
+    challenge: DigestChallenge,
+    *,
+    cnonce: str | None = None,
+) -> str:
+    """Compute the Authorization header value for HTTP Digest Authentication."""
+    challenge.nc += 1
+    algo = (challenge.algorithm or "MD5").upper()
+    hasher = hashlib.sha256 if "SHA-256" in algo or "SHA256" in algo else hashlib.md5
+
+    realm = challenge.realm
+    nonce = challenge.nonce
+
+    if algo.endswith("-SESS"):
+        h_user = hasher(f"{username}:{realm}:{password}".encode()).hexdigest()
+        if not cnonce:
+            cnonce = secrets.token_hex(4)
+        ha1 = hasher(f"{h_user}:{nonce}:{cnonce}".encode()).hexdigest()
+    else:
+        ha1 = hasher(f"{username}:{realm}:{password}".encode()).hexdigest()
+
+    ha2 = hasher(f"{method}:{raw_path}".encode()).hexdigest()
+
+    parts = [
+        f'username="{username}"',
+        f'realm="{realm}"',
+        f'nonce="{nonce}"',
+        f'uri="{raw_path}"',
+    ]
+
+    if challenge.qop:
+        if not cnonce:
+            cnonce = secrets.token_hex(4)
+        nc_str = f"{challenge.nc:08x}"
+        resp = hasher(f"{ha1}:{nonce}:{nc_str}:{cnonce}:{challenge.qop}:{ha2}".encode()).hexdigest()
+        parts.append(f'response="{resp}"')
+        if challenge.algorithm is not None:
+            parts.append(f"algorithm={challenge.algorithm}")
+        if challenge.opaque is not None:
+            parts.append(f'opaque="{challenge.opaque}"')
+        parts.append(f"qop={challenge.qop}")
+        parts.append(f"nc={nc_str}")
+        parts.append(f'cnonce="{cnonce}"')
+    else:
+        resp = hasher(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        parts.append(f'response="{resp}"')
+        if challenge.algorithm is not None:
+            parts.append(f"algorithm={challenge.algorithm}")
+        if challenge.opaque is not None:
+            parts.append(f'opaque="{challenge.opaque}"')
+
+    return "Digest " + ", ".join(parts)
 
 
 def view_from_url(url: URL) -> tuple[URL, str]:
@@ -318,6 +420,7 @@ class LocalWebUiHub:
         # view_id -> (configured origin, https origin the site redirected to)
         self._upgrades: dict[str, tuple[URL, URL]] = {}
         self._views: dict[str, View] = {}
+        self._digest_challenges: dict[str, DigestChallenge] = {}
         # device_id -> (what its candidate view was computed from, the view)
         self._device_views: dict[str, tuple[tuple[Any, ...], View | None]] = {}
         # Devices offered as discovered web UIs during this run
@@ -443,6 +546,7 @@ class LocalWebUiHub:
             else:
                 client.detach()  # Shares Home Assistant's connector; only let go of it
         self._http.clear()
+        self._digest_challenges.clear()
         for event in self._write_waiters.values():
             event.set()
         if self._loaded:
@@ -478,6 +582,7 @@ class LocalWebUiHub:
         elif self.view_entries.pop(entry.entry_id, None) is not None and gone:
             # Device pages must not point at it, and open views must stop working
             self.sessions.end_view(entry.entry_id)
+            self._digest_challenges.pop(entry.entry_id, None)
             if (device_id := entry.data.get(CONF_DEVICE_ID)) and (
                 device := main_device(dr.async_get(self.hass), device_id)
             ):
@@ -490,6 +595,7 @@ class LocalWebUiHub:
     def async_view_removed(self, entry: ConfigEntry) -> None:
         """A web UI entry was deleted: end it everywhere and forget its data."""
         self.sessions.end_view(entry.entry_id)
+        self._digest_challenges.pop(entry.entry_id, None)
         self._async_forget_site_data(entry.entry_id)
         if (device_id := entry.data.get(CONF_DEVICE_ID)) and (
             device := main_device(dr.async_get(self.hass), device_id)
@@ -526,8 +632,11 @@ class LocalWebUiHub:
         self._views = self._build_views()
         for view_id, old in previous.items():
             # A web UI moved to another site must not hand it the old site's data
-            if (view := self._views.get(view_id)) is not None and view.origin != old.origin:
+            view = self._views.get(view_id)
+            if view is not None and view.origin != old.origin:
                 self._async_forget_site_data(view_id)
+            if view is None or (view.username, view.password) != (old.username, old.password):
+                self._digest_challenges.pop(view_id, None)
         self.async_sync_device_links()
         for entry in self.view_entries.values():
             self._async_sync_entry_device(entry)
@@ -563,11 +672,13 @@ class LocalWebUiHub:
                 _LOGGER.warning("Ignoring web UI %s with invalid URL", entry.title)
                 continue
             origin, entry_path = view_from_url(url)
+            username = (options.get(CONF_USERNAME) or "").strip() or None
+            password = options.get(CONF_PASSWORD) or None
             authorization = None
-            if options.get(CONF_USERNAME):
-                authorization = basic_authorization(
-                    options[CONF_USERNAME], options.get(CONF_PASSWORD) or ""
-                )
+            if username:
+                authorization = basic_authorization(username, password or "")
+            elif password:
+                authorization = f"Bearer {password}"
             views[entry.entry_id] = View(
                 view_id=entry.entry_id,
                 name=entry.title,
@@ -582,6 +693,8 @@ class LocalWebUiHub:
                 show_in_sidebar=options.get(CONF_SHOW_IN_SIDEBAR, False),
                 icon=options.get(CONF_ICON),
                 subtitle=subtitle or url.host or "",
+                username=username,
+                password=password,
             )
         return views
 
@@ -594,6 +707,37 @@ class LocalWebUiHub:
 
     def view_for_device(self, device_id: str) -> View | None:
         return next((v for v in self._views.values() if v.device_id == device_id), None)
+
+    def cached_digest_header(self, view: View, method: str, url: URL) -> str | None:
+        """Compute pre-emptive Authorization header if we have cached a Digest challenge."""
+        if not view.username or not view.password:
+            return None
+        challenge = self._digest_challenges.get(view.view_id)
+        if challenge is None:
+            return None
+        raw_path = url.raw_path or "/"
+        if url.raw_query_string:
+            raw_path += "?" + url.raw_query_string
+        return compute_digest_authorization(
+            view.username, view.password, method, raw_path, challenge
+        )
+
+    def handle_digest_challenge(
+        self, view: View, method: str, url: URL, auth_header: str
+    ) -> str | None:
+        """Handle a 401 WWW-Authenticate Digest header and return the computed Authorization header."""
+        if not view.username or not view.password:
+            return None
+        challenge = parse_digest_challenge(auth_header)
+        if challenge is None:
+            return None
+        self._digest_challenges[view.view_id] = challenge
+        raw_path = url.raw_path or "/"
+        if url.raw_query_string:
+            raw_path += "?" + url.raw_query_string
+        return compute_digest_authorization(
+            view.username, view.password, method, raw_path, challenge
+        )
 
     def device_ui_url(self, device: dr.DeviceEntry) -> URL | None:
         """The device's own web UI URL, looking through our link if we set one."""

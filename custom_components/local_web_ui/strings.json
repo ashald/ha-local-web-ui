@@ -26,8 +26,8 @@
           "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you, while its logins and storage still work. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
           "trusted_acknowledged": "Required for trusted mode.",
           "verify_ssl": "Turn off for devices with self-signed certificates.",
-          "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
-          "password": "Optional. When editing, leave empty to keep the stored password.",
+          "username": "Optional. Sent as HTTP Basic or Digest authentication so you are not prompted. Leave empty if using a token in the password field.",
+          "password": "Optional. Sent for Basic or Digest authentication, or as a Bearer token / API key. When editing, leave empty to keep the stored password.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       },
@@ -89,8 +89,8 @@
           "trusted_acknowledged": "Required for trusted mode.",
           "visit_link": "Open this web UI from the device's own \"Visit\" button, or leave that button pointing at the device. The web UI's own device (in this entry) always opens it here.",
           "verify_ssl": "Turn off for devices with self-signed certificates.",
-          "username": "Optional. Sent as HTTP Basic authentication so you are not prompted.",
-          "password": "Optional. When editing, leave empty to keep the stored password.",
+          "username": "Optional. Sent as HTTP Basic or Digest authentication so you are not prompted. Leave empty if using a token in the password field.",
+          "password": "Optional. Sent for Basic or Digest authentication, or as a Bearer token / API key. When editing, leave empty to keep the stored password.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       }
