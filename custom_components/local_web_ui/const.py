@@ -54,6 +54,10 @@ DEFAULT_DISCOVERY: Final = True
 DEFAULT_LINK_DEVICE_PAGES: Final = True
 DEFAULT_SHOW_PANEL: Final = True
 DEFAULT_LOCAL_SUFFIXES: Final = (".local", ".home.arpa")
+# Top-level names used on home networks that no one can register publicly
+PRIVATE_USE_DOMAINS: Final = frozenset(
+    {"lan", "home", "internal", "localdomain", "intranet", "corp", "private"}
+)
 
 MODE_ISOLATED: Final = "isolated"
 MODE_TRUSTED: Final = "trusted"

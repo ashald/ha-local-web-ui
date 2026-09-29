@@ -28,11 +28,13 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_KIND,
     CONF_LINKED_DEVICES,
+    CONF_LOCAL_DOMAINS,
     CONF_PANEL_ICON,
     CONF_PANEL_TITLE,
     CONF_PREVIOUS_VIEW_ID,
     CONF_SHOW_PANEL,
     CONF_VISIT_LINK,
+    DEFAULT_LOCAL_SUFFIXES,
     DEFAULT_PANEL_ICON,
     DEFAULT_SHOW_PANEL,
     DISCOVERED_PREFIX,
@@ -41,6 +43,7 @@ from .const import (
     NAME,
     PANEL_COMPONENT,
     PANEL_URL_PATH,
+    PRIVATE_USE_DOMAINS,
     STATIC_URL_PATH,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -48,7 +51,7 @@ from .const import (
     VISIT_DEVICE,
     VISIT_HERE,
 )
-from .hub import LocalWebUiHub, async_restore_device_links, device_unique_id
+from .hub import LocalWebUiHub, async_restore_device_links, device_unique_id, own_domain
 from .proxy import async_register_proxy
 from .websocket import async_register_commands
 
@@ -193,7 +196,11 @@ def _async_sync_panels(hass: HomeAssistant) -> None:
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """0.3: the one entry becomes the hub, and each web UI an entry of its own."""
+    """0.3: the one entry becomes the hub, and each web UI an entry of its own.
+
+    2.2 (0.3.6): the domain of Home Assistant's own address is no longer treated as
+    local on its own; it moves into the local domains option.
+    """
     if entry.version > 2:
         return False
     if entry.version == 1:
@@ -243,6 +250,29 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             version=2,
         )
         _LOGGER.info("Local Web UIs: web UIs moved to entries of their own")
+    if entry.minor_version < 2:
+        options = dict(entry.options)
+        if (
+            entry.data.get(CONF_KIND) == KIND_HUB
+            and CONF_LOCAL_DOMAINS not in options
+            and (domain := own_domain(hass)) is not None
+            and f".{domain}" not in DEFAULT_LOCAL_SUFFIXES
+        ):
+            if "." in domain or domain in PRIVATE_USE_DOMAINS:
+                options[CONF_LOCAL_DOMAINS] = domain
+                _LOGGER.info(
+                    "Local Web UIs: devices in %s, the domain of Home Assistant's own "
+                    "address, are now discovered through the local domains option",
+                    domain,
+                )
+            else:
+                _LOGGER.warning(
+                    "Local Web UIs: devices in %s, the domain of Home Assistant's own "
+                    "address, are no longer discovered, since it is a public domain. "
+                    "Add it to the local domains option if they should be",
+                    domain,
+                )
+        hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
     return True
 
 

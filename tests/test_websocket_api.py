@@ -140,6 +140,7 @@ def hub_config_entry(options: dict[str, Any] | None = None) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         entry_id=HUB_ID,
         title="Local Web UIs",
         data={CONF_KIND: KIND_HUB},
@@ -153,6 +154,7 @@ def manual_entry(entry_id: str, title: str, url: str, **options: Any) -> MockCon
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         entry_id=entry_id,
         title=title,
         data={CONF_KIND: KIND_VIEW},
@@ -173,6 +175,7 @@ def device_entry(
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         entry_id=entry_id,
         title=title,
         source=SOURCE_INTEGRATION_DISCOVERY,

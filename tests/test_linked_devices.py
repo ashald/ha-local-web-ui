@@ -79,6 +79,7 @@ def _hub_entry(**options: Any) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         title="Local Web UIs",
         unique_id=HUB_UNIQUE_ID,
         data={CONF_KIND: KIND_HUB},
@@ -99,6 +100,7 @@ async def _device_web_ui(
         MockConfigEntry(
             domain=DOMAIN,
             version=2,
+            minor_version=2,
             title=title,
             unique_id=device_unique_id(device.id),
             source=SOURCE_INTEGRATION_DISCOVERY,
@@ -116,6 +118,7 @@ async def _manual_web_ui(
         MockConfigEntry(
             domain=DOMAIN,
             version=2,
+            minor_version=2,
             title=title,
             data={CONF_KIND: KIND_VIEW},
             options={CONF_URL: url, CONF_MODE: MODE_ISOLATED, CONF_VERIFY_SSL: True},

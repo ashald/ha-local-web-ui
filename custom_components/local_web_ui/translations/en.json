@@ -65,7 +65,7 @@
           "show_panel": "The web UIs' own pages keep working when the list is hidden.",
           "panel_title": "Leave empty for \"Local Web UIs\".",
           "panel_icon": "Icon of the list in the sidebar.",
-          "local_domains": "Additional domain suffixes to treat as local network for discovery (space- or comma-separated). By default, .local and .home.arpa are accepted."
+          "local_domains": "Domains of your home network whose devices can be discovered, besides .local and .home.arpa, separated with spaces or commas (for example lan).{own_domain}"
         }
       },
       "web_ui": {

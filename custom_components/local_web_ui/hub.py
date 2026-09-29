@@ -219,6 +219,42 @@ def compute_digest_authorization(
     return "Digest " + ", ".join(parts)
 
 
+def parse_local_domains(value: Any) -> list[str]:
+    """The domains of the local domains option, without leading dots."""
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    elif not isinstance(value, (list, tuple)):
+        return []
+    return [d for d in (str(v).strip().strip(".").lower() for v in value) if d]
+
+
+def own_domain(hass: HomeAssistant) -> str | None:
+    """The domain Home Assistant's own local address is in (ha.lan.example.com: lan.example.com).
+
+    Only ever suggested for the local domains option, never used on its own: the
+    domain of a public name would make every name in it look local.
+    """
+    for kwargs in (
+        {"allow_internal": True, "allow_external": False},
+        {"prefer_external": False},
+    ):
+        try:
+            host = URL(get_url(hass, allow_cloud=False, **kwargs)).host
+            break
+        except NoURLAvailableError:
+            continue
+    else:
+        return None
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.lower().rstrip(".").split(".")
+        return ".".join(labels[1:]) if len(labels) >= 2 else None
+    return None
+
+
 def view_from_url(url: URL) -> tuple[URL, str]:
     """Split an absolute URL into origin and raw entry path (with query)."""
     origin = url.origin()
@@ -456,44 +492,13 @@ class LocalWebUiHub:
         choice = self.visit_link(view_id)
         return self.link_default if choice == VISIT_DEFAULT else choice == VISIT_HERE
 
-    def _compute_own_domain_suffixes(self) -> frozenset[str]:
-        suffixes: set[str] = set()
-        try:
-            url = URL(
-                get_url(self.hass, allow_internal=True, allow_external=False, allow_cloud=False)
-            )
-        except NoURLAvailableError:
-            try:
-                url = URL(get_url(self.hass, allow_cloud=False, prefer_external=False))
-            except NoURLAvailableError:
-                return frozenset()
-        if not url.host:
-            return frozenset()
-        try:
-            ipaddress.ip_address(url.host)
-            return frozenset()
-        except ValueError:
-            pass
-        labels = url.host.lower().split(".")
-        if len(labels) >= 3:
-            suffixes.add("." + ".".join(labels[1:]))
-        elif len(labels) == 2:
-            suffixes.add(f".{labels[1]}")
-        return frozenset(suffixes)
-
     @property
     def local_suffixes(self) -> tuple[str, ...]:
+        """Name suffixes discovery treats as local: the defaults and the configured ones."""
         suffixes = set(DEFAULT_LOCAL_SUFFIXES)
-        suffixes.update(self._compute_own_domain_suffixes())
-        configured = self._hub_option(CONF_LOCAL_DOMAINS, "")
-        if isinstance(configured, str):
-            domains = [d.strip() for d in configured.replace(",", " ").split() if d.strip()]
-        elif isinstance(configured, (list, tuple)):
-            domains = [str(d).strip() for d in configured if str(d).strip()]
-        else:
-            domains = []
-        for domain in domains:
-            suffixes.add(domain if domain.startswith(".") else f".{domain}")
+        suffixes.update(
+            f".{d}" for d in parse_local_domains(self._hub_option(CONF_LOCAL_DOMAINS, ""))
+        )
         return tuple(sorted(suffixes))
 
     # ---- lifecycle ---------------------------------------------------------

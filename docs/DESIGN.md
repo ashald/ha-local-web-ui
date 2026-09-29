@@ -215,7 +215,7 @@ becomes the hub.
 
 **Discovery filter.** A discovered URL must point at one of:
 - a private IPv4/IPv6 address, or `100.64.0.0/10` (Tailscale/CGNAT);
-- a `.local`, `.lan`, `.home`, `.home.arpa`, `.internal` or `.localdomain` name;
+- a `.local` or `.home.arpa` name, or one in a domain listed in the `local_domains` option;
 - a single-label hostname.
 
 It excludes loopback, link-local, multicast, cloud metadata addresses and names,

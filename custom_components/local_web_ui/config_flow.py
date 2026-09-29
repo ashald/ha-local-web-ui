@@ -14,7 +14,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
     BooleanSelector,
     IconSelector,
@@ -48,6 +48,7 @@ from .const import (
     CONF_VISIT_LINK,
     DEFAULT_DISCOVERY,
     DEFAULT_LINK_DEVICE_PAGES,
+    DEFAULT_LOCAL_SUFFIXES,
     DEFAULT_PANEL_ICON,
     DEFAULT_SHOW_PANEL,
     DOMAIN,
@@ -63,7 +64,7 @@ from .const import (
     VISIT_DEFAULT,
 )
 from .discovery import parse_http_url
-from .hub import device_unique_id
+from .hub import device_unique_id, own_domain, parse_local_domains
 
 CONF_NAME = "name"
 
@@ -78,6 +79,7 @@ class LocalWebUiConfigFlow(ConfigFlow, domain=DOMAIN):
     """The hub first; then web UIs, added by URL or discovered."""
 
     VERSION = 2
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         self._discovered: dict[str, Any] = {}
@@ -208,8 +210,23 @@ class HubOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="hub",
             data_schema=vol.Schema(schema),
-            description_placeholders={"panel_url": f"/{PANEL_URL_PATH}"},
+            description_placeholders={
+                "panel_url": f"/{PANEL_URL_PATH}",
+                "own_domain": _own_domain_hint(self.hass, options.get(CONF_LOCAL_DOMAINS)),
+            },
         )
+
+
+def _own_domain_hint(hass: HomeAssistant, configured: Any) -> str:
+    """Point at the domain of Home Assistant's own address, unless already covered."""
+    domain = own_domain(hass)
+    if (
+        domain is None
+        or f".{domain}" in DEFAULT_LOCAL_SUFFIXES
+        or domain in parse_local_domains(configured)
+    ):
+        return ""
+    return f" Home Assistant's own address is in {domain}: add it if your devices are too."
 
 
 class WebUiOptionsFlow(OptionsFlow):

@@ -455,6 +455,7 @@ def _web_ui(
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         entry_id=view_id,
         title=title,
         data={CONF_KIND: KIND_VIEW},
@@ -474,6 +475,7 @@ def _device_web_ui(device: dr.DeviceEntry, title: str) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         source=SOURCE_INTEGRATION_DISCOVERY,
         unique_id=device_unique_id(device.id),
         title=title,
@@ -577,6 +579,7 @@ async def env(
     hub_entry = MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         unique_id="hub",
         title=NAME,
         data={CONF_KIND: KIND_HUB},

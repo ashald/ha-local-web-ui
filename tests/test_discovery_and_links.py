@@ -135,6 +135,7 @@ async def setup_hub(hass: HomeAssistant, **options: Any) -> MockConfigEntry:
         MockConfigEntry(
             domain=DOMAIN,
             version=2,
+            minor_version=2,
             title="Local Web UIs",
             unique_id=HUB_UNIQUE_ID,
             data={CONF_KIND: KIND_HUB},
@@ -157,6 +158,7 @@ async def add_device_web_ui(
         MockConfigEntry(
             domain=DOMAIN,
             version=2,
+            minor_version=2,
             title=title or device.name or "Device",
             unique_id=device_unique_id(device.id),
             source=SOURCE_INTEGRATION_DISCOVERY,
@@ -176,6 +178,7 @@ async def add_manual_web_ui(hass: HomeAssistant, title: str, url: str) -> MockCo
         MockConfigEntry(
             domain=DOMAIN,
             version=2,
+            minor_version=2,
             title=title,
             data={CONF_KIND: KIND_VIEW},
             options={
@@ -648,21 +651,23 @@ async def test_discovery_with_configured_local_domains(
 
 
 @pytest.mark.usefixtures("http")
-async def test_discovery_inherits_internal_domain_suffix(
+async def test_own_domain_is_not_local_on_its_own(
     hass: HomeAssistant, device_registry: dr.DeviceRegistry, owner: MockConfigEntry
 ) -> None:
+    """The domain of Home Assistant's address counts only once it is in the option."""
     await hass.config.async_update(
         internal_url="https://ha.lan.ashald.net:8123", external_url="https://ha.example.com"
     )
     nas = add_device(
         device_registry, owner, "nas", "https://nas.lan.ashald.net:443", name="Synology NAS"
     )
-    add_device(
-        device_registry, owner, "other", "https://router.other.net:8443", name="Other Router"
-    )
+    add_device(device_registry, owner, "cloud", "https://my.example.com/", name="Cloud")
 
-    await setup_hub(hass)
-    # Inherits .lan.ashald.net from internal_url, so nas is offered, but not other.net or ha.example.com
+    hub_entry = await setup_hub(hass)
+    assert offers(hass) == {}
+    assert CONF_LOCAL_DOMAINS not in hub_entry.options
+
+    await set_options(hass, hub_entry, **{CONF_LOCAL_DOMAINS: ".lan.ashald.net"})
     assert set(offers(hass)) == {nas.id}
 
 
@@ -776,6 +781,7 @@ async def test_configured_or_ignored_devices_are_not_offered(
     MockConfigEntry(
         domain=DOMAIN,
         version=2,
+        minor_version=2,
         source=SOURCE_IGNORE,
         unique_id=device_unique_id(ignored.id),
         title="Ignored",

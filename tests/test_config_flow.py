@@ -746,7 +746,10 @@ async def test_import_device_web_ui(hass: HomeAssistant, hub_entry: ConfigEntry)
 
 async def test_hub_options_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> None:
     result = await _start_options(hass, hub_entry, "hub")
-    assert result["description_placeholders"] == {"panel_url": f"/{PANEL_URL_PATH}"}
+    assert result["description_placeholders"] == {
+        "panel_url": f"/{PANEL_URL_PATH}",
+        "own_domain": "",
+    }
     fields = _fields(result["data_schema"])
     assert list(fields) == [
         CONF_DISCOVERY,
@@ -762,6 +765,45 @@ async def test_hub_options_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_PANEL_ICON: DEFAULT_PANEL_ICON,
         CONF_LOCAL_DOMAINS: vol.UNDEFINED,
     }
+
+
+@pytest.mark.parametrize(
+    ("internal_url", "configured", "hint"),
+    [
+        (
+            "https://ha.lan.ashald.net:8123",
+            None,
+            " Home Assistant's own address is in lan.ashald.net: add it if your devices are too.",
+        ),
+        (
+            "http://homeassistant.lan:8123",
+            None,
+            " Home Assistant's own address is in lan: add it if your devices are too.",
+        ),
+        ("https://ha.lan.ashald.net:8123", "lan, .lan.ashald.net", ""),
+        ("http://homeassistant.local:8123", None, ""),
+        ("http://192.168.1.10:8123", None, ""),
+    ],
+)
+async def test_hub_options_form_points_at_own_domain(
+    hass: HomeAssistant,
+    hub_entry: ConfigEntry,
+    internal_url: str,
+    configured: str | None,
+    hint: str,
+) -> None:
+    """The form suggests the domain of Home Assistant's address, but never adds it."""
+    await hass.config.async_update(internal_url=internal_url)
+    if configured is not None:
+        hass.config_entries.async_update_entry(
+            hub_entry, options={**hub_entry.options, CONF_LOCAL_DOMAINS: configured}
+        )
+        await hass.async_block_till_done()
+    result = await _start_options(hass, hub_entry, "hub")
+    assert result["description_placeholders"]["own_domain"] == hint
+    fields = _fields(result["data_schema"])
+    expected = vol.UNDEFINED if configured is None else configured
+    assert _form_value(fields[CONF_LOCAL_DOMAINS]) == expected
 
 
 async def test_hub_options_form_prefills_current_options(
@@ -784,7 +826,12 @@ async def test_hub_options_form_prefills_current_options(
 
 async def test_hub_options_defaults_when_options_missing(hass: HomeAssistant, http: None) -> None:
     entry = MockConfigEntry(
-        domain=DOMAIN, version=2, title=NAME, unique_id=HUB_UNIQUE_ID, data={CONF_KIND: KIND_HUB}
+        domain=DOMAIN,
+        version=2,
+        minor_version=2,
+        title=NAME,
+        unique_id=HUB_UNIQUE_ID,
+        data={CONF_KIND: KIND_HUB},
     )
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -1462,6 +1509,76 @@ async def test_migration_is_idempotent(
     assert all(e.state is ConfigEntryState.LOADED for e in _entries(hass))
     assert _discovery_flows(hass) == []
     assert len(_hub(hass).views) == 2
+
+
+@pytest.mark.parametrize(
+    ("internal_url", "options", "expected", "logged"),
+    [
+        ("https://ha.lan.ashald.net:8123", {}, "lan.ashald.net", logging.INFO),
+        ("http://homeassistant.lan:8123", {}, "lan", logging.INFO),
+        ("https://ha.example.com", {}, "example.com", logging.INFO),
+        # A public top-level domain would make every name in it local
+        ("https://myhouse.net", {}, None, logging.WARNING),
+        ("http://homeassistant.local:8123", {}, None, None),
+        ("http://192.168.1.10:8123", {}, None, None),
+        (None, {}, None, None),
+        # Chosen already: left alone
+        ("https://ha.lan.ashald.net:8123", {CONF_LOCAL_DOMAINS: "iot"}, "iot", None),
+    ],
+)
+async def test_migration_moves_own_domain_to_option(
+    hass: HomeAssistant,
+    http: None,
+    caplog: pytest.LogCaptureFixture,
+    internal_url: str | None,
+    options: dict[str, Any],
+    expected: str | None,
+    logged: int | None,
+) -> None:
+    """0.3.6 no longer treats the domain of Home Assistant's address as local by itself."""
+    await hass.config.async_update(internal_url=internal_url)
+    hub = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        minor_version=1,
+        title=NAME,
+        unique_id=HUB_UNIQUE_ID,
+        data={CONF_KIND: KIND_HUB},
+        options={CONF_DISCOVERY: True, **options},
+    )
+    web_ui = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        minor_version=1,
+        title="Router",
+        data={CONF_KIND: KIND_VIEW},
+        options={CONF_URL: "http://192.168.1.1/", CONF_MODE: MODE_ISOLATED},
+    )
+    web_ui.add_to_hass(hass)
+    caplog.set_level(logging.INFO)
+    # Setting up the integration sets up (and migrates) every entry
+    await _migrate(hass, hub)
+
+    assert (hub.version, hub.minor_version) == (2, 2)
+    assert hub.options.get(CONF_LOCAL_DOMAINS) == expected
+    assert dict(hub.options) == {
+        CONF_DISCOVERY: True,
+        **({CONF_LOCAL_DOMAINS: expected} if expected else {}),
+    }
+    assert (web_ui.version, web_ui.minor_version) == (2, 2)
+    assert dict(web_ui.options) == {CONF_URL: "http://192.168.1.1/", CONF_MODE: MODE_ISOLATED}
+    records = [r for r in caplog.records if "own address" in r.getMessage()]
+    assert [r.levelno for r in records] == ([logged] if logged else [])
+
+
+async def test_migration_from_v1_moves_own_domain_to_option(
+    hass: HomeAssistant, http: None
+) -> None:
+    await hass.config.async_update(internal_url="https://ha.lan.ashald.net:8123")
+    old = _v1_entry()
+    await _migrate(hass, old)
+    assert (old.version, old.minor_version) == (2, 2)
+    assert old.options[CONF_LOCAL_DOMAINS] == "lan.ashald.net"
 
 
 async def test_migration_refuses_newer_versions(hass: HomeAssistant, http: None) -> None:
