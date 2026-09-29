@@ -178,6 +178,17 @@ RESPONSE_HEADERS_DROPPED = frozenset(
         "alt-svc",
         "link",  # preloads/preconnects would resolve against Home Assistant's origin
         "refresh",  # would navigate the Home Assistant page
+        "speculation-rules",  # prefetches and prerenders on Home Assistant's origin
+        # Remembered by the browser for the whole origin
+        "accept-ch",
+        "accept-ch-lifetime",
+        "critical-ch",
+        "activate-storage-access",
+        "origin-trial",
+        "observe-browsing-topics",
+        "attribution-reporting-register-source",
+        "attribution-reporting-register-trigger",
+        "supports-loading-mode",
         # CORS is answered by the proxy itself
         hdrs.ACCESS_CONTROL_ALLOW_ORIGIN,
         hdrs.ACCESS_CONTROL_ALLOW_CREDENTIALS,
