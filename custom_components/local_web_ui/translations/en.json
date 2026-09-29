@@ -18,6 +18,8 @@
           "verify_ssl": "Verify SSL certificate",
           "username": "Username",
           "password": "Password",
+          "token_header": "Send a token",
+          "token": "Token",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -26,8 +28,10 @@
           "mode": "Isolated (recommended) keeps the page away from Home Assistant: it cannot read Home Assistant's data or act as you, while its logins and storage still work. Trusted runs it with Home Assistant's own origin, which a few pages need (for example ones using IndexedDB). A trusted page's scripts get full administrator control of Home Assistant, so only use it for pages you fully trust.",
           "trusted_acknowledged": "Required for trusted mode.",
           "verify_ssl": "Turn off for devices with self-signed certificates.",
-          "username": "Optional. Sent as HTTP Basic or Digest authentication so you are not prompted. Leave empty if using a token in the password field.",
-          "password": "Optional. Sent for Basic or Digest authentication, or as a Bearer token / API key. When editing, leave empty to keep the stored password.",
+          "username": "Optional. Sent as HTTP Basic or Digest authentication, so you are not asked to log in.",
+          "password": "The password for the username. When editing, leave it empty to keep the stored one.",
+          "token_header": "For pages that use an API token or key instead of a login: how it is sent with every request. Choose a listed way or type the name of a header. The browser never sees the token.",
+          "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       },
@@ -39,7 +43,10 @@
     "error": {
       "name_required": "Enter a name.",
       "invalid_url": "Enter an http:// or https:// URL with a host.",
-      "trusted_not_acknowledged": "Trusted mode needs your confirmation."
+      "trusted_not_acknowledged": "Trusted mode needs your confirmation.",
+      "invalid_token_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
+      "token_required": "Enter the token.",
+      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty."
     },
     "abort": {
       "already_configured": "This web UI is already set up.",
@@ -80,6 +87,8 @@
           "verify_ssl": "Verify SSL certificate",
           "username": "Username",
           "password": "Password",
+          "token_header": "Send a token",
+          "token": "Token",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -89,8 +98,10 @@
           "trusted_acknowledged": "Required for trusted mode.",
           "visit_link": "Open this web UI from the device's own \"Visit\" button, or leave that button pointing at the device. The web UI's own device (in this entry) always opens it here.",
           "verify_ssl": "Turn off for devices with self-signed certificates.",
-          "username": "Optional. Sent as HTTP Basic or Digest authentication so you are not prompted. Leave empty if using a token in the password field.",
-          "password": "Optional. Sent for Basic or Digest authentication, or as a Bearer token / API key. When editing, leave empty to keep the stored password.",
+          "username": "Optional. Sent as HTTP Basic or Digest authentication, so you are not asked to log in.",
+          "password": "The password for the username. When editing, leave it empty to keep the stored one.",
+          "token_header": "For pages that use an API token or key instead of a login: how it is sent with every request. Choose a listed way or type the name of a header. The browser never sees the token.",
+          "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       }
@@ -98,7 +109,10 @@
     "error": {
       "name_required": "Enter a name.",
       "invalid_url": "Enter an http:// or https:// URL with a host.",
-      "trusted_not_acknowledged": "Trusted mode needs your confirmation."
+      "trusted_not_acknowledged": "Trusted mode needs your confirmation.",
+      "invalid_token_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
+      "token_required": "Enter the token.",
+      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty."
     }
   },
   "selector": {
@@ -113,6 +127,13 @@
         "default": "As set in the Local Web UIs options",
         "here": "Open the web UI here",
         "device": "Open the device directly"
+      }
+    },
+    "token_header": {
+      "options": {
+        "none": "No token",
+        "bearer": "In the Authorization header, as a Bearer token",
+        "x-api-key": "In the X-Api-Key header"
       }
     }
   }

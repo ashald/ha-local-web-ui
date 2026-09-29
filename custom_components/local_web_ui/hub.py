@@ -45,6 +45,8 @@ from .const import (
     CONF_PASSWORD,
     CONF_PREVIOUS_VIEW_ID,
     CONF_SHOW_IN_SIDEBAR,
+    CONF_TOKEN,
+    CONF_TOKEN_HEADER,
     CONF_URL,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
@@ -71,6 +73,9 @@ from .const import (
     STORAGE_KEY_JAR,
     STORAGE_VERSION,
     STORAGE_WRITE_WAIT,
+    TOKEN_BEARER,
+    TOKEN_NONE,
+    TOKEN_X_API_KEY,
     VISIT_DEFAULT,
     VISIT_HERE,
 )
@@ -99,6 +104,8 @@ class View:
     subtitle: str
     username: str | None = None
     password: str | None = None
+    # (header name, value) of a stored token sent in a header other than Authorization
+    token_header: tuple[str, str] | None = None
 
     @property
     def url(self) -> str:
@@ -682,8 +689,12 @@ class LocalWebUiHub:
             authorization = None
             if username:
                 authorization = basic_authorization(username, password or "")
-            elif password:
-                authorization = f"Bearer {password}"
+            token_header = None
+            if token := options.get(CONF_TOKEN):
+                if (how := options.get(CONF_TOKEN_HEADER, TOKEN_BEARER)) == TOKEN_BEARER:
+                    authorization = f"Bearer {token}"
+                elif how != TOKEN_NONE:
+                    token_header = ("X-Api-Key" if how == TOKEN_X_API_KEY else how, token)
             views[entry.entry_id] = View(
                 view_id=entry.entry_id,
                 name=entry.title,
@@ -700,6 +711,7 @@ class LocalWebUiHub:
                 subtitle=subtitle or url.host or "",
                 username=username,
                 password=password,
+                token_header=token_header,
             )
         return views
 

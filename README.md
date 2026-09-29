@@ -27,7 +27,8 @@ You don't need to open ports or change any firmware.
 - **Your own sites.** Add any page your Home Assistant server can reach under
   *Settings → Devices & services → Local Web UIs → Add entry*. For each one you can set:
   - a name, URL and icon;
-  - a stored login, sent as HTTP Basic auth so you are never prompted;
+  - a stored login, sent as HTTP Basic or Digest auth so you are never prompted;
+  - an API token, sent as a Bearer token, in `X-Api-Key`, or in a header you name;
   - whether to verify the SSL certificate;
   - its own sidebar entry.
 - **Linked devices.** Each device web UI has a device of its own, "*device* web UI". Home
@@ -119,10 +120,9 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the details.
   root-relative `import "/…"` statements in JavaScript modules. A page that relies on them may
   not load. The same goes for a page that builds URLs from `location.origin` while isolated,
   because an isolated page's origin is `null`. Trusted mode usually fixes the second case.
-- **No browser login prompts.** For HTTP Basic auth, store the login in the web UI's
-  settings (its entry's *Configure* button). The browser's own prompt is not used,
-  and credentials the browser holds are never sent to devices. HTTP Digest auth is not
-  supported.
+- **No browser login prompts.** For HTTP Basic or Digest auth, store the login in the web
+  UI's settings (its entry's *Configure* button). The browser's own prompt is not used,
+  and credentials the browser holds are never sent to devices.
 - **Home Assistant's request filter.** Home Assistant rejects URLs that look like attacks
   (`../`, `<script>`, SQL keywords) before they reach the proxy, and logs them, including
   the session path. A few router diagnostic pages can run into this.

@@ -55,6 +55,8 @@ from custom_components.local_web_ui.const import (
     CONF_PREVIOUS_VIEW_ID,
     CONF_SHOW_IN_SIDEBAR,
     CONF_SHOW_PANEL,
+    CONF_TOKEN,
+    CONF_TOKEN_HEADER,
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
@@ -77,6 +79,9 @@ from custom_components.local_web_ui.const import (
     STORAGE_KEY,
     STORAGE_KEY_JAR,
     SUBENTRY_TYPE_VIEW,
+    TOKEN_BEARER,
+    TOKEN_NONE,
+    TOKEN_X_API_KEY,
     VISIT_CHOICES,
     VISIT_DEFAULT,
     VISIT_DEVICE,
@@ -380,6 +385,8 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_VERIFY_SSL,
         CONF_USERNAME,
         CONF_PASSWORD,
+        CONF_TOKEN_HEADER,
+        CONF_TOKEN,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -388,6 +395,7 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_MODE: MODE_ISOLATED,
         CONF_TRUSTED_ACK: False,
         CONF_VERIFY_SSL: True,
+        CONF_TOKEN_HEADER: TOKEN_NONE,
         CONF_SHOW_IN_SIDEBAR: False,
     }
     assert isinstance(fields[CONF_NAME], vol.Required)
@@ -911,6 +919,8 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_VERIFY_SSL,
         CONF_USERNAME,
         CONF_PASSWORD,
+        CONF_TOKEN_HEADER,
+        CONF_TOKEN,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -923,6 +933,8 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_USERNAME: "admin",
         # The stored password is never sent to the browser
         CONF_PASSWORD: vol.UNDEFINED,
+        CONF_TOKEN_HEADER: TOKEN_NONE,
+        CONF_TOKEN: vol.UNDEFINED,
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: "mdi:router",
     }
@@ -940,6 +952,8 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_VERIFY_SSL,
         CONF_USERNAME,
         CONF_PASSWORD,
+        CONF_TOKEN_HEADER,
+        CONF_TOKEN,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -950,6 +964,8 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_VERIFY_SSL: False,
         CONF_USERNAME: vol.UNDEFINED,
         CONF_PASSWORD: vol.UNDEFINED,
+        CONF_TOKEN_HEADER: TOKEN_NONE,
+        CONF_TOKEN: vol.UNDEFINED,
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: vol.UNDEFINED,
     }
@@ -1126,6 +1142,144 @@ async def test_options_new_password_replaces_stored_one(
     entry = await _add_router(hass, **{CONF_USERNAME: "admin", CONF_PASSWORD: "hunter2"})
     await _set_options(hass, entry, VIEW_INPUT | {CONF_USERNAME: "root", CONF_PASSWORD: "new"})
     assert (entry.options[CONF_USERNAME], entry.options[CONF_PASSWORD]) == ("root", "new")
+
+
+@pytest.mark.parametrize(
+    ("changes", "stored", "authorization", "token_header"),
+    [
+        ({}, {}, None, None),
+        (
+            {CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t0k"},
+            {CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t0k"},
+            "Bearer t0k",
+            None,
+        ),
+        (
+            {CONF_TOKEN_HEADER: TOKEN_X_API_KEY, CONF_TOKEN: "t0k"},
+            {CONF_TOKEN_HEADER: TOKEN_X_API_KEY, CONF_TOKEN: "t0k"},
+            None,
+            ("X-Api-Key", "t0k"),
+        ),
+        # A listed choice typed by hand is that choice
+        (
+            {CONF_TOKEN_HEADER: " X-API-Key ", CONF_TOKEN: "t0k"},
+            {CONF_TOKEN_HEADER: TOKEN_X_API_KEY, CONF_TOKEN: "t0k"},
+            None,
+            ("X-Api-Key", "t0k"),
+        ),
+        (
+            {CONF_TOKEN_HEADER: "X-Auth-Token", CONF_TOKEN: "t0k"},
+            {CONF_TOKEN_HEADER: "X-Auth-Token", CONF_TOKEN: "t0k"},
+            None,
+            ("X-Auth-Token", "t0k"),
+        ),
+        # A token alongside a login, in a header of its own
+        (
+            {
+                CONF_USERNAME: "admin",
+                CONF_PASSWORD: "pw",
+                CONF_TOKEN_HEADER: TOKEN_X_API_KEY,
+                CONF_TOKEN: "t0k",
+            },
+            {
+                CONF_USERNAME: "admin",
+                CONF_PASSWORD: "pw",
+                CONF_TOKEN_HEADER: TOKEN_X_API_KEY,
+                CONF_TOKEN: "t0k",
+            },
+            basic_authorization("admin", "pw"),
+            ("X-Api-Key", "t0k"),
+        ),
+        # No token: a token typed anyway is not stored
+        ({CONF_TOKEN_HEADER: TOKEN_NONE, CONF_TOKEN: "t0k"}, {}, None, None),
+        # A password alone is not a token (it was, unusably, before 0.3.8)
+        ({CONF_PASSWORD: "pw"}, {}, None, None),
+    ],
+)
+async def test_web_ui_token(
+    hass: HomeAssistant,
+    hub_entry: ConfigEntry,
+    changes: dict[str, Any],
+    stored: dict[str, Any],
+    authorization: str | None,
+    token_header: tuple[str, str] | None,
+) -> None:
+    entry = await _add_router(hass, **changes)
+    keys = (CONF_USERNAME, CONF_PASSWORD, CONF_TOKEN_HEADER, CONF_TOKEN)
+    assert {k: v for k, v in entry.options.items() if k in keys} == stored
+    view = _hub(hass).views[entry.entry_id]
+    assert view.authorization == authorization
+    assert view.token_header == token_header
+
+
+@pytest.mark.parametrize(
+    ("changes", "errors"),
+    [
+        ({CONF_TOKEN_HEADER: TOKEN_BEARER}, {CONF_TOKEN: "token_required"}),
+        ({CONF_TOKEN_HEADER: "X-Auth-Token", CONF_TOKEN: ""}, {CONF_TOKEN: "token_required"}),
+        (
+            {CONF_TOKEN_HEADER: "Bad Header", CONF_TOKEN: "t"},
+            {CONF_TOKEN_HEADER: "invalid_token_header"},
+        ),
+        (
+            {CONF_TOKEN_HEADER: "X-Key:", CONF_TOKEN: "t"},
+            {CONF_TOKEN_HEADER: "invalid_token_header"},
+        ),
+        *(
+            (
+                {CONF_TOKEN_HEADER: name, CONF_TOKEN: "t"},
+                {CONF_TOKEN_HEADER: "invalid_token_header"},
+            )
+            for name in ("Host", "cookie", "Origin", "X-Forwarded-For", "X-Ingress-Path")
+        ),
+        # The login is already in the Authorization header
+        (
+            {CONF_USERNAME: "admin", CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t"},
+            {CONF_TOKEN_HEADER: "token_conflicts_with_login"},
+        ),
+        (
+            {CONF_USERNAME: "admin", CONF_TOKEN_HEADER: "Authorization", CONF_TOKEN: "t"},
+            {CONF_TOKEN_HEADER: "token_conflicts_with_login"},
+        ),
+    ],
+)
+async def test_web_ui_token_errors(
+    hass: HomeAssistant, hub_entry: ConfigEntry, changes: dict[str, Any], errors: dict[str, str]
+) -> None:
+    result, entry = await _add_web_ui(hass, VIEW_INPUT | changes)
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == errors
+    assert entry is None
+    # The token is never shown back
+    fields = _fields(result["data_schema"])
+    assert _form_value(fields[CONF_TOKEN]) is vol.UNDEFINED
+
+
+@pytest.mark.parametrize("token_input", [{}, {CONF_TOKEN: ""}])
+async def test_options_empty_token_keeps_stored_one(
+    hass: HomeAssistant, hub_entry: ConfigEntry, token_input: dict[str, Any]
+) -> None:
+    entry = await _add_router(hass, **{CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t0k"})
+    result = await _start_options(hass, entry, "web_ui")
+    fields = _fields(result["data_schema"])
+    assert _form_value(fields[CONF_TOKEN_HEADER]) == TOKEN_BEARER
+    assert _form_value(fields[CONF_TOKEN]) is vol.UNDEFINED
+    await _set_options(hass, entry, VIEW_INPUT | {CONF_TOKEN_HEADER: TOKEN_X_API_KEY} | token_input)
+    assert (entry.options[CONF_TOKEN_HEADER], entry.options[CONF_TOKEN]) == (
+        TOKEN_X_API_KEY,
+        "t0k",
+    )
+    assert _hub(hass).views[entry.entry_id].token_header == ("X-Api-Key", "t0k")
+
+
+async def test_options_no_token_removes_stored_one(
+    hass: HomeAssistant, hub_entry: ConfigEntry
+) -> None:
+    entry = await _add_router(hass, **{CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t0k"})
+    await _set_options(hass, entry, VIEW_INPUT | {CONF_TOKEN_HEADER: TOKEN_NONE})
+    assert CONF_TOKEN not in entry.options
+    assert CONF_TOKEN_HEADER not in entry.options
+    assert _hub(hass).views[entry.entry_id].authorization is None
 
 
 async def test_options_credentials_in_url_replace_stored_ones(
@@ -1888,7 +2042,14 @@ def test_translations_cover_config_flow(filename: str) -> None:
     web_ui = config["step"]["web_ui"]
     assert _web_ui_fields(manual=True) <= set(web_ui["data"])
     assert set(web_ui.get("data_description", {})) <= set(web_ui["data"])
-    assert {"name_required", "invalid_url", "trusted_not_acknowledged"} <= set(config["error"])
+    assert {
+        "name_required",
+        "invalid_url",
+        "trusted_not_acknowledged",
+        "invalid_token_header",
+        "token_required",
+        "token_conflicts_with_login",
+    } <= set(config["error"])
 
 
 @pytest.mark.parametrize("filename", ["strings.json", "translations/en.json"])
@@ -1914,7 +2075,14 @@ def test_translations_cover_options_flows(filename: str) -> None:
     assert set(web_ui["data"]) == form_fields
     assert set(web_ui.get("data_description", {})) <= form_fields
     assert CONF_VISIT_LINK in web_ui["data_description"]
-    assert set(options["error"]) == {"name_required", "invalid_url", "trusted_not_acknowledged"}
+    assert set(options["error"]) == {
+        "name_required",
+        "invalid_url",
+        "trusted_not_acknowledged",
+        "invalid_token_header",
+        "token_required",
+        "token_conflicts_with_login",
+    }
 
 
 @pytest.mark.parametrize("filename", ["strings.json", "translations/en.json"])

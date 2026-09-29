@@ -430,8 +430,9 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
         headers[hdrs.AUTHORIZATION] = digest_auth
     elif ctx.view.authorization is not None:
         headers[hdrs.AUTHORIZATION] = ctx.view.authorization
-    if ctx.view.password and not ctx.view.username:
-        headers.setdefault("X-Api-Key", ctx.view.password)
+    if ctx.view.token_header is not None:
+        name, value = ctx.view.token_header
+        headers[name] = value
     # Same header Supervisor ingress uses, so UIs built for ingress can adapt links
     headers["X-Ingress-Path"] = ctx.prefix
     # Validated by Home Assistant's forwarded middleware against trusted_proxies

@@ -54,6 +54,8 @@ from custom_components.local_web_ui.const import (
     CONF_MODE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
+    CONF_TOKEN,
+    CONF_TOKEN_HEADER,
     CONF_URL,
     CONF_USERNAME,
     CONF_VERIFY_SSL,
@@ -397,6 +399,8 @@ async def build_home(
             CONF_ICON: "mdi:router-wireless",
             CONF_USERNAME: "rootuser",
             CONF_PASSWORD: "hunter2",
+            CONF_TOKEN_HEADER: "X-Auth-Token",
+            CONF_TOKEN: "tok3n-secret",
         },
     )
     printer_entry = device_entry(PRINTER_VIEW_ID, "Office printer", printer)
@@ -1220,6 +1224,7 @@ async def test_diagnostics_manual_web_ui_redacts_credentials_and_query(
     dumped = json.dumps(diagnostics)
     assert "hunter2" not in dumped
     assert "rootuser" not in dumped
+    assert "tok3n-secret" not in dumped
     assert "tab=wifi" not in dumped
     redacted_url = ROUTER_URL.partition("?")[0] + "?**REDACTED**"
     assert diagnostics["data"] == {CONF_KIND: KIND_VIEW}
@@ -1231,6 +1236,8 @@ async def test_diagnostics_manual_web_ui_redacts_credentials_and_query(
         CONF_ICON: "mdi:router-wireless",
         CONF_USERNAME: "**REDACTED**",
         CONF_PASSWORD: "**REDACTED**",
+        CONF_TOKEN_HEADER: "X-Auth-Token",
+        CONF_TOKEN: "**REDACTED**",
     }
     view = diagnostics["view"]
     assert view["url"] == redacted_url

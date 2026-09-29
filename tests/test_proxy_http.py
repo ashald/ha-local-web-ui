@@ -57,6 +57,8 @@ from custom_components.local_web_ui.const import (
     CONF_MODE,
     CONF_PASSWORD,
     CONF_SHOW_IN_SIDEBAR,
+    CONF_TOKEN,
+    CONF_TOKEN_HEADER,
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
@@ -74,6 +76,8 @@ from custom_components.local_web_ui.const import (
     SESSION_MAX_AGE,
     SESSION_TTL,
     STORAGE_KEY_JAR,
+    TOKEN_BEARER,
+    TOKEN_X_API_KEY,
 )
 from custom_components.local_web_ui.hub import (
     DigestChallenge,
@@ -433,9 +437,12 @@ class Upstream:
                 },
             )
         if path == "/token-auth":
-            auth = request.headers.get(hdrs.AUTHORIZATION, "")
-            api_key = request.headers.get("X-Api-Key", "")
-            return web.Response(text=f"auth={auth} key={api_key}")
+            return web.json_response(
+                {
+                    name: request.headers.get(name, "")
+                    for name in (hdrs.AUTHORIZATION, "X-Api-Key", "X-Auth-Token")
+                }
+            )
         return web.Response(text=f"echo {request.method} {request.raw_path}")
 
 
@@ -598,7 +605,7 @@ async def env(
             TOKEN,
             "Site with token",
             f"{upstream.origin}/",
-            **{CONF_PASSWORD: "token12345"},
+            **{CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "token12345"},
         ),
         _web_ui(DOWN, "Unplugged", f"http://127.0.0.1:{_free_port()}/"),
     ]
@@ -2318,10 +2325,45 @@ async def test_digest_stale_nonce_recovery(env: Env) -> None:
     assert await response.text() == "stale recovered"
 
 
-async def test_token_only_auth(env: Env) -> None:
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (
+            {CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "token12345"},
+            {hdrs.AUTHORIZATION: "Bearer token12345", "X-Api-Key": "", "X-Auth-Token": ""},
+        ),
+        (
+            {CONF_TOKEN_HEADER: TOKEN_X_API_KEY, CONF_TOKEN: "token12345"},
+            {hdrs.AUTHORIZATION: "", "X-Api-Key": "token12345", "X-Auth-Token": ""},
+        ),
+        (
+            {CONF_TOKEN_HEADER: "X-Auth-Token", CONF_TOKEN: "token12345"},
+            {hdrs.AUTHORIZATION: "", "X-Api-Key": "", "X-Auth-Token": "token12345"},
+        ),
+        # A password without a username sends nothing
+        (
+            {CONF_PASSWORD: "token12345"},
+            {hdrs.AUTHORIZATION: "", "X-Api-Key": "", "X-Auth-Token": ""},
+        ),
+    ],
+)
+async def test_token_sent_to_its_web_ui_only(
+    env: Env, options: dict[str, Any], expected: dict[str, str]
+) -> None:
+    entry = env.web_uis[TOKEN]
+    env.hass.config_entries.async_update_entry(
+        entry, options={CONF_URL: entry.options[CONF_URL], **options}
+    )
+    await env.hass.async_block_till_done()
     prefix = await env.prefix(TOKEN)
     response = await env.client.get(prefix + "/token-auth")
     assert response.status == 200
-    text = await response.text()
-    assert "auth=Bearer token12345" in text
-    assert "key=token12345" in text
+    assert await response.json() == expected
+    # A page cannot replace the token with a value of its own
+    if (header := options.get(CONF_TOKEN_HEADER)) not in (None, TOKEN_BEARER):
+        name = "X-Api-Key" if header == TOKEN_X_API_KEY else header
+        response = await env.client.get(prefix + "/token-auth", headers={name: "from-page"})
+        assert (await response.json())[name] == "token12345"
+    # Another web UI gets none of it
+    other = await env.client.get(await env.prefix(ISO) + "/token-auth")
+    assert await other.json() == {hdrs.AUTHORIZATION: "", "X-Api-Key": "", "X-Auth-Token": ""}

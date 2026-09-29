@@ -31,6 +31,13 @@ CONF_MODE: Final = "mode"
 CONF_VERIFY_SSL: Final = "verify_ssl"
 CONF_USERNAME: Final = "username"
 CONF_PASSWORD: Final = "password"
+CONF_TOKEN: Final = "token"
+CONF_TOKEN_HEADER: Final = "token_header"
+# How a token is sent: one of these, or the name of a header of its own
+TOKEN_NONE: Final = "none"
+TOKEN_BEARER: Final = "bearer"
+TOKEN_X_API_KEY: Final = "x-api-key"
+TOKEN_CHOICES: Final = (TOKEN_NONE, TOKEN_BEARER, TOKEN_X_API_KEY)
 CONF_SHOW_IN_SIDEBAR: Final = "show_in_sidebar"
 CONF_ICON: Final = "icon"
 CONF_DEVICE_ID: Final = "device_id"

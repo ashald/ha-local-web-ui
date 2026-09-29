@@ -123,8 +123,11 @@ becomes the hub.
   headers of authenticating proxies (`Remote-*`, `X-Forwarded-*`, `X-Auth-Request-*`,
   `Cf-Access-*`, authentik, AWS ALB OIDC, Azure App Service, Google IAP, Pomerium,
   Tailscale, mod_auth_openidc…) are dropped.
-  Site cookies come from the server-side jar and site logins from the view's settings
-  (sent as Basic auth).
+  Site cookies come from the server-side jar and site logins from the view's settings:
+  Basic auth, or Digest once the device asks for it. A stored API token is sent as a
+  Bearer token, in `X-Api-Key`, or in a header the user names (never one the proxy sets
+  itself, such as `Host`, `Cookie`, `Origin` or `X-Forwarded-*`); it replaces a value the
+  page sent in that header.
 - Client-sent `Forwarded`/`X-Forwarded-*`/`X-Real-IP` are dropped and replaced with HA's
   own view of the request. `X-Ingress-Path` is set to the prefix, as Supervisor ingress
   does.

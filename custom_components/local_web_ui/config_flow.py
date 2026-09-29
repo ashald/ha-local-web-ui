@@ -6,6 +6,8 @@ by URL, and devices with a local web page are offered through discovery.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import re
 from typing import Any
 
 from homeassistant.config_entries import (
@@ -41,6 +43,8 @@ from .const import (
     CONF_PREVIOUS_VIEW_ID,
     CONF_SHOW_IN_SIDEBAR,
     CONF_SHOW_PANEL,
+    CONF_TOKEN,
+    CONF_TOKEN_HEADER,
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
@@ -60,6 +64,9 @@ from .const import (
     MODES,
     NAME,
     PANEL_URL_PATH,
+    TOKEN_BEARER,
+    TOKEN_CHOICES,
+    TOKEN_NONE,
     VISIT_CHOICES,
     VISIT_DEFAULT,
 )
@@ -107,7 +114,7 @@ class LocalWebUiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_web_ui(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """A web UI added by URL: any page Home Assistant can reach."""
         errors: dict[str, str] = {}
-        if user_input is not None and not (errors := _validate(user_input, manual=True)):
+        if user_input is not None and not (errors := _validate(user_input, {}, manual=True)):
             return self.async_create_entry(
                 title=user_input[CONF_NAME].strip(),
                 data={CONF_KIND: KIND_VIEW},
@@ -117,7 +124,7 @@ class LocalWebUiConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="web_ui",
             data_schema=self.add_suggested_values_to_schema(
                 _view_schema(manual=True, device=False),
-                {k: v for k, v in (user_input or {}).items() if k != CONF_PASSWORD},
+                {k: v for k, v in (user_input or {}).items() if k not in SECRETS},
             ),
             errors=errors,
         )
@@ -229,6 +236,36 @@ def _own_domain_hint(hass: HomeAssistant, configured: Any) -> str:
     return f" Home Assistant's own address is in {domain}: add it if your devices are too."
 
 
+# Never shown back in a form
+SECRETS = frozenset({CONF_PASSWORD, CONF_TOKEN})
+# RFC 9110 field name
+HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+# Headers the proxy sets or controls itself, or that would change what the request is
+RESERVED_TOKEN_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "content-type",
+        "cookie",
+        "forwarded",
+        "host",
+        "keep-alive",
+        "origin",
+        "proxy-authorization",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-ingress-path",
+        "x-real-ip",
+    }
+)
+
+
 class WebUiOptionsFlow(OptionsFlow):
     """Settings of one web UI."""
 
@@ -239,17 +276,19 @@ class WebUiOptionsFlow(OptionsFlow):
         entry = self.config_entry
         manual = not entry.data.get(CONF_DEVICE_ID)
         errors: dict[str, str] = {}
-        if user_input is not None and not (errors := _validate(user_input, manual=manual)):
+        if user_input is not None and not (
+            errors := _validate(user_input, entry.options, manual=manual)
+        ):
             # A web UI added by URL is renamed here too; others with HA's own rename
             if manual and (name := user_input[CONF_NAME].strip()) != entry.title:
                 self.hass.config_entries.async_update_entry(entry, title=name)
             return self.async_create_entry(
                 data=_view_options(user_input, dict(entry.options), manual=manual)
             )
-        current: dict[str, Any] = {k: v for k, v in entry.options.items() if k != CONF_PASSWORD}
+        current: dict[str, Any] = {k: v for k, v in entry.options.items() if k not in SECRETS}
         if manual:
             current[CONF_NAME] = entry.title
-        typed = {k: v for k, v in (user_input or {}).items() if k != CONF_PASSWORD}
+        typed = {k: v for k, v in (user_input or {}).items() if k not in SECRETS}
         return self.async_show_form(
             step_id="web_ui",
             data_schema=self.add_suggested_values_to_schema(
@@ -285,13 +324,44 @@ def _view_schema(manual: bool, device: bool) -> vol.Schema:
     schema[vol.Optional(CONF_PASSWORD)] = TextSelector(
         TextSelectorConfig(type=TextSelectorType.PASSWORD, autocomplete="off")
     )
+    schema[vol.Required(CONF_TOKEN_HEADER, default=TOKEN_NONE)] = SelectSelector(
+        SelectSelectorConfig(
+            options=list(TOKEN_CHOICES),
+            mode=SelectSelectorMode.DROPDOWN,
+            custom_value=True,
+            translation_key=CONF_TOKEN_HEADER,
+        )
+    )
+    # When editing, an empty token keeps the stored one
+    schema[vol.Optional(CONF_TOKEN)] = TextSelector(
+        TextSelectorConfig(type=TextSelectorType.PASSWORD, autocomplete="off")
+    )
     schema[vol.Required(CONF_SHOW_IN_SIDEBAR, default=False)] = BooleanSelector()
     schema[vol.Optional(CONF_ICON)] = IconSelector()
     return vol.Schema(schema)
 
 
-def _validate(user_input: dict[str, Any], manual: bool) -> dict[str, str]:
+def _token_header(user_input: dict[str, Any]) -> str:
+    """How the token is sent: a TOKEN_ choice, or a header name of its own."""
+    how = (user_input.get(CONF_TOKEN_HEADER) or TOKEN_NONE).strip()
+    return how.lower() if how.lower() in TOKEN_CHOICES else how
+
+
+def _validate(
+    user_input: dict[str, Any], previous: Mapping[str, Any], manual: bool
+) -> dict[str, str]:
     errors: dict[str, str] = {}
+    if (how := _token_header(user_input)) != TOKEN_NONE:
+        if how not in TOKEN_CHOICES and (
+            not HEADER_NAME.fullmatch(how) or how.lower() in RESERVED_TOKEN_HEADERS
+        ):
+            errors[CONF_TOKEN_HEADER] = "invalid_token_header"
+        elif not user_input.get(CONF_TOKEN) and not previous.get(CONF_TOKEN):
+            errors[CONF_TOKEN] = "token_required"
+        elif (user_input.get(CONF_USERNAME) or "").strip() and (
+            how == TOKEN_BEARER or how.lower() == "authorization"
+        ):
+            errors[CONF_TOKEN_HEADER] = "token_conflicts_with_login"
     if manual:
         if not user_input.get(CONF_NAME, "").strip():
             errors[CONF_NAME] = "name_required"
@@ -328,6 +398,9 @@ def _view_options(
         options[CONF_USERNAME] = username
         if password:
             options[CONF_PASSWORD] = password
+    if (how := _token_header(user_input)) != TOKEN_NONE:
+        options[CONF_TOKEN_HEADER] = how
+        options[CONF_TOKEN] = user_input.get(CONF_TOKEN) or previous[CONF_TOKEN]
     if user_input.get(CONF_ICON):
         options[CONF_ICON] = user_input[CONF_ICON]
     return options

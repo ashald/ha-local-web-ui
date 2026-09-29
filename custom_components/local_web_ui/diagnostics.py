@@ -8,9 +8,9 @@ from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import LocalWebUiConfigEntry
-from .const import CONF_KIND, CONF_PASSWORD, CONF_URL, CONF_USERNAME, KIND_HUB
+from .const import CONF_KIND, CONF_PASSWORD, CONF_TOKEN, CONF_URL, CONF_USERNAME, KIND_HUB
 
-TO_REDACT = {CONF_PASSWORD, CONF_USERNAME}
+TO_REDACT = {CONF_PASSWORD, CONF_TOKEN, CONF_USERNAME}
 
 
 def _redact_query(url: str | None) -> str | None:
