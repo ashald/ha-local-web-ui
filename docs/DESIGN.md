@@ -178,6 +178,9 @@ becomes the hub.
 - The script keeps URLs that the page builds at runtime under the prefix: `fetch`, XHR,
   `EventSource`, `WebSocket`, `history.pushState`/`replaceState`, `window.open`, `src`/`href`/
   `action` set through `setAttribute` or properties, and link clicks and form submits.
+- `EventSource` and `WebSocket` are wrapped in a `Proxy` with a `construct` trap, not a
+  subclass, so their objects keep the native prototype: noVNC, for one, rejects a socket
+  whose prototype lacks its own `send`.
 - It unprefixes `getAttribute` / `getAttributeNS` on link attributes (`href`, `src`, `action`,
   etc.) and `pathname` on `<a>` / `<area>` elements, so client-side routers, frameworks and
   scripts querying the DOM observe the author's original root-relative paths while browser

@@ -143,9 +143,21 @@ const apis = await frame.evaluate(async () => ({
   indexedDB: typeof indexedDB,
   serviceWorker: "serviceWorker" in navigator,
   credentialed: (await fetch("api/whoami", { credentials: "include" })).status,
+  // noVNC refuses a socket whose prototype lacks its own "send" (a subclass's)
+  nativeSockets: (() => {
+    const ws = new WebSocket(new URL("ws", location.href).href.replace(/^http/, "ws"));
+    const es = new EventSource("events");
+    const own = (s, prop) => Object.getOwnPropertyNames(Object.getPrototypeOf(s)).includes(prop);
+    const ok = own(ws, "send") && own(es, "close") && ws instanceof WebSocket
+      && ws.url.includes("/api/local_web_ui/");
+    ws.close();
+    es.close();
+    return ok;
+  })(),
 }));
 check("Isolated: throwing APIs removed, credentialed fetch works",
       apis.indexedDB === "undefined" && !apis.serviceWorker && apis.credentialed === 200, JSON.stringify(apis));
+check("Rewritten WebSocket and EventSource are native objects", apis.nativeSockets === true);
 
 // 3) Standalone: open in a new tab (full page, no HA chrome), still isolated
 const session = await ws(page, { type: "local_web_ui/session", view_id: router.view_id });

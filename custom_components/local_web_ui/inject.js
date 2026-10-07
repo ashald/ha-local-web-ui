@@ -108,23 +108,18 @@ function (cfg) {
       args[1] = rewrite(args[1]);
       return open.apply(this, args);
     };
-    if (window.EventSource) {
-      var NativeEventSource = window.EventSource;
-      window.EventSource = class extends NativeEventSource {
-        constructor(url, options) {
-          super(rewrite(url), options);
-        }
-      };
+    // A Proxy rather than a subclass: instances keep the native prototype, which
+    // pages check (noVNC refuses a socket whose prototype lacks its own "send")
+    function rewriteConstructor(Native) {
+      return new Proxy(Native, {
+        construct: function (target, args, newTarget) {
+          if (args.length) args[0] = rewrite(args[0]);
+          return Reflect.construct(target, args, newTarget);
+        },
+      });
     }
-    if (window.WebSocket) {
-      var NativeWebSocket = window.WebSocket;
-      window.WebSocket = class extends NativeWebSocket {
-        constructor(url, protocols) {
-          if (protocols === undefined) super(rewrite(url));
-          else super(rewrite(url), protocols);
-        }
-      };
-    }
+    if (window.EventSource) window.EventSource = rewriteConstructor(window.EventSource);
+    if (window.WebSocket) window.WebSocket = rewriteConstructor(window.WebSocket);
     ["pushState", "replaceState"].forEach(function (name) {
       var original = history[name];
       history[name] = function (state, title, url) {
