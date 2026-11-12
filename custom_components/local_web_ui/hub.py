@@ -844,9 +844,13 @@ class LocalWebUiHub:
             if entry.unique_id
         }
         # One offer per URL: since 2026.8 a device known to several integrations is
-        # one device per integration, each with the same link
+        # one device per integration, each with the same link. A device offered
+        # before keeps its claim, so a change to another device with the same link
+        # does not offer that one too.
         urls = {view.url for view in self._views.values()}
-        devices = [only] if only is not None else iter_devices(dr.async_get(self.hass))
+        devices = sorted(
+            iter_devices(dr.async_get(self.hass)), key=lambda device: device.id not in self._offered
+        )
         for device in devices:
             if (
                 device.disabled
@@ -858,7 +862,11 @@ class LocalWebUiHub:
             if candidate.url in urls:
                 continue
             urls.add(candidate.url)
-            if device_unique_id(device.id) in known or device.id in self._offered:
+            if (
+                (only is not None and device.id != only.id)
+                or device_unique_id(device.id) in known
+                or device.id in self._offered
+            ):
                 continue
             self._offered.add(device.id)
             discovery_flow.async_create_flow(

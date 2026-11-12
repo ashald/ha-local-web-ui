@@ -753,6 +753,12 @@ async def test_one_offer_per_url(
     assert admin.id in pending
     assert len({first.id, second.id} & set(pending)) == 1
 
+    # A change to the device not offered does not offer it too
+    [unoffered] = {first.id, second.id} - set(pending)
+    device_registry.async_update_device(unoffered, name_by_user="Porch")
+    await hass.async_block_till_done()
+    assert offers(hass) == pending
+
 
 @pytest.mark.usefixtures("http")
 async def test_url_used_by_a_web_ui_is_not_offered(

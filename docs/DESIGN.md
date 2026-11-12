@@ -42,7 +42,7 @@ Web UIs come from two sources:
   it shows under *Discovered* with **Add** and **Ignore**; ignoring is HA's own
   `SOURCE_IGNORE` entry. There is one offer per URL: since 2026.8 a device known to several
   integrations is one device per integration, each with the same link, so only the first is
-  offered. Child devices (2026.9) are ignored; they share their parent's link. Turning
+  offered; a device offered before keeps its claim to the URL when the others change. Child devices (2026.9) are ignored; they share their parent's link. Turning
   discovery off aborts pending offers, and so does a device losing its local link (changed,
   disabled or removed); it is offered again if it gets one back. The URL follows the
   device's current link, so a device that moves to a new address keeps working.
