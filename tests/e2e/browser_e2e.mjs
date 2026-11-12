@@ -141,6 +141,24 @@ for (let round = 1; round <= 3; round++) {
 }
 const apis = await frame.evaluate(async () => ({
   indexedDB: typeof indexedDB,
+  idb: await new Promise((res) => {
+    const open = indexedDB.open("e2e", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("s");
+    open.onerror = () => res(`error ${open.error}`);
+    open.onsuccess = () => {
+      const tx = open.result.transaction("s", "readwrite");
+      tx.objectStore("s").put("v", "k");
+      tx.oncomplete = () => res(open.result instanceof IDBDatabase ? "ok" : "not an IDBDatabase");
+    };
+  }),
+  // Posted before the worker's script has run: must not be lost
+  workers: await Promise.all(["static/worker.js", "static/worker.mjs"].map((url) => new Promise((res) => {
+    const w = new Worker(url, url.endsWith(".mjs") ? { type: "module" } : {});
+    w.onmessage = (e) => { res(e.data); w.terminate(); };
+    w.onerror = (e) => res({ error: e.message || "error" });
+    w.postMessage("ping");
+    setTimeout(() => res({ error: "timeout" }), 8000);
+  }))),
   serviceWorker: "serviceWorker" in navigator,
   credentialed: (await fetch("api/whoami", { credentials: "include" })).status,
   // noVNC refuses a socket whose prototype lacks its own "send" (a subclass's)
@@ -155,8 +173,14 @@ const apis = await frame.evaluate(async () => ({
     return ok;
   })(),
 }));
-check("Isolated: throwing APIs removed, credentialed fetch works",
-      apis.indexedDB === "undefined" && !apis.serviceWorker && apis.credentialed === 200, JSON.stringify(apis));
+check("Isolated: in-memory IndexedDB, service workers removed, credentialed fetch works",
+      apis.indexedDB === "object" && apis.idb === "ok" && !apis.serviceWorker && apis.credentialed === 200,
+      JSON.stringify(apis));
+check("Isolated: classic and module workers run, get early messages, requests stay proxied",
+      apis.workers.every((w, i) => w.echo === "ping" && typeof w.session === "boolean"
+        && w.path.endsWith(i ? "/static/worker.mjs" : "/static/worker.js")
+        && w.path.startsWith("/api/local_web_ui/")),
+      JSON.stringify(apis.workers));
 check("Rewritten WebSocket and EventSource are native objects", apis.nativeSockets === true);
 
 // 3) Standalone: open in a new tab (full page, no HA chrome), still isolated

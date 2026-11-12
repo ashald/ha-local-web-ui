@@ -39,6 +39,13 @@ fetch('/api/whoami').then(r => r.json()).then(j =>
   document.getElementById('server').textContent = JSON.stringify(j));
 """
 
+# Answers a message with what the worker sees: its location, and a root-relative
+# request that must stay in the proxy. The same code as a classic script and a module.
+WORKER_JS = """
+self.onmessage = (e) => fetch('/api/whoami').then(r => r.json()).then(j =>
+  postMessage({echo: e.data, path: location.pathname, session: j.session}));
+"""
+
 
 @web.middleware
 async def basic_auth(request: web.Request, handler):
@@ -79,6 +86,13 @@ async def app_js(request):
     return web.Response(text=APP_JS, content_type="application/javascript")
 
 
+async def worker_js(request):
+    module = request.path.endswith(".mjs")
+    return web.Response(
+        text=WORKER_JS + ("export {};\n" if module else ""), content_type="application/javascript"
+    )
+
+
 async def style(request):
     return web.Response(
         text="body{font-family:sans-serif;background:#223;color:#eee}", content_type="text/css"
@@ -98,6 +112,8 @@ def make_app() -> web.Application:
             web.post("/login", login),
             web.get("/dashboard", dashboard),
             web.get("/static/app.js", app_js),
+            web.get("/static/worker.js", worker_js),
+            web.get("/static/worker.mjs", worker_js),
             web.get("/static/style.css", style),
             web.get("/api/whoami", whoami),
         ]

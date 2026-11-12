@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -38,6 +39,7 @@ from .const import (
     MAX_SHIM_STORAGE_BYTES,
     MODE_ISOLATED,
     PROXY_URL_PREFIX,
+    STATIC_URL_PATH,
 )
 
 try:
@@ -580,6 +582,13 @@ _REFERRERPOLICY_ATTR = re.compile(rb"(<[a-z][^<>]*?\s)referrerpolicy(?=\s*=)", r
 INJECT_JS = (Path(__file__).parent / "inject.js").read_bytes()
 if b"</script" in INJECT_JS.lower() or b"]]>" in INJECT_JS:
     raise RuntimeError("inject.js must not contain a closing script tag or CDATA end")
+# The in-memory IndexedDB inject.js installs in isolated views. A static file (60 KB)
+# rather than inline, so the browser caches it; versioned by content.
+MEMORY_INDEXEDDB_FILE = Path(__file__).parent / "www" / "memory-indexeddb.js"
+MEMORY_INDEXEDDB_URL = (
+    f"{STATIC_URL_PATH}/{MEMORY_INDEXEDDB_FILE.name}"
+    f"?v={hashlib.sha256(MEMORY_INDEXEDDB_FILE.read_bytes()).hexdigest()[:12]}"
+)
 
 
 def _js(value: Any) -> str:
@@ -616,7 +625,11 @@ def inject_script(ctx: _Context, xhtml: bool = False) -> bytes:
     if xhtml:
         # In XML, the script's "<" and "&" would end the document
         code = b"//<![CDATA[\n" + code + b"\n//]]>"
-    return b"<script>/* local_web_ui */" + code + b"</script>"
+    script = b"<script>/* local_web_ui */" + code + b"</script>"
+    if isolated:
+        # Runs first and only defines a global, which the injected script takes
+        script = b'<script src="' + MEMORY_INDEXEDDB_URL.encode() + b'"></script>' + script
+    return script
 
 
 _CSS_URL = re.compile(rb"""(url\(\s*["']?|@import\s+["'])/(?!/)""", re.IGNORECASE)

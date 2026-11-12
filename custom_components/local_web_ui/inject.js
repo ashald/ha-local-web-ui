@@ -9,8 +9,18 @@
 //    for Home Assistant's origin.
 // 3. Isolated views only: gives the page localStorage and sessionStorage, which
 //    an opaque origin lacks (they throw), backed by server-side storage.
+// 4. Isolated views only: gives the page an in-memory IndexedDB (proxy.py loads
+//    memory-indexeddb.js just before this script), and starts its web workers
+//    through a loader, since an opaque origin cannot start them from the proxy's
+//    URLs (see workerMain).
 function (cfg) {
   "use strict";
+  var memoryIndexedDB = window.__lwuMemoryIndexedDB;
+  try {
+    delete window.__lwuMemoryIndexedDB;
+  } catch (e) {
+    /* Not loaded */
+  }
   var loc = window.location;
   // location.origin is "null" in an isolated view; the URL's own origin is what
   // relative URLs resolve against
@@ -19,34 +29,42 @@ function (cfg) {
   var viewPath = cfg.viewPath; // /api/local_web_ui/<view_id>/
   var site = cfg.site; // the device's own origin, e.g. http://192.168.1.50
 
-  function rewrite(input) {
-    if (input === null || input === undefined) return input;
-    var text = String(input);
-    var url;
-    try {
-      url = new URL(text, document.baseURI);
-    } catch (e) {
-      return input;
-    }
-    var proto = url.protocol;
-    var ws = proto === "ws:" || proto === "wss:";
-    if (!ws && proto !== "http:" && proto !== "https:") return input;
-    var origin = (ws ? (proto === "wss:" ? "https:" : "http:") : proto) + "//" + url.host;
-    // The page's own scheme: "ws://" + location.host would be mixed content on https
-    var scheme = ws ? (loc.protocol === "https:" ? "wss:" : "ws:") : loc.protocol;
-    if (url.host === loc.host) {
-      if (url.pathname.indexOf(viewPath) === 0) {
-        if (proto === scheme) return input; // Already proxied
-        url.protocol = scheme;
-        return url.href;
+  // Also copied into web workers as source text (see workerMain), so it uses
+  // nothing from the enclosing function
+  function makeRewrite(pageProtocol, pageHost, prefix, viewPath, site, baseURI) {
+    var here = pageProtocol + "//" + pageHost;
+    return function rewrite(input) {
+      if (input === null || input === undefined) return input;
+      var text = String(input);
+      var url;
+      try {
+        url = new URL(text, baseURI());
+      } catch (e) {
+        return input;
       }
-    } else if (origin !== site) {
-      return input; // Another site entirely
-    }
-    var out = new URL(prefix + url.pathname + url.search + url.hash, here);
-    out.protocol = scheme;
-    return out.href;
+      var proto = url.protocol;
+      var ws = proto === "ws:" || proto === "wss:";
+      if (!ws && proto !== "http:" && proto !== "https:") return input;
+      var origin = (ws ? (proto === "wss:" ? "https:" : "http:") : proto) + "//" + url.host;
+      // The page's own scheme: "ws://" + location.host would be mixed content on https
+      var scheme = ws ? (pageProtocol === "https:" ? "wss:" : "ws:") : pageProtocol;
+      if (url.host === pageHost) {
+        if (url.pathname.indexOf(viewPath) === 0) {
+          if (proto === scheme) return input; // Already proxied
+          url.protocol = scheme;
+          return url.href;
+        }
+      } else if (origin !== site) {
+        return input; // Another site entirely
+      }
+      var out = new URL(prefix + url.pathname + url.search + url.hash, here);
+      out.protocol = scheme;
+      return out.href;
+    };
   }
+  var rewrite = makeRewrite(loc.protocol, loc.host, prefix, viewPath, site, function () {
+    return document.baseURI;
+  });
 
   function unprefix(val) {
     if (typeof val !== "string") return val;
@@ -326,13 +344,183 @@ function (cfg) {
   }
 
   // These throw in an opaque origin; without them pages fall back gracefully
-  // ("indexedDB" in window, "serviceWorker" in navigator, ...)
+  // ("serviceWorker" in navigator, "caches" in window, ...)
   try {
     delete Navigator.prototype.serviceWorker;
     delete window.caches;
-    delete window.indexedDB;
   } catch (e) {
     /* Keep them */
+  }
+  // IndexedDB in memory, for the current page: some apps (SilverBullet) cannot run
+  // without one. The native classes are replaced too, so that instanceof checks
+  // (the idb library's) recognise its objects.
+  try {
+    if (memoryIndexedDB) {
+      Object.keys(memoryIndexedDB).forEach(function (name) {
+        Object.defineProperty(window, name, {
+          configurable: true,
+          writable: true,
+          value: memoryIndexedDB[name],
+        });
+      });
+    } else {
+      delete window.indexedDB;
+    }
+  } catch (e) {
+    /* Keep it */
+  }
+
+  // Web workers. An opaque origin can start a worker from a blob: URL, but not
+  // from the proxy's URLs (another origin to it), and not as a module worker at
+  // all. So every worker of a proxied script starts as a classic worker from a
+  // small blob: script, workerMain, which loads the real one.
+  //
+  // workerMain runs inside the worker. It keeps the worker's own requests in the
+  // proxy, as this script does for the page, and shows the real script's URL as
+  // location (relative URLs resolve against it). A module is loaded with import(),
+  // which a classic worker may use; the messages that arrive meanwhile are held
+  // and handed to the module's listeners once it has run. A classic script is
+  // loaded with a synchronous XHR and eval, as importScripts would (which fails
+  // for the proxy's URLs too, so it is replaced the same way).
+  function workerMain(c, makeRewrite) {
+    var rewrite = makeRewrite(c.protocol, c.host, c.prefix, c.viewPath, c.site, function () {
+      return c.url;
+    });
+    var nativeFetch = self.fetch;
+    self.fetch = function (input, init) {
+      if (typeof input === "string" || input instanceof URL) {
+        input = rewrite(input);
+      } else if (input instanceof Request) {
+        var moved = rewrite(input.url);
+        if (moved !== input.url) {
+          var req = input;
+          var self_ = this;
+          var noBody = req.method === "GET" || req.method === "HEAD";
+          return (noBody ? Promise.resolve(undefined) : req.arrayBuffer()).then(function (body) {
+            return nativeFetch.call(self_, new Request(moved, {
+              method: req.method,
+              headers: req.headers,
+              body: body,
+              mode: req.mode,
+              credentials: req.credentials,
+              cache: req.cache,
+              redirect: req.redirect,
+              integrity: req.integrity,
+              signal: req.signal,
+            }), init);
+          });
+        }
+      }
+      return nativeFetch.call(this, input, init);
+    };
+    var open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function () {
+      var args = Array.prototype.slice.call(arguments);
+      args[1] = rewrite(args[1]);
+      return open.apply(this, args);
+    };
+    ["EventSource", "WebSocket"].forEach(function (name) {
+      if (!self[name]) return;
+      self[name] = new Proxy(self[name], {
+        construct: function (target, args, newTarget) {
+          if (args.length) args[0] = rewrite(args[0]);
+          return Reflect.construct(target, args, newTarget);
+        },
+      });
+    });
+    var real = new URL(c.url);
+    var location = { origin: "null" }; // As the page's
+    ["href", "protocol", "host", "hostname", "port", "pathname", "search", "hash"].forEach(function (key) {
+      location[key] = real[key];
+    });
+    location.toString = function () {
+      return real.href;
+    };
+    try {
+      Object.defineProperty(self, "location", { configurable: true, get: function () { return location; } });
+    } catch (e) {
+      /* Keep the blob's */
+    }
+    var globalEval = eval;
+    self.importScripts = function () {
+      for (var i = 0; i < arguments.length; i++) {
+        var url = rewrite(String(arguments[i]));
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", url, false);
+        xhr.send();
+        if (xhr.status < 200 || xhr.status >= 300) {
+          throw new DOMException("Failed to load " + url, "NetworkError");
+        }
+        globalEval(xhr.responseText + "\n//# sourceURL=" + url);
+      }
+    };
+    if (!c.module) {
+      self.importScripts(c.url);
+      return;
+    }
+    var held = [];
+    function hold(event) {
+      event.stopImmediatePropagation();
+      held.push(event);
+    }
+    self.addEventListener("message", hold);
+    // Through eval: this file stays ES2017, which has no import()
+    globalEval("import(" + JSON.stringify(c.url) + ")").then(
+      function () {
+        self.removeEventListener("message", hold);
+        held.forEach(function (event) {
+          self.dispatchEvent(new MessageEvent("message", { data: event.data, ports: event.ports }));
+        });
+      },
+      function (error) {
+        // An error event on the page's Worker object, as a failed module load gives
+        setTimeout(function () {
+          throw error;
+        });
+      }
+    );
+  }
+  try {
+    var NativeWorker = window.Worker;
+    if (NativeWorker) {
+      window.Worker = new Proxy(NativeWorker, {
+        construct: function (target, args, newTarget) {
+          var options = args[1] || {};
+          var module = options.type === "module";
+          var url = rewrite(args[0]);
+          var proto;
+          try {
+            url = new URL(String(url), document.baseURI).href;
+            proto = new URL(url).protocol;
+          } catch (e) {
+            return Reflect.construct(target, args, newTarget);
+          }
+          // A classic worker from the page's own blob: or data: URL starts natively
+          if (!module && proto !== "http:" && proto !== "https:") {
+            return Reflect.construct(target, args, newTarget);
+          }
+          var conf = {
+            url: url,
+            module: module,
+            protocol: loc.protocol,
+            host: loc.host,
+            prefix: prefix,
+            viewPath: viewPath,
+            site: site,
+          };
+          var source = "(" + workerMain + ")(" + JSON.stringify(conf) + ", " + makeRewrite + ");";
+          var classic = Object.assign({}, options, { type: "classic" });
+          var blob = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+          var worker = Reflect.construct(target, [blob, classic], newTarget);
+          setTimeout(function () {
+            URL.revokeObjectURL(blob);
+          }, 60000);
+          return worker;
+        },
+      });
+    }
+  } catch (e) {
+    /* Keep the native one */
   }
 
   // localStorage is written back as changes. Each write has an id, and a page

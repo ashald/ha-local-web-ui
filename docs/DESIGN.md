@@ -94,7 +94,9 @@ becomes the hub.
 | **`document.cookie`** | Emulated, backed by the same jar (non-HttpOnly cookies only). | Same. |
 | **localStorage** | Emulated and stored server side per (HA user, view); see below. | Native: shared with HA and every other trusted view. |
 | **sessionStorage** | Emulated, per page (does not survive a reload). | Native. |
-| **IndexedDB, Cache Storage, service workers** | Removed, so feature detection falls back (they would throw). | Native, except service workers, which are refused in both modes: one registered from HA's origin could intercept HA itself. |
+| **IndexedDB** | In memory, per page: fake-indexeddb (`www/memory-indexeddb.js`, Apache-2.0), loaded just before the injected script, which installs it along with its classes (`IDBRequest`…, so `instanceof` checks hold). | Native. |
+| **Web workers** | An opaque origin cannot start a worker from the proxy's URLs, nor a module worker at all. So each one starts as a classic worker from a `blob:` loader (`workerMain` in inject.js) that loads the real script: a module with `import()`, holding the messages that arrive before it has run; a classic script with a synchronous XHR and `eval` (`importScripts` the same way). The loader rewrites the worker's fetch/XHR/WebSocket/EventSource URLs like the page's, and shows the script's URL as `location`. | Native. |
+| **Cache Storage, service workers** | Removed, so feature detection falls back (they would throw). | Native, except service workers, which are refused in both modes: one registered from HA's origin could intercept HA itself. |
 | **CORS** | Requests carry `Origin: null`. The proxy answers preflights itself and adds `Access-Control-Allow-Origin: null` with `Access-Control-Allow-Credentials: true` (errors included), so credentialed `fetch`/XHR work. The browser holds no site credentials for these paths; the credential is the path token. | Not needed. |
 
 **Emulated localStorage.** The data is inlined into each HTML page the proxy serves.
@@ -312,6 +314,8 @@ Adding, ignoring and editing web UIs go through HA's own config entry flows.
 - Root-relative ES module imports (`import "/x.js"`) cannot be rewritten at runtime.
 - `Storage.prototype.getItem.call(localStorage, k)` throws with the emulated storage.
 - Iframes a page creates with script (`about:blank`) get their own opaque origin.
+- Isolated views: IndexedDB does not survive a reload; shared workers, and workers a
+  worker starts, are not available.
 
 ## Out of scope (designed for)
 

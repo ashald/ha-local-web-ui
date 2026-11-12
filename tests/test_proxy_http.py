@@ -75,6 +75,7 @@ from custom_components.local_web_ui.const import (
     PROXY_URL_PREFIX,
     SESSION_MAX_AGE,
     SESSION_TTL,
+    STATIC_URL_PATH,
     STORAGE_KEY_JAR,
     TOKEN_BEARER,
     TOKEN_X_API_KEY,
@@ -86,7 +87,12 @@ from custom_components.local_web_ui.hub import (
     device_unique_id,
     parse_digest_challenge,
 )
-from custom_components.local_web_ui.proxy import ISOLATION_CSP, https_upgrade
+from custom_components.local_web_ui.proxy import (
+    ISOLATION_CSP,
+    MEMORY_INDEXEDDB_FILE,
+    MEMORY_INDEXEDDB_URL,
+    https_upgrade,
+)
 
 ISO = "isoview"
 TRUSTED = "trustedview"
@@ -95,6 +101,8 @@ TOKEN = "tokenview"
 DOWN = "downview"
 
 SHIM_MARKER = b"<script>/* local_web_ui */("
+# Isolated views load the in-memory IndexedDB just before the injected script
+MEMORY_INDEXEDDB_TAG = b'<script src="' + MEMORY_INDEXEDDB_URL.encode() + b'"></script>'
 BIG = random.Random(1234).randbytes(5 * 1024 * 1024 + 123)
 # Larger than what the proxy buffers: links in the first 4 MiB are rewritten
 BIG_PAGE_TAIL = b'<a href="/late">l</a></body></html>'
@@ -1261,10 +1269,12 @@ async def test_isolated_html_rewritten_and_shim_first(env: Env) -> None:
     assert response.headers[hdrs.CONTENT_TYPE].startswith("text/html")
     body = await response.read()
 
-    # The shim is the very first thing inside <head>, before any script of the page
+    # The shim is the very first thing inside <head>, before any script of the page,
+    # right after the in-memory IndexedDB it installs
     head = b'<!DOCTYPE html>\n<html lang="en"><head>'
-    assert body.startswith(head + SHIM_MARKER)
+    assert body.startswith(head + MEMORY_INDEXEDDB_TAG + SHIM_MARKER)
     assert body.count(SHIM_MARKER) == 1
+    assert body.count(MEMORY_INDEXEDDB_TAG) == 1
     config = shim_config(body)
     assert config["prefix"] == prefix
     assert config["viewPath"] == f"{PROXY_URL_PREFIX}/{ISO}/"
@@ -1274,7 +1284,7 @@ async def test_isolated_html_rewritten_and_shim_first(env: Env) -> None:
     assert config["cookies"] == {}
     assert config["writes"] == []
 
-    page = body[body.index(b"</script>") + len(b"</script>") :]
+    page = body[body.index(b"</script>", body.index(SHIM_MARKER)) + len(b"</script>") :]
     # Root-relative and same-site absolute URLs go through the proxy
     assert f'href="{prefix}/style.css"'.encode() in page
     assert f'href="{prefix}/settings?x=1"'.encode() in page
@@ -1294,7 +1304,7 @@ async def test_isolated_html_rewritten_and_shim_first(env: Env) -> None:
 async def test_meta_referrer_neutralized(env: Env) -> None:
     prefix = await env.prefix(ISO)
     body = await (await env.client.get(prefix + "/meta-referrer")).read()
-    page = body[body.index(b"</script>") :]
+    page = body[body.index(b"</script>", body.index(SHIM_MARKER)) :]
     # The page's own policy could send its URL, with the token, to other sites
     assert b'<meta name="x-referrer-removed" content="unsafe-url">' in page
     assert b"<META NAME='x-referrer-removed' CONTENT='origin'>" in page
@@ -1308,7 +1318,7 @@ async def test_meta_referrer_neutralized(env: Env) -> None:
 async def test_referrerpolicy_attributes_neutralized(env: Env) -> None:
     prefix = await env.prefix(ISO)
     body = await (await env.client.get(prefix + "/referrer-attributes")).read()
-    page = body[body.index(b"</script>") :]
+    page = body[body.index(b"</script>", body.index(SHIM_MARKER)) :]
     assert not re.search(
         rb"\sreferrerpolicy\s*=\s*[\"']?(?:unsafe-url|no-referrer-when-downgrade)",
         page,
@@ -1455,6 +1465,8 @@ async def test_trusted_no_csp_and_no_storage_shim(env: Env) -> None:
     assert config["isolated"] is False
     assert "storage" not in config
     assert "writes" not in config
+    # Nor an emulated IndexedDB
+    assert MEMORY_INDEXEDDB_TAG not in body
     assert config["cookies"] == {}
     # Links are still kept inside the proxy
     assert f'href="{prefix}/settings?x=1"'.encode() in body
@@ -1848,7 +1860,8 @@ async def test_storage_endpoint_persists_into_next_page(env: Env) -> None:
         "html": "</script><b>",
     }
     # The stored value could not close the injected script early
-    assert body.count(b"</script>") == 2  # The shim's and the page's own
+    # The in-memory IndexedDB's, the shim's and the page's own
+    assert body.count(b"</script>") == 3
 
 
 async def test_storage_writes_are_diffs(env: Env) -> None:
@@ -2090,9 +2103,9 @@ async def test_large_html_injected_then_streamed(env: Env, path: str) -> None:
     body = await response.read()
 
     # The start of the page gets the script and the rewriting, the rest streams as is
-    assert body.startswith(b"<html><head>" + SHIM_MARKER)
+    assert body.startswith(b"<html><head>" + MEMORY_INDEXEDDB_TAG + SHIM_MARKER)
     assert shim_config(body)["prefix"] == prefix
-    page = body[body.index(b"</script>") + len(b"</script>") :]
+    page = body[body.index(b"</script>", body.index(SHIM_MARKER)) + len(b"</script>") :]
     assert page == (
         b'</head><body><a href="' + prefix.encode() + b'/early">e</a>' + BIG + BIG_PAGE_TAIL
     )
@@ -2201,6 +2214,48 @@ def test_inject_script_attributes_and_pathname_hooks() -> None:
     )
     for attr in ("src", "href", "action", "formaction", "poster", "data", "background"):
         assert f"{attr}: 1".encode() in proxy_module.INJECT_JS
+
+
+def test_inject_script_memory_indexeddb_and_workers() -> None:
+    """Isolated views get an in-memory IndexedDB and start workers through a loader."""
+    js = proxy_module.INJECT_JS
+    # The bundle hands its classes over in a global, which the script takes and removes
+    assert b"var memoryIndexedDB = window.__lwuMemoryIndexedDB;" in js
+    assert b"delete window.__lwuMemoryIndexedDB;" in js
+    assert b"Object.keys(memoryIndexedDB).forEach" in js
+    # Workers: a classic blob: worker runs workerMain, which loads the real script with
+    # the URL rewriting copied in as source text
+    assert b"function workerMain(c, makeRewrite)" in js
+    assert b"function makeRewrite(pageProtocol, pageHost, prefix, viewPath, site, baseURI)" in js
+    assert b'"(" + workerMain + ")(" + JSON.stringify(conf) + ", " + makeRewrite + ");"' in js
+    assert b'type: "classic"' in js
+    # Still ES2017: import() only through eval
+    assert b'globalEval("import(" + JSON.stringify(c.url) + ")")' in js
+
+
+def test_memory_indexeddb_bundle() -> None:
+    """The vendored fake-indexeddb bundle sets the global inject.js takes, with its licence."""
+    code = MEMORY_INDEXEDDB_FILE.read_bytes()
+    assert b"self.__lwuMemoryIndexedDB=" in code
+    for name in ("indexedDB", "IDBKeyRange", "IDBRequest", "IDBTransaction", "IDBDatabase"):
+        assert name.encode() in code
+    assert (
+        (MEMORY_INDEXEDDB_FILE.parent / "memory-indexeddb.LICENSE")
+        .read_text()
+        .startswith("Apache License")
+    )
+    assert (
+        f"{STATIC_URL_PATH}/memory-indexeddb.js?v={hashlib.sha256(code).hexdigest()[:12]}"
+    ) == MEMORY_INDEXEDDB_URL
+
+
+async def test_memory_indexeddb_served_cached(env: Env) -> None:
+    """Loaded by isolated pages from Home Assistant's static path, cacheable for long."""
+    response = await env.client.get(MEMORY_INDEXEDDB_URL)
+    assert response.status == 200
+    assert await response.read() == MEMORY_INDEXEDDB_FILE.read_bytes()
+    assert "javascript" in response.headers[hdrs.CONTENT_TYPE]
+    assert "max-age" in response.headers[hdrs.CACHE_CONTROL]
 
 
 def test_parse_digest_challenge() -> None:

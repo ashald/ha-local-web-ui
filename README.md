@@ -65,11 +65,13 @@ browser then withholds from the page, Local Web UIs provides:
 | `sessionStorage` | Emulated for the current page. |
 | `document.cookie` | Emulated, backed by the same cookie store. |
 | API calls, WebSockets, live updates | Passed through (CORS is handled for you). |
-| IndexedDB, offline caches | Not available; pages that check for them fall back. |
+| IndexedDB | Emulated in memory for the current page: apps that need it work, but what they keep there does not survive a reload. |
+| Web workers | Started through a small loader, module workers included. Shared workers, and workers started by a worker, are not available. |
+| Offline caches | Not available; pages that check for them fall back. |
 
 **Trusted** runs the page with Home Assistant's own origin, as Supervisor apps (add-ons) do.
-Use it only for pages that need a browser feature the emulation doesn't cover (IndexedDB,
-a `sessionStorage` that survives reloads, `window.parent` access), and **only for pages
+Use it only for pages that need a browser feature the emulation doesn't cover (an IndexedDB
+or a `sessionStorage` that survives reloads, `window.parent` access), and **only for pages
 you fully trust**. The form makes you confirm. Site cookies stay server side in this mode
 too, and service workers are refused in both modes.
 
