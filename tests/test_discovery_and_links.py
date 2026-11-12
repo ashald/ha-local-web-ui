@@ -372,6 +372,8 @@ NON_LOCAL_URLS = [
     "http://a0d7b954-vscode:8080/",
     "http://core-mosquitto/",
     "http://local-my-app:8099/",
+    "http://d5369777-music-assistant:8094/",
+    "http://D5369777-Music-Assistant.:8094/",
 ]
 
 
@@ -545,6 +547,13 @@ async def test_offers_devices_with_a_local_web_page(
     add_device(device_registry, owner, "app", "homeassistant://hassio/addon/core_ssh")
     add_device(device_registry, owner, "loopback", "http://127.0.0.1:8080/")
     add_device(device_registry, owner, "supervisor", "http://172.30.32.2/")
+    # Music Assistant links its players to its app's hostname
+    add_device(
+        device_registry,
+        owner,
+        "player",
+        "http://d5369777-music-assistant:8094/#/settings/editplayer/ap52ba4bc3e0fc",
+    )
     disabled = add_device(device_registry, owner, "disabled", "http://192.168.1.52/")
     device_registry.async_update_device(disabled.id, disabled_by=dr.DeviceEntryDisabler.USER)
 
@@ -853,6 +862,28 @@ async def test_device_offered_when_it_gains_a_local_url(
     device_registry.async_update_device(disabled.id, disabled_by=None)
     await hass.async_block_till_done()
     assert disabled.id in offers(hass)
+
+
+@pytest.mark.usefixtures("http")
+async def test_offer_withdrawn_when_device_loses_its_local_url(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry, owner: MockConfigEntry
+) -> None:
+    porch = add_device(device_registry, owner, "porch", PORCH_URL)
+    kitchen = add_device(device_registry, owner, "kitchen", KITCHEN_URL)
+    garage = add_device(device_registry, owner, "garage", "http://192.168.1.60/")
+    await setup_hub(hass)
+    assert set(offers(hass)) == {porch.id, kitchen.id, garage.id}
+
+    device_registry.async_update_device(porch.id, configuration_url="https://cloud.example.com/1")
+    device_registry.async_update_device(kitchen.id, disabled_by=dr.DeviceEntryDisabler.USER)
+    device_registry.async_remove_device(garage.id)
+    await hass.async_block_till_done()
+    assert offers(hass) == {}
+
+    # Not a dismissal: offered again once it has a local web page again
+    device_registry.async_update_device(porch.id, configuration_url=PORCH_URL)
+    await hass.async_block_till_done()
+    assert set(offers(hass)) == {porch.id}
 
 
 @pytest.mark.usefixtures("http")

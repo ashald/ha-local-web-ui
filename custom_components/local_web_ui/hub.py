@@ -848,9 +848,14 @@ class LocalWebUiHub:
         urls = {view.url for view in self._views.values()}
         devices = [only] if only is not None else iter_devices(dr.async_get(self.hass))
         for device in devices:
-            if device.disabled or self._own_device(device):
+            if (
+                device.disabled
+                or self._own_device(device)
+                or (candidate := self._device_view(device)) is None
+            ):
+                self._async_withdraw_offer(device.id)
                 continue
-            if (candidate := self._device_view(device)) is None or candidate.url in urls:
+            if candidate.url in urls:
                 continue
             urls.add(candidate.url)
             if device_unique_id(device.id) in known or device.id in self._offered:
@@ -867,6 +872,25 @@ class LocalWebUiHub:
                     "subtitle": candidate.subtitle,
                 },
             )
+
+    @callback
+    def _async_withdraw_offer(self, device_id: str) -> None:
+        """Abort a pending offer for a device that no longer has a local web page.
+
+        An offer that was dismissed stays dismissed: only a pending one is withdrawn,
+        so the device can be offered again if it gets a local web page back.
+        """
+        if device_id not in self._offered:
+            return
+        for flow in self.hass.config_entries.flow.async_progress_by_handler(
+            DOMAIN,
+            match_context={
+                "source": SOURCE_INTEGRATION_DISCOVERY,
+                "unique_id": device_unique_id(device_id),
+            },
+        ):
+            self.hass.config_entries.flow.async_abort(flow["flow_id"])
+            self._offered.discard(device_id)
 
     # ---- device page links ---------------------------------------------------
 
@@ -940,6 +964,7 @@ class LocalWebUiHub:
         if device is None:
             # Removed, or turned into a child device (2026.9): no link of its own
             self._device_views.pop(device_id, None)
+            self._async_withdraw_offer(device_id)
             if self.originals.pop(device_id, None) is not None:
                 self._async_schedule_save()
         if any(e.data.get(CONF_DEVICE_ID) == device_id for e in self.view_entries.values()):

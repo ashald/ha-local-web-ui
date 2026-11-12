@@ -43,8 +43,9 @@ Web UIs come from two sources:
   `SOURCE_IGNORE` entry. There is one offer per URL: since 2026.8 a device known to several
   integrations is one device per integration, each with the same link, so only the first is
   offered. Child devices (2026.9) are ignored; they share their parent's link. Turning
-  discovery off aborts pending offers. The URL follows the device's current link, so a
-  device that moves to a new address keeps working.
+  discovery off aborts pending offers, and so does a device losing its local link (changed,
+  disabled or removed); it is offered again if it gets one back. The URL follows the
+  device's current link, so a device that moves to a new address keeps working.
 - **Manual web UIs** (`data {}`) are added with *Add entry*. Credentials typed into the URL
   (`http://user:pass@host/`) are moved into the username and password fields.
 
@@ -225,9 +226,10 @@ becomes the hub.
 - a single-label hostname.
 
 It excludes loopback, link-local, multicast, cloud metadata addresses and names,
-Supervisor's `172.30.32.0/23` network, `*.localhost`, app hostnames (`core-*`, `local-*`,
-`a0d7b954-*`, `supervisor`, `homeassistant`) and Home Assistant's own URLs. IPv4-mapped
-IPv6 addresses are checked as IPv4. Discovered views skip TLS verification, because LAN
+Supervisor's `172.30.32.0/23` network, `*.localhost`, app hostnames (`core-*`, `local-*`
+and `<8 hex digits>-*` for any other repository, like `d5369777-music-assistant`, which
+Music Assistant links its players to; `supervisor`, `homeassistant`) and Home Assistant's
+own URLs. IPv4-mapped IPv6 addresses are checked as IPv4. Discovered views skip TLS verification, because LAN
 devices rarely have trusted certificates. Manual web UIs are not filtered.
 
 ## Storage

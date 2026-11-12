@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 
 from aiohttp.abc import AbstractResolver, ResolveResult
@@ -29,6 +30,11 @@ _BLOCKED_HOSTS = frozenset(
         "metadata.google.internal",
     }
 )
+
+# App hostnames on the Supervisor network: "<repository>-<app>", where the
+# repository is "core", "local" or the first 8 hex digits of the SHA-1 of its URL
+# (a0d7b954-vscode, d5369777-music-assistant)
+_APP_HOST = re.compile(r"(?:core|local|[0-9a-f]{8})-[a-z0-9-]+")
 
 # Supervisor's internal network on HA OS / Supervised installs
 _SUPERVISOR_NETWORK = ipaddress.ip_network("172.30.32.0/23")
@@ -107,9 +113,9 @@ def is_local_ui_url(
         if (
             host in _BLOCKED_HOSTS
             or host.endswith(".localhost")  # RFC 6761: always loopback
-            or host.startswith(("a0d7b954-", "core-", "local-"))
+            or _APP_HOST.fullmatch(host)
         ):
-            return False  # App hostnames on the Supervisor network
+            return False
         return "." not in host or host.endswith(local_suffixes)
     return is_lan_address(address)
 
