@@ -58,6 +58,7 @@ from custom_components.local_web_ui.const import (
     CONF_TOKEN_HEADER,
     CONF_URL,
     CONF_USERNAME,
+    CONF_USERS,
     CONF_VERIFY_SSL,
     CONF_VISIT_LINK,
     DOMAIN,
@@ -104,6 +105,7 @@ VIEW_KEYS = {
     "show_in_sidebar",
     "device_link",
     "linked_device_id",
+    "users",
 }
 
 ALL_COMMANDS: list[dict[str, Any]] = [
@@ -478,6 +480,7 @@ async def test_views_json(hass: HomeAssistant, home: Home, ws: MockHAClientWebSo
         "show_in_sidebar": True,
         "device_link": None,
         "linked_device_id": hub.linked_device_id(ROUTER_ID),
+        "users": [],
     }
     assert views[ROUTER_ID]["linked_device_id"] is not None
     # Credentials never reach the panel
@@ -498,6 +501,7 @@ async def test_views_json(hass: HomeAssistant, home: Home, ws: MockHAClientWebSo
         "show_in_sidebar": False,
         "device_link": link_state(enabled=True, active=True),
         "linked_device_id": hub.linked_device_id(PRINTER_VIEW_ID),
+        "users": [],
     }
     assert url_of(hass, home.printer.id) == link_for(PRINTER_VIEW_ID)
 
@@ -682,6 +686,7 @@ async def test_views_include_manual_entries_added_by_flow(
         "show_in_sidebar": False,
         "device_link": None,
         "linked_device_id": hub_of(hass).linked_device_id(entry_id),
+        "users": [],
     }
 
 
@@ -1086,7 +1091,7 @@ async def test_session_for_devices_without_web_ui_entry_is_not_found(
 
 
 @pytest.mark.parametrize("command", ALL_COMMANDS, ids=COMMAND_IDS)
-async def test_commands_reject_non_admin(
+async def test_commands_open_nothing_not_shared_with_the_user(
     hass: HomeAssistant,
     home: Home,
     hass_ws_client: WebSocketGenerator,
@@ -1100,8 +1105,11 @@ async def test_commands_reject_non_admin(
     hub.async_store_cookies(hass_read_only_user.id, view, ["sid=kept"], view.origin)
     entries = {e.entry_id: (e.title, dict(e.options)) for e in hass.config_entries.async_entries()}
     ws = await hass_ws_client(access_token=hass_read_only_access_token)
-    error = await ws_error(ws, **command)
-    assert error["code"] == "unauthorized"
+    if command["type"] == f"{DOMAIN}/views":
+        assert await ws_ok(ws, **command) == {"views": []}
+    else:
+        error = await ws_error(ws, **command)
+        assert error == {"code": "not_found", "message": "This web UI is not available to you"}
     await hass.async_block_till_done()
     # Nothing changed
     assert hub_of(hass) is hub
@@ -1112,12 +1120,12 @@ async def test_commands_reject_non_admin(
     } == entries
 
 
-async def test_commands_reject_non_admin_user_with_own_group(
+async def test_commands_open_nothing_for_a_plain_user_without_shares(
     hass: HomeAssistant,
     home: Home,
     hass_ws_client: WebSocketGenerator,
 ) -> None:
-    """A regular (non-admin, non-read-only) user is rejected as well."""
+    """A regular (non-admin, non-read-only) user too, while nothing is shared with them."""
     group = await hass.auth.async_get_group(GROUP_ID_USER)
     assert group is not None
     user = MockUser(name="plain", groups=[group]).add_to_hass(hass)
@@ -1134,9 +1142,10 @@ async def test_commands_reject_non_admin_user_with_own_group(
     )
     assert not user.is_admin
     ws = await hass_ws_client(access_token=hass.auth.async_create_access_token(refresh_token))
-    for command in ALL_COMMANDS:
+    assert await ws_ok(ws, type=f"{DOMAIN}/views") == {"views": []}
+    for command in ALL_COMMANDS[1:]:
         error = await ws_error(ws, **dict(command))
-        assert error["code"] == "unauthorized", command
+        assert error["code"] == "not_found", command
     assert not hub_of(hass).sessions._sessions
 
 
@@ -1252,6 +1261,7 @@ async def test_diagnostics_manual_web_ui_redacts_credentials_and_query(
         "device_page_link",
         "identity_header",
         "identity_audience",
+        "shared_with_users",
     }
 
 
@@ -1276,6 +1286,7 @@ async def test_diagnostics_device_web_ui(
             "device_page_link": True,
             "identity_header": None,
             "identity_audience": None,
+            "shared_with_users": 0,
         },
     }
 
@@ -1302,6 +1313,7 @@ async def test_diagnostics_device_web_ui(
         "device_page_link": False,
         "identity_header": None,
         "identity_audience": None,
+        "shared_with_users": 0,
     }
 
 
@@ -1943,3 +1955,96 @@ async def test_ws_relay_session_socket_limit_holds_for_simultaneous_opens(
     finally:
         for ws in opened:
             await ws.close()
+
+
+# ---------------------------------------------------------------------------
+# web UIs shared with users who are not admins
+# ---------------------------------------------------------------------------
+
+SHARED_VIEW_KEYS = {"view_id", "name", "subtitle", "mode", "area", "icon"}
+
+
+async def plain_login(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, name: str = "Kids"
+) -> tuple[MockUser, MockHAClientWebSocket]:
+    group = await hass.auth.async_get_group(GROUP_ID_USER)
+    assert group is not None
+    user = MockUser(name=name, groups=[group]).add_to_hass(hass)
+    refresh_token = await hass.auth.async_create_refresh_token(user, CLIENT_ID)
+    ws = await hass_ws_client(access_token=hass.auth.async_create_access_token(refresh_token))
+    return user, ws
+
+
+async def share(hass: HomeAssistant, entry: MockConfigEntry, *user_ids: str) -> None:
+    options = {k: v for k, v in entry.options.items() if k != CONF_USERS}
+    if user_ids:
+        options[CONF_USERS] = sorted(user_ids)
+    hass.config_entries.async_update_entry(entry, options=options)
+    await hass.async_block_till_done()
+
+
+async def test_user_sees_and_opens_only_what_is_shared_with_them(
+    hass: HomeAssistant, home: Home, hass_ws_client: WebSocketGenerator
+) -> None:
+    kids, ws = await plain_login(hass, hass_ws_client)
+    await share(hass, home.router, kids.id)
+    hub = hub_of(hass)
+
+    result = await ws_ok(ws, type=f"{DOMAIN}/views")
+    assert set(result) == {"views"}  # Nothing about discovery or the hub
+    [view] = result["views"]
+    # What it takes to show it: no address, device or settings
+    assert set(view) == SHARED_VIEW_KEYS
+    assert view["view_id"] == ROUTER_ID
+
+    session = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID)
+    assert set(session["view"]) == SHARED_VIEW_KEYS
+    assert session["url"].startswith(f"/api/local_web_ui/{ROUTER_ID}/{session['token']}/")
+    stored = hub.sessions.get(session["token"])
+    assert stored is not None and stored.user_id == kids.id and not stored.admin
+    # Kept alive like an admin's
+    again = await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID, token=session["token"])
+    assert again["token"] == session["token"]
+    # Their own saved data can be cleared
+    await ws_ok(ws, type=f"{DOMAIN}/clear_site_data", view_id=ROUTER_ID)
+
+    # Not the others, and the answer doesn't tell whether one exists
+    for view_id in (PRINTER_VIEW_ID, "nope"):
+        error = await ws_error(ws, type=f"{DOMAIN}/session", view_id=view_id)
+        assert error == {"code": "not_found", "message": "This web UI is not available to you"}
+        error = await ws_error(ws, type=f"{DOMAIN}/clear_site_data", view_id=view_id)
+        assert error["code"] == "not_found"
+
+
+async def test_unsharing_ends_the_users_sessions_only(
+    hass: HomeAssistant, home: Home, hass_ws_client: WebSocketGenerator, ws: MockHAClientWebSocket
+) -> None:
+    kids, kids_ws = await plain_login(hass, hass_ws_client)
+    zoe, zoe_ws = await plain_login(hass, hass_ws_client, "Zoe")
+    await share(hass, home.router, kids.id, zoe.id)
+    hub = hub_of(hass)
+    kids_session = (await ws_ok(kids_ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID))["token"]
+    zoe_session = (await ws_ok(zoe_ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID))["token"]
+    admin_session = (await ws_ok(ws, type=f"{DOMAIN}/session", view_id=ROUTER_ID))["token"]
+
+    await share(hass, home.router, zoe.id)
+    assert hub.sessions.get(kids_session) is None
+    assert hub.sessions.get(zoe_session) is not None
+    assert hub.sessions.get(admin_session) is not None
+    assert await ws_ok(kids_ws, type=f"{DOMAIN}/views") == {"views": []}
+    # Other settings changes leave the sessions alone
+    hass.config_entries.async_update_entry(
+        home.router, options={**home.router.options, CONF_SHOW_IN_SIDEBAR: True}
+    )
+    await hass.async_block_till_done()
+    assert hub.sessions.get(zoe_session) is not None
+
+
+async def test_admins_see_who_a_web_ui_is_shared_with(
+    hass: HomeAssistant, home: Home, hass_ws_client: WebSocketGenerator, ws: MockHAClientWebSocket
+) -> None:
+    kids, _ = await plain_login(hass, hass_ws_client)
+    await share(hass, home.router, kids.id)
+    views = await list_views(ws)
+    assert views[ROUTER_ID]["users"] == [kids.id]
+    assert views[PRINTER_VIEW_ID]["users"] == []

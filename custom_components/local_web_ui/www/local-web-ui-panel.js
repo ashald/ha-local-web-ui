@@ -1,8 +1,11 @@
-// Local Web UIs panel. Plain web component, no build step.
+// Local Web UIs: the panel and the dashboard card. Plain web components, no build step.
 //
 // /local-web-ui               list of web UIs (devices, sites, hidden)
 // /local-web-ui/<view_id>     one web UI in an iframe
 // /local-web-ui-<view_id>     sidebar entry for one web UI (panel.config.view_id)
+// custom:local-web-ui-card    one web UI on a dashboard (this module is loaded on every page)
+//
+// Admins see and open every web UI; other users the ones shared with them.
 
 const SANDBOX =
   "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads";
@@ -153,11 +156,15 @@ class LocalWebUiPanel extends HTMLElement {
 
   // ---- list ----------------------------------------------------------------
 
+  get _admin() { return !!this._hass?.user?.is_admin; }
+
   async _showList() {
     const key = this._key;
+    const settings = this._admin
+      ? `<a class="button" href="${SETTINGS_PATH}" title="Add web UIs and change options">${icon("mdi:cog", "⚙")}<span class="label">Settings</span></a>`
+      : "";
     this.shadowRoot.innerHTML =
-      this._toolbar("Local Web UIs", "", `<a class="button" href="/config/integrations/integration/local_web_ui"
-        title="Add web UIs and change options">${icon("mdi:cog", "⚙")}<span class="label">Settings</span></a>`) +
+      this._toolbar("Local Web UIs", "", settings) +
       `<div class="content"><div class="inner"><div class="message">Loading…</div></div></div>`;
     this._bindToolbar();
     let result;
@@ -176,10 +183,17 @@ class LocalWebUiPanel extends HTMLElement {
 
   _renderList() {
     const { views, discovery, discovered } = this._views;
-    const devices = views.filter((v) => v.device_id);
-    const sites = views.filter((v) => !v.device_id);
     const section = (title, list) =>
       list.length ? `<h2>${esc(title)}</h2>${list.map((v) => this._row(v)).join("")}` : "";
+    if (!this._admin) {
+      this._inner().innerHTML = views.length
+        ? section("Web UIs", views)
+        : `<div class="message">No web UIs are shared with you yet. An admin can share one in its settings.</div>`;
+      this._bindRows(views);
+      return;
+    }
+    const devices = views.filter((v) => v.device_id);
+    const sites = views.filter((v) => !v.device_id);
     let html = `<div class="actions"><span class="hint">Each web UI is an entry of the integration:
       its settings are behind the ⚙ button on its row.</span>
       <a class="button" href="${SETTINGS_PATH}">${icon("mdi:plus", "+")} Add a web UI</a></div>`;
@@ -197,6 +211,10 @@ class LocalWebUiPanel extends HTMLElement {
       }<br>You can also add any local site with "Add a web UI".</div>`;
     }
     this._inner().innerHTML = html;
+    this._bindRows(views);
+  }
+
+  _bindRows(views) {
     this._inner().querySelectorAll(".row").forEach((row) => {
       const view = views.find((v) => v.view_id === row.dataset.id);
       row.addEventListener("click", (ev) => {
@@ -223,7 +241,7 @@ class LocalWebUiPanel extends HTMLElement {
       <div class="row-actions">
         <button data-act="open-tab" title="Open in a new tab">${icon("mdi:open-in-new", "↗")}</button>
         ${v.device_id ? `<button data-act="device" title="Device page">${icon("mdi:devices", "▣")}</button>` : ""}
-        <button data-act="settings" title="Settings (mode, login, Visit button…)">${icon("mdi:cog", "⚙")}</button>
+        ${this._admin ? `<button data-act="settings" title="Settings (mode, login, who can open it…)">${icon("mdi:cog", "⚙")}</button>` : ""}
       </div>
     </div>`;
   }
@@ -359,4 +377,255 @@ class LocalWebUiPanel extends HTMLElement {
   }
 }
 
-customElements.define("local-web-ui-panel", LocalWebUiPanel);
+// ---- dashboard card ----------------------------------------------------------
+//
+//   type: custom:local-web-ui-card
+//   view_id: 01ABC…          the web UI (its entry id; the card editor offers a list)
+//   title: Printer            optional card header
+//   aspect_ratio: 75%         height as a share of the width (or 16:9); in a sections or
+//                             panel view the card fills the space it is given instead
+//
+// It opens a session of its own, like the panel, keeps it alive while it is shown and
+// renews it when it runs out. Isolated web UIs get the same sandbox as in the panel.
+
+const CARD_TYPE = "local-web-ui-card";
+const DEFAULT_ASPECT_RATIO = "75%";
+
+// "75%", "16:9", "16x9" → padding-top percentage, or null if invalid
+function aspectPercent(value) {
+  const text = String(value ?? DEFAULT_ASPECT_RATIO).trim();
+  let m = text.match(/^(\d+(?:\.\d+)?)\s*%$/);
+  if (m) return Number(m[1]) > 0 ? Number(m[1]) : null;
+  m = text.match(/^(\d+(?:\.\d+)?)\s*[:x]\s*(\d+(?:\.\d+)?)$/i);
+  if (m && Number(m[1]) > 0 && Number(m[2]) > 0) return (Number(m[2]) / Number(m[1])) * 100;
+  return null;
+}
+
+const CARD_STYLE = `
+  :host { display: block; height: 100%; }
+  ha-card, .card { overflow: hidden; height: 100%; width: 100%; display: flex; flex-direction: column;
+                   box-sizing: border-box; }
+  .frame { position: relative; width: 100%; flex: none; }
+  /* Sections (grid) and panel views give the card its height: fill it */
+  :host([layout="grid"]) .frame, :host([layout="panel"]) .frame {
+    flex: 1 1 auto; padding-top: 0 !important; min-height: 0; }
+  iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: white; }
+  .message { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+             padding: 16px; text-align: center; color: var(--secondary-text-color); }
+`;
+
+class LocalWebUiCard extends HTMLElement {
+  static getConfigElement() {
+    return document.createElement(`${CARD_TYPE}-editor`);
+  }
+
+  static async getStubConfig(hass) {
+    try {
+      const { views } = await hass.callWS({ type: "local_web_ui/views" });
+      if (views.length) return { view_id: views[0].view_id };
+    } catch {
+      /* not set up: the editor says so */
+    }
+    return { view_id: "" };
+  }
+
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._config = null;
+    this._session = null;
+    this._timer = null;
+    this._generation = 0;
+  }
+
+  setConfig(config) {
+    if (!config || typeof config !== "object") throw new Error("Invalid configuration");
+    if (config.aspect_ratio != null && aspectPercent(config.aspect_ratio) === null) {
+      throw new Error(`Invalid aspect_ratio "${config.aspect_ratio}": use a percentage (75%) or a ratio (16:9)`);
+    }
+    const changed = !this._config || this._config.view_id !== config.view_id;
+    this._config = { ...config };
+    if (changed) this._restart();
+    else this._render();
+  }
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) this._restart();
+  }
+
+  // Set by Home Assistant: "grid" in a sections view, "panel" in a panel view
+  set layout(layout) {
+    if (layout) this.setAttribute("layout", layout);
+    else this.removeAttribute("layout");
+  }
+
+  getCardSize() {
+    return Math.max(3, Math.round((aspectPercent(this._config?.aspect_ratio) ?? 75) / 12.5));
+  }
+
+  getGridOptions() {
+    return { columns: "full", rows: 6, min_rows: 2, min_columns: 3 };
+  }
+
+  connectedCallback() { this._restart(); }
+
+  disconnectedCallback() {
+    clearInterval(this._timer);
+    this._timer = null;
+    this._generation++;
+  }
+
+  _render(message) {
+    const config = this._config || {};
+    const ratio = aspectPercent(config.aspect_ratio) ?? 75;
+    const session = message ? null : this._session;
+    const view = session?.view;
+    const isolated = view?.mode !== "trusted";
+    const card = customElements.get("ha-card") ? "ha-card" : "div";
+    const body = session
+      ? `<iframe title="${esc(view.name)}" src="${esc(session.url)}" ${isolated ? `sandbox="${SANDBOX}"` : ""}
+                 allow="fullscreen; clipboard-write" referrerpolicy="same-origin"></iframe>`
+      : `<div class="message">${esc(message || "Connecting…")}</div>`;
+    this.shadowRoot.innerHTML = `<style>${CARD_STYLE}</style>
+      <${card} class="card" ${config.title ? `header="${esc(config.title)}"` : ""}>
+        <div class="frame" style="padding-top: ${ratio}%">${body}</div>
+      </${card}>`;
+  }
+
+  async _restart() {
+    clearInterval(this._timer);
+    this._timer = null;
+    const generation = ++this._generation;
+    this._session = null;
+    if (!this.isConnected || !this._hass || !this._config) return;
+    const viewId = this._config.view_id;
+    if (!viewId) {
+      this._render("Choose a web UI in the card's settings.");
+      return;
+    }
+    this._render();
+    try {
+      this._session = await this._open(viewId);
+    } catch (err) {
+      if (generation === this._generation) this._render(err?.message || String(err));
+      return;
+    }
+    if (generation !== this._generation) return;
+    this._render();
+    this._timer = setInterval(async () => {
+      try {
+        const next = await this._open(viewId, this._session.token);
+        if (generation !== this._generation) return;
+        if (next.token !== this._session.token) {
+          const previous = this._session;
+          this._session = next;
+          const frame = this.shadowRoot.querySelector("iframe");
+          // Same sandbox: just point the frame at the new session
+          if (frame && next.view.mode === previous.view.mode) frame.src = next.url;
+          else this._render();
+        }
+      } catch {
+        /* Home Assistant unreachable for now: try again on the next beat */
+      }
+    }, KEEPALIVE_MS);
+  }
+
+  _open(viewId, token) {
+    return this._hass.callWS({ type: "local_web_ui/session", view_id: viewId, ...(token ? { token } : {}) });
+  }
+}
+
+class LocalWebUiCardEditor extends HTMLElement {
+  setConfig(config) {
+    this._config = { ...config };
+    this._render();
+  }
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) this._load();
+    if (this._form) this._form.hass = hass;
+  }
+
+  async _load() {
+    try {
+      this._views = (await this._hass.callWS({ type: "local_web_ui/views" })).views;
+    } catch (err) {
+      this._error = err?.message || String(err);
+    }
+    this._render();
+  }
+
+  _render() {
+    if (!this._hass || !this._config) return;
+    if (this._error || (this._views && !this._views.length)) {
+      this.innerHTML = `<p>${esc(this._error || "There are no web UIs you can open yet.")}</p>`;
+      this._form = null;
+      return;
+    }
+    if (!this._views) return;
+    if (!this._form) {
+      this.innerHTML = "";
+      this._form = document.createElement("ha-form");
+      this._form.computeLabel = (field) =>
+        ({ view_id: "Web UI", title: "Title", aspect_ratio: "Aspect ratio" })[field.name];
+      this._form.computeHelper = (field) =>
+        field.name === "aspect_ratio"
+          ? `Height as a share of the width, such as 75% (the default) or 16:9. In a sections or panel view the card fills the space it is given.`
+          : undefined;
+      this._form.addEventListener("value-changed", (ev) => {
+        ev.stopPropagation();
+        const config = { ...ev.detail.value };
+        for (const key of ["title", "aspect_ratio"]) if (!config[key]) delete config[key];
+        this._config = config;
+        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true }));
+      });
+      this.appendChild(this._form);
+    }
+    this._form.hass = this._hass;
+    this._form.schema = [
+      {
+        name: "view_id",
+        required: true,
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: this._views.map((v) => ({ value: v.view_id, label: v.name })),
+          },
+        },
+      },
+      { name: "title", selector: { text: {} } },
+      { name: "aspect_ratio", selector: { text: {} } },
+    ];
+    this._form.data = this._config;
+  }
+}
+
+const ELEMENTS = [
+  ["local-web-ui-panel", LocalWebUiPanel],
+  [CARD_TYPE, LocalWebUiCard],
+  [`${CARD_TYPE}-editor`, LocalWebUiCardEditor],
+];
+function defineElements() {
+  const registry = window.customElements;
+  for (const [name, cls] of ELEMENTS) if (!registry.get(name)) registry.define(name, cls);
+}
+// This module is loaded on every page as early as Home Assistant's own app (for the card),
+// and the app replaces window.customElements with a scoped registry polyfill as it starts.
+// Elements defined before that swap are lost to it, so define them once the app is up, in
+// the registry it ends up with. Loaded later (the panel), this runs right away.
+window.customElements.whenDefined("home-assistant").then(defineElements);
+
+window.customCards = window.customCards || [];
+if (!window.customCards.some((card) => card.type === CARD_TYPE)) {
+  window.customCards.push({
+    type: CARD_TYPE,
+    name: "Local Web UI",
+    description: "A web UI from Local Web UIs: a device's or a site's own page, isolated like in the sidebar.",
+    preview: false,
+    documentationURL: "https://github.com/ashald/ha-local-web-ui#dashboard-card",
+  });
+}

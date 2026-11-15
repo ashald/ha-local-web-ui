@@ -21,6 +21,7 @@ from homeassistant.helpers.selector import (
     BooleanSelector,
     IconSelector,
     ObjectSelector,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -53,6 +54,7 @@ from .const import (
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
+    CONF_USERS,
     CONF_VERIFY_SSL,
     CONF_VISIT_LINK,
     DEFAULT_DISCOVERY,
@@ -134,7 +136,7 @@ class LocalWebUiConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="web_ui",
             data_schema=self.add_suggested_values_to_schema(
-                _view_schema(manual=True, device=False),
+                _view_schema(manual=True, device=False, users=await _shareable_users(self.hass)),
                 {k: v for k, v in (user_input or {}).items() if k not in SECRETS},
             ),
             errors=errors,
@@ -327,21 +329,40 @@ class WebUiOptionsFlow(OptionsFlow):
             return self.async_create_entry(
                 data=_view_options(user_input, dict(entry.options), manual=manual)
             )
+        users = await _shareable_users(self.hass)
         current: dict[str, Any] = {k: v for k, v in entry.options.items() if k not in SECRETS}
         if manual:
             current[CONF_NAME] = entry.title
+        # Someone made an admin meanwhile sees it anyway; the list only offers others
+        shareable = {u["value"] for u in users}
+        current[CONF_USERS] = [u for u in current.get(CONF_USERS, []) if u in shareable]
         typed = {k: v for k, v in (user_input or {}).items() if k not in SECRETS}
         return self.async_show_form(
             step_id="web_ui",
             data_schema=self.add_suggested_values_to_schema(
-                _view_schema(manual=manual, device=not manual), {**current, **typed}
+                _view_schema(manual=manual, device=not manual, users=users), {**current, **typed}
             ),
             errors=errors,
             description_placeholders={"panel_url": f"/{PANEL_URL_PATH}/{entry.entry_id}"},
         )
 
 
-def _view_schema(manual: bool, device: bool) -> vol.Schema:
+async def _shareable_users(hass: HomeAssistant) -> list[SelectOptionDict]:
+    """Users a web UI can be shared with: people who are not admins (those see all)."""
+    users = [
+        u
+        for u in await hass.auth.async_get_users()
+        if u.is_active and not u.system_generated and not u.is_admin
+    ]
+    return [
+        SelectOptionDict(value=u.id, label=u.name or u.id)
+        for u in sorted(users, key=lambda u: (u.name or "").casefold())
+    ]
+
+
+def _view_schema(
+    manual: bool, device: bool, users: list[SelectOptionDict] | None = None
+) -> vol.Schema:
     schema: dict[Any, Any] = {}
     if manual:
         schema[vol.Required(CONF_NAME)] = TextSelector()
@@ -387,6 +408,9 @@ def _view_schema(manual: bool, device: bool) -> vol.Schema:
         )
     )
     schema[vol.Optional(CONF_AUDIENCE)] = TextSelector()
+    schema[vol.Optional(CONF_USERS, default=[])] = SelectSelector(
+        SelectSelectorConfig(options=users or [], multiple=True, mode=SelectSelectorMode.LIST)
+    )
     schema[vol.Required(CONF_SHOW_IN_SIDEBAR, default=False)] = BooleanSelector()
     schema[vol.Optional(CONF_ICON)] = IconSelector()
     return vol.Schema(schema)
@@ -478,6 +502,8 @@ def _view_options(
         options[CONF_IDENTITY] = identity
         if audience := (user_input.get(CONF_AUDIENCE) or "").strip():
             options[CONF_AUDIENCE] = audience
+    if users := sorted(set(user_input.get(CONF_USERS) or [])):
+        options[CONF_USERS] = users
     if user_input.get(CONF_ICON):
         options[CONF_ICON] = user_input[CONF_ICON]
     return options

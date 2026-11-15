@@ -30,6 +30,7 @@ You don't need to open ports or change any firmware.
   - a stored login, sent as HTTP Basic or Digest auth so you are never prompted;
   - an API token, sent as a Bearer token, in `X-Api-Key`, or in a header you name;
   - who is viewing, as a token Home Assistant signs (see [Who is viewing](#who-is-viewing));
+  - who else can open it: users who are not admins (see [Sharing](#sharing-with-users-who-are-not-admins));
   - whether to verify the SSL certificate;
   - its own sidebar entry.
 - **Linked devices.** Each device web UI has a device of its own, "*device* web UI". Home
@@ -46,6 +47,7 @@ You don't need to open ports or change any firmware.
   page has buttons back to that device page (and to its linked device).
 - **Your sidebar.** The name and icon of the Local Web UIs entry can be changed, or the
   entry hidden, in the global settings.
+- **Dashboard card.** Show a web UI on any dashboard (see [Dashboard card](#dashboard-card)).
 - **Isolated by default.** See the next section.
 
 ## Isolated and trusted
@@ -127,6 +129,45 @@ Its `X-Auth-Request-User`, `-Email`, `-Preferred-Username` and `-Groups` then co
 token's `sub`, `email`, `preferred_username` and `groups`, the same headers a browser login
 produces. Without an `email` claim, oauth2-proxy uses `sub` as the email.
 
+## Sharing with users who are not admins
+
+Admins can open every web UI. In a web UI's settings, **Who else can open it** lists the
+Home Assistant users who are not admins; the ones you choose can open that web UI too, from
+its sidebar entry, the *Local Web UIs* list or a dashboard card. Everything else stays admin
+only: the settings, discovery, and the other web UIs.
+
+- Home Assistant checks it on every request, not only when the page opens. Taking someone
+  off the list ends their open sessions at once, and a user who stops being an admin keeps
+  only what is shared with them.
+- They see the web UI's name, icon and area, never its address, device or settings.
+- They use it with the login or token stored in its settings, and each has their own cookies
+  and saved data, like admins.
+- A **trusted** web UI runs with Home Assistant's own origin, so its pages can act in Home
+  Assistant as whoever is viewing (with that user's permissions). Share only trusted web UIs
+  you trust for each of them.
+- Sidebar entries are the same for every user in Home Assistant. A web UI's own sidebar entry
+  shows for everyone once it is shared with anyone, and the *Local Web UIs* entry once anything
+  is shared; users who may not open a web UI get "This web UI is not available to you". A
+  dashboard view or a card, which you can show to some users only, avoids that.
+
+## Dashboard card
+
+`custom:local-web-ui-card` shows one web UI on a dashboard, with its own session, kept alive
+while the card is shown, and the same isolation as the panel. Add it from the card picker
+(*Local Web UI*), or in YAML:
+
+```yaml
+type: custom:local-web-ui-card
+view_id: 01JABCDEF...      # the web UI; the card editor offers a list
+title: Printer             # optional
+aspect_ratio: 75%          # optional: height as a share of the width (or 16:9)
+```
+
+In a sections or panel view the card fills the space it is given instead of using
+`aspect_ratio`. Users who may not open the web UI see "This web UI is not available to you"
+in the card. The card's code is loaded on every page of the frontend while the integration is
+set up, so no dashboard resource needs to be added.
+
 ## Install
 
 Requires Home Assistant 2026.9 or newer.
@@ -137,7 +178,8 @@ Requires Home Assistant 2026.9 or newer.
 3. *Settings → Devices & services → Add integration → Local Web UIs.* This creates the
    entry for the global settings; add it again for each site of your own.
 4. Add the discovered devices you want from *Discovered* on the integrations page.
-5. Open **Local Web UIs** in the sidebar. It is visible to admin users only.
+5. Open **Local Web UIs** in the sidebar. Admins see it always; other users once a web UI is
+   shared with them.
 
 **Upgrading from 0.2.** Your web UIs move to entries of their own on the first start, with
 their settings, logins and saved site data. Hidden devices become ignored discoveries.
@@ -169,7 +211,9 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the details.
 
 ## Limitations
 
-- **Admin only.** Web UIs are available to admin users only (for now).
+- **Sidebar entries are global.** Home Assistant shows a panel to all users or to admins only,
+  so the sidebar entry of a web UI shared with some users shows for all of them (see
+  [Sharing](#sharing-with-users-who-are-not-admins)).
 - **Absolute URLs in JavaScript modules.** Some URLs can't be rewritten, most notably
   root-relative `import "/…"` statements in JavaScript modules. A page that relies on them may
   not load. The same goes for a page that builds URLs from `location.origin` while isolated,
@@ -186,12 +230,6 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the details.
 
 ## Possible future work
 
-- **Dashboard cards.** Home Assistant's own *Webpage* card cannot show these web UIs: it
-  takes a fixed URL, while the proxy's URLs carry a short-lived session. A card of this
-  integration could get and renew the session the way the panel does, with the same
-  isolation. It needs non-admin access first (below), since dashboards are often viewed
-  by users who are not admins.
-- **Non-admin users,** with a list of web UIs each user may open.
 - **A pluggable transport,** for example tunnelling ESPHome's web server over its native
   API, so it works without a direct network path to the device.
 

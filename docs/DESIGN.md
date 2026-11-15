@@ -316,6 +316,37 @@ with no build step.
 
 Adding, ignoring and editing web UIs go through HA's own config entry flows.
 
+## Users who are not admins (0.5)
+
+- A view's `users` option lists user ids, besides admins, who may open it
+  (`LocalWebUiHub.may_open`: `user.is_admin or user.id in view.users`). The options form offers
+  active, non-system users who are not admins.
+- Checked on every proxied request (`proxy._handle_request`): a session whose user may no longer
+  open the view is ended (that session only). Sessions remember whether an admin opened them;
+  `SessionManager.end_unshared` ends a non-admin's sessions as soon as the view stops being
+  shared with them (on every `async_refresh`).
+- Websocket API: `views` returns only what the user may open, and for non-admins only
+  `view_id, name, subtitle, mode, area, icon`; `session` and `clear_site_data` answer
+  `not_found` "not available to you" whether or not the view exists. Admins can still clear
+  data of a view that has none right now.
+- Panels: a view's sidebar panel is `require_admin` unless it is shared; the list panel unless
+  any view is. HA panels are global, so the entry shows for every user then.
+
+## Dashboard card (0.5)
+
+- `custom:local-web-ui-card` (`view_id`, `title`, `aspect_ratio`) and its editor
+  (`ha-form`, a select of the views from `local_web_ui/views`) live in the panel's module, which
+  is also registered with `frontend.add_extra_js_url` while any entry is loaded (versioned
+  by content; removed when the last entry unloads). It is listed in `window.customCards`.
+- The card opens its own session (`local_web_ui/session`), keeps it alive every 60 s while
+  connected, and points the iframe at the new session when it is renewed; same sandbox as the
+  panel for isolated views. In `layout` "grid" (sections) or "panel" it fills its height.
+- HA's index page imports extra modules at the same time as its app, and the app replaces
+  `window.customElements` with a scoped-registry polyfill as it starts: elements defined
+  before that are lost to it. The module therefore defines its elements after
+  `customElements.whenDefined("home-assistant")`, in the registry the app ends up with
+  (seen in HA 2026.9: the card was "Custom element doesn't exist" on some loads).
+
 ## Known limitations
 
 - **HA's security filter** rejects (400) request paths and queries that look like attacks
@@ -330,9 +361,4 @@ Adding, ignoring and editing web UIs go through HA's own config entry flows.
 ## Out of scope (designed for)
 
 - A pluggable transport, for example the ESPHome native-API tunnel from variant 1.
-- Non-admin users with per-view allow lists.
-- A dashboard card (`custom:local-web-ui-card` with a `view_id`), loaded as a frontend
-  extra module. It would reuse the panel's view code: get a session over the WebSocket
-  API, keep it alive, and show the iframe with the same sandbox. HA's own iframe card
-  cannot do this, because session URLs expire. It depends on non-admin access, since
-  sessions are admin only today.
+

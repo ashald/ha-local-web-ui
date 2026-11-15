@@ -64,6 +64,8 @@ PANEL_FILE = Path(__file__).parent / "www" / "local-web-ui-panel.js"
 DATA_MODULE_URL = f"{DOMAIN}_module_url"
 # Registered panels: url path -> what they were registered with
 DATA_PANELS = f"{DOMAIN}_panels"
+# The module loaded on every frontend page for the dashboard card (the panel's own)
+DATA_CARD_URL = f"{DOMAIN}_card_url"
 
 type LocalWebUiConfigEntry = ConfigEntry[LocalWebUiHub]
 
@@ -133,12 +135,16 @@ async def async_remove_entry(hass: HomeAssistant, entry: LocalWebUiConfigEntry) 
 # ---- panels ---------------------------------------------------------------------
 
 
-def _panel(hass: HomeAssistant, title: str, icon: str, config: dict[str, Any]) -> dict[str, Any]:
+def _panel(
+    hass: HomeAssistant, title: str, icon: str, config: dict[str, Any], require_admin: bool
+) -> dict[str, Any]:
     return {
         "component_name": "custom",
         "sidebar_title": title,
         "sidebar_icon": icon,
-        "require_admin": True,
+        # Panels are the same for every user: one shared with anyone but admins shows
+        # for all users, and the web UIs themselves check who may open them
+        "require_admin": require_admin,
         "config": {
             **config,
             "_panel_custom": {
@@ -156,9 +162,20 @@ def _async_sync_panels(hass: HomeAssistant) -> None:
     """The main panel while any entry is loaded, and the sidebar entries of web UIs.
 
     The main panel also serves the web UIs' own pages (device "Visit" links), so
-    it stays registered even when hidden from the sidebar.
+    it stays registered even when hidden from the sidebar. While any entry is
+    loaded, the dashboard card is loaded on every page of the frontend.
     """
     hub: LocalWebUiHub = hass.data[DOMAIN]
+    module_url: str = hass.data[DATA_MODULE_URL]
+    card_url = hass.data.get(DATA_CARD_URL)
+    if hub.active and card_url != module_url:
+        if card_url is not None:
+            frontend.remove_extra_js_url(hass, card_url)
+        frontend.add_extra_js_url(hass, module_url)
+        hass.data[DATA_CARD_URL] = module_url
+    elif not hub.active and card_url is not None:
+        frontend.remove_extra_js_url(hass, card_url)
+        del hass.data[DATA_CARD_URL]
     wanted: dict[str, tuple[dict[str, Any], bool]] = {}
     if hub.active:
         options = hub.hub_entry.options if hub.hub_entry else {}
@@ -168,13 +185,20 @@ def _async_sync_panels(hass: HomeAssistant) -> None:
                 options.get(CONF_PANEL_TITLE) or NAME,
                 options.get(CONF_PANEL_ICON) or DEFAULT_PANEL_ICON,
                 {},
+                require_admin=not hub.shared,
             ),
             hub.hub_entry is not None and options.get(CONF_SHOW_PANEL, DEFAULT_SHOW_PANEL),
         )
         for view in hub.views.values():
             if view.show_in_sidebar:
                 wanted[f"{PANEL_URL_PATH}-{view.view_id.lower()}"] = (
-                    _panel(hass, view.name, view.icon or "mdi:web", {"view_id": view.view_id}),
+                    _panel(
+                        hass,
+                        view.name,
+                        view.icon or "mdi:web",
+                        {"view_id": view.view_id},
+                        require_admin=not view.users,
+                    ),
                     True,
                 )
     current: dict[str, tuple[dict[str, Any], bool]] = hass.data.setdefault(DATA_PANELS, {})

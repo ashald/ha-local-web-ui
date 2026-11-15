@@ -50,6 +50,8 @@ CONF_AUDIENCE: Final = "audience"
 IDENTITY_NONE: Final = "none"
 IDENTITY_BEARER: Final = "bearer"
 IDENTITY_CHOICES: Final = (IDENTITY_NONE, IDENTITY_BEARER)
+# Users other than admins who may open a web UI (admins can open every one)
+CONF_USERS: Final = "users"
 CONF_SHOW_IN_SIDEBAR: Final = "show_in_sidebar"
 CONF_ICON: Final = "icon"
 CONF_DEVICE_ID: Final = "device_id"

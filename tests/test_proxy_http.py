@@ -68,6 +68,7 @@ from custom_components.local_web_ui.const import (
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
+    CONF_USERS,
     CONF_VERIFY_SSL,
     DOMAIN,
     IDENTITY_BEARER,
@@ -806,6 +807,58 @@ async def test_session_of_user_no_longer_admin_is_not_found(
     assert hass_admin_user.is_admin
     assert (await env.client.get(prefix + "/echo")).status == 404
     assert len(env.upstream.requests) == requests_before
+
+
+async def _plain_login(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, name: str
+) -> tuple[MockUser, MockHAClientWebSocket]:
+    """A websocket connection of a user who is not an admin."""
+    group = await hass.auth.async_get_group(GROUP_ID_USER)
+    user = MockUser(name=name, groups=[group]).add_to_hass(hass)
+    refresh_token = await hass.auth.async_create_refresh_token(user, CLIENT_ID)
+    return user, await hass_ws_client(hass, hass.auth.async_create_access_token(refresh_token))
+
+
+async def _share(env: Env, view_id: str, *user_ids: str) -> None:
+    entry = env.web_uis[view_id]
+    options = {k: v for k, v in entry.options.items() if k != CONF_USERS}
+    if user_ids:
+        options[CONF_USERS] = list(user_ids)
+    env.hass.config_entries.async_update_entry(entry, options=options)
+    await env.hass.async_block_till_done()
+
+
+async def test_shared_web_ui_opens_for_its_users(
+    env: Env, hass_ws_client: WebSocketGenerator
+) -> None:
+    kids, ws = await _plain_login(env.hass, hass_ws_client, "Kids")
+    await _share(env, ISO, kids.id)
+    prefix = await env.prefix(ISO, ws)
+    response = await env.client.get(prefix + "/page")
+    assert response.status == 200
+    assert SHIM_MARKER in await response.read()
+    # Its own cookies and storage, like any user's
+    assert (await env.client.get(prefix + "/echo")).status == 200
+    # Unshared: the session ends at once
+    await _share(env, ISO)
+    assert (await env.client.get(prefix + "/echo")).status == 404
+
+
+async def test_demoted_admin_keeps_what_is_shared_with_them(
+    env: Env, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws, refresh_token = await _admin_login(env.hass, hass_ws_client, "Former admin")
+    user = refresh_token.user
+    await _share(env, ISO, user.id)
+    shared = await env.prefix(ISO, ws)
+    private = await env.prefix(TRUSTED, ws)
+    user.groups = [await env.hass.auth.async_get_group(GROUP_ID_USER)]
+    assert not user.is_admin
+    assert (await env.client.get(shared + "/echo")).status == 200
+    assert (await env.client.get(private + "/echo")).status == 404
+    # That session is over; the shared one still works
+    assert env.hub.sessions.get(private.rsplit("/", 1)[1]) is None
+    assert (await env.client.get(shared + "/echo")).status == 200
 
 
 async def test_session_of_deactivated_user_is_not_found(

@@ -22,6 +22,7 @@
           "token": "Token",
           "identity": "Tell the site who is viewing",
           "audience": "Audience",
+          "users": "Who else can open it",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -36,6 +37,7 @@
           "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
           "identity": "Sends the Home Assistant user viewing this web UI to the site with every request, as a short-lived token signed by Home Assistant (an OpenID Connect JWT). The site, or a gateway in front of it such as oauth2-proxy, checks it with the keys Home Assistant publishes; set up the person's details in the Local Web UIs options. Choose a listed way or type the name of a header to send the token in. Send it only to sites you trust: it says who you are.",
           "audience": "The token's audience (aud), which the site checks. Leave empty for the site's own address (scheme, host and port).",
+          "users": "Admins can open every web UI. The users chosen here, who are not admins, can open this one too: from its sidebar entry, the Local Web UIs list or a dashboard card. They use it with the login or token stored here, and if it is trusted, its pages can act as them in Home Assistant. Sidebar entries are the same for everyone, so other users see this one's entry too, but cannot open it.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       },
@@ -103,6 +105,7 @@
           "token": "Token",
           "identity": "Tell the site who is viewing",
           "audience": "Audience",
+          "users": "Who else can open it",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -118,6 +121,7 @@
           "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
           "identity": "Sends the Home Assistant user viewing this web UI to the site with every request, as a short-lived token signed by Home Assistant (an OpenID Connect JWT). The site, or a gateway in front of it such as oauth2-proxy, checks it with the keys Home Assistant publishes; set up the person's details in the Local Web UIs options. Choose a listed way or type the name of a header to send the token in. Send it only to sites you trust: it says who you are.",
           "audience": "The token's audience (aud), which the site checks. Leave empty for the site's own address (scheme, host and port).",
+          "users": "Admins can open every web UI. The users chosen here, who are not admins, can open this one too: from its sidebar entry, the Local Web UIs list or a dashboard card. They use it with the login or token stored here, and if it is trusted, its pages can act as them in Home Assistant. Sidebar entries are the same for everyone, so other users see this one's entry too, but cannot open it.",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       }

@@ -19,6 +19,7 @@ from typing import Any
 
 import aiohttp
 from homeassistant.auth import EVENT_USER_REMOVED
+from homeassistant.auth.models import User
 from homeassistant.config_entries import SOURCE_INTEGRATION_DISCOVERY, ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.helpers import (
@@ -51,6 +52,7 @@ from .const import (
     CONF_TOKEN_HEADER,
     CONF_URL,
     CONF_USERNAME,
+    CONF_USERS,
     CONF_VERIFY_SSL,
     CONF_VISIT_LINK,
     DEFAULT_DISCOVERY,
@@ -114,6 +116,8 @@ class View:
     # Header that carries the viewer's identity token (Authorization: as a Bearer token)
     identity_header: str | None = None
     audience: str = ""  # The identity token's aud
+    # Users other than admins who may open it
+    users: frozenset[str] = frozenset()
 
     @property
     def url(self) -> str:
@@ -289,6 +293,8 @@ class Session:
     refresh_token_id: str | None
     created: float
     expires: float
+    # Opened by an admin; otherwise only while the view is shared with the user
+    admin: bool = True
     websockets: set[Callable[[], Coroutine[Any, Any, Any]]] = field(default_factory=set)
     # Other long-lived responses (server-sent events, downloads, camera streams)
     streams: set[Callable[[], Coroutine[Any, Any, Any]]] = field(default_factory=set)
@@ -307,7 +313,9 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._revoke_unsubs: dict[str, CALLBACK_TYPE] = {}
 
-    def create(self, view_id: str, user_id: str, refresh_token_id: str | None) -> Session:
+    def create(
+        self, view_id: str, user_id: str, refresh_token_id: str | None, admin: bool = True
+    ) -> Session:
         self.expire()
         now = time.monotonic()
         session = Session(
@@ -317,6 +325,7 @@ class SessionManager:
             refresh_token_id,
             now,
             now + SESSION_TTL,
+            admin,
         )
         self._sessions[session.token] = session
         if refresh_token_id is not None and refresh_token_id not in self._revoke_unsubs:
@@ -352,6 +361,20 @@ class SessionManager:
     def end_all(self) -> None:
         """End every session, closing its WebSockets (integration disabled or removed)."""
         for session in list(self._sessions.values()):
+            self._end(session)
+
+    def end(self, token: str) -> None:
+        if (session := self._sessions.get(token)) is not None:
+            self._end(session)
+
+    def end_unshared(self, views: dict[str, View]) -> None:
+        """End non-admins' sessions of web UIs no longer shared with them."""
+        for session in [
+            s
+            for s in self._sessions.values()
+            if not s.admin
+            and ((view := views.get(s.view_id)) is None or s.user_id not in view.users)
+        ]:
             self._end(session)
 
     def revoke_user(self, user_id: str) -> None:
@@ -651,6 +674,7 @@ class LocalWebUiHub:
         """Bring views, device links, web UI devices and discovery up to date."""
         previous = self._views
         self._views = self._build_views()
+        self.sessions.end_unshared(self._views)
         self.identity.async_forget_tokens()  # Claims or addresses may have changed
         for view_id, old in previous.items():
             # A web UI moved to another site must not hand it the old site's data
@@ -727,6 +751,7 @@ class LocalWebUiHub:
                 token_header=token_header,
                 identity_header=identity_header,
                 audience=(options.get(CONF_AUDIENCE) or "").strip() or str(origin),
+                users=frozenset(options.get(CONF_USERS) or ()),
             )
         return views
 
@@ -736,6 +761,16 @@ class LocalWebUiHub:
 
     def get_view(self, view_id: str) -> View | None:
         return self._views.get(view_id)
+
+    @staticmethod
+    def may_open(user: User, view: View) -> bool:
+        """Admins open every web UI; other users the ones shared with them."""
+        return user.is_admin or user.id in view.users
+
+    @property
+    def shared(self) -> bool:
+        """Whether any web UI is open to users other than admins."""
+        return any(view.users for view in self._views.values())
 
     def view_for_device(self, device_id: str) -> View | None:
         return next((v for v in self._views.values() if v.device_id == device_id), None)

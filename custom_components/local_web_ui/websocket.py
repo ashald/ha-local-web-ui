@@ -1,4 +1,9 @@
-"""Websocket API for the panel. Admin only."""
+"""Websocket API for the panel and the dashboard card.
+
+Admins see and open every web UI. Other users see and open only the web UIs
+shared with them, and only what they need to show one: no addresses, devices
+or settings.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +38,31 @@ def _hub(
     return hub
 
 
-def _view_json(hub: LocalWebUiHub, view: View) -> dict[str, Any]:
+def _view_for(
+    hub: LocalWebUiHub, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> View | None:
+    """The requested web UI, if the user may open it; else an error is sent."""
+    view = hub.get_view(msg["view_id"])
+    if view is not None and hub.may_open(connection.user, view):
+        return view
+    if view is None and connection.user.is_admin:
+        connection.send_error(msg["id"], "not_found", "This web UI no longer exists")
+    else:
+        # Same answer whether it exists or not
+        connection.send_error(msg["id"], "not_found", "This web UI is not available to you")
+    return None
+
+
+def _view_json(hub: LocalWebUiHub, view: View, admin: bool = True) -> dict[str, Any]:
+    if not admin:
+        return {
+            "view_id": view.view_id,
+            "name": view.name,
+            "subtitle": view.subtitle,
+            "mode": view.mode,
+            "area": hub.area_name(view.device_id),
+            "icon": view.icon,
+        }
     device_link = None
     if view.device_id is not None:
         device = main_device(dr.async_get(hub.hass), view.device_id)
@@ -58,17 +87,30 @@ def _view_json(hub: LocalWebUiHub, view: View) -> dict[str, Any]:
         "show_in_sidebar": view.show_in_sidebar,
         "device_link": device_link,
         "linked_device_id": hub.linked_device_id(view.view_id),
+        "users": sorted(view.users),
     }
 
 
-@websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/views"})
 @callback
 def ws_views(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """List the web UIs, and how many discovered ones wait to be added."""
+    """List the web UIs the user may open; for admins, also discovery's state."""
     if (hub := _hub(hass, connection, msg["id"])) is None:
+        return
+    user = connection.user
+    if not user.is_admin:
+        connection.send_result(
+            msg["id"],
+            {
+                "views": [
+                    _view_json(hub, view, admin=False)
+                    for view in hub.views.values()
+                    if hub.may_open(user, view)
+                ],
+            },
+        )
         return
     discovered = hass.config_entries.flow.async_progress_by_handler(
         DOMAIN, match_context={"source": SOURCE_INTEGRATION_DISCOVERY}
@@ -85,7 +127,6 @@ def ws_views(
     )
 
 
-@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): f"{DOMAIN}/session",
@@ -101,8 +142,7 @@ def ws_session(
     """Create or keep alive the session a view's iframe loads through."""
     if (hub := _hub(hass, connection, msg["id"])) is None:
         return
-    if (view := hub.get_view(msg["view_id"])) is None:
-        connection.send_error(msg["id"], "not_found", "This web UI no longer exists")
+    if (view := _view_for(hub, connection, msg)) is None:
         return
     user_id = connection.user.id
     session = None
@@ -112,19 +152,20 @@ def ws_session(
             session = hub.sessions.touch(token, view.view_id)
     if session is None:
         # Bound to this login: logging out ends the session
-        session = hub.sessions.create(view.view_id, user_id, connection.refresh_token_id)
+        session = hub.sessions.create(
+            view.view_id, user_id, connection.refresh_token_id, admin=connection.user.is_admin
+        )
     connection.send_result(
         msg["id"],
         {
             "token": session.token,
             "url": f"{PROXY_URL_PREFIX}/{view.view_id}/{session.token}{view.entry}",
-            "view": _view_json(hub, view),
+            "view": _view_json(hub, view, admin=connection.user.is_admin),
             "expires_in": SESSION_TTL,
         },
     )
 
 
-@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): f"{DOMAIN}/clear_site_data", vol.Required("view_id"): str}
 )
@@ -134,6 +175,9 @@ def ws_clear_site_data(
 ) -> None:
     """Forget the calling user's saved cookies and storage for a web UI."""
     if (hub := _hub(hass, connection, msg["id"])) is None:
+        return
+    # Admins also for web UIs without a view right now (a device with no local page)
+    if not connection.user.is_admin and _view_for(hub, connection, msg) is None:
         return
     hub.async_clear_site_data(connection.user.id, msg["view_id"])
     connection.send_result(msg["id"])

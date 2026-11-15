@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
+from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_USER
 from homeassistant.auth.models import Credentials
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import (
@@ -65,6 +66,7 @@ from custom_components.local_web_ui.const import (
     CONF_TRUSTED_ACK,
     CONF_URL,
     CONF_USERNAME,
+    CONF_USERS,
     CONF_VERIFY_SSL,
     CONF_VISIT_LINK,
     DEFAULT_PANEL_ICON,
@@ -405,6 +407,7 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_TOKEN,
         CONF_IDENTITY,
         CONF_AUDIENCE,
+        CONF_USERS,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -415,6 +418,7 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_VERIFY_SSL: True,
         CONF_TOKEN_HEADER: TOKEN_NONE,
         CONF_IDENTITY: IDENTITY_NONE,
+        CONF_USERS: [],
         CONF_SHOW_IN_SIDEBAR: False,
     }
     assert isinstance(fields[CONF_NAME], vol.Required)
@@ -950,6 +954,7 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_TOKEN,
         CONF_IDENTITY,
         CONF_AUDIENCE,
+        CONF_USERS,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -966,6 +971,7 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_TOKEN: vol.UNDEFINED,
         CONF_IDENTITY: IDENTITY_NONE,
         CONF_AUDIENCE: vol.UNDEFINED,
+        CONF_USERS: [],
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: "mdi:router",
     }
@@ -987,6 +993,7 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_TOKEN,
         CONF_IDENTITY,
         CONF_AUDIENCE,
+        CONF_USERS,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -1001,6 +1008,7 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_TOKEN: vol.UNDEFINED,
         CONF_IDENTITY: IDENTITY_NONE,
         CONF_AUDIENCE: vol.UNDEFINED,
+        CONF_USERS: [],
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: vol.UNDEFINED,
     }
@@ -2298,3 +2306,93 @@ def test_option_names_are_stable() -> None:
         "identity_claims",
     )
     assert CONF_URL == "url"
+
+
+# ---- sharing with users other than admins -------------------------------------------
+
+
+async def _plain_user(hass: HomeAssistant, name: str) -> MockUser:
+    """A user who is not an admin."""
+    group = await hass.auth.async_get_group(GROUP_ID_USER)
+    assert group is not None
+    return MockUser(name=name, groups=[group]).add_to_hass(hass)
+
+
+async def test_web_ui_can_be_shared_with_users_who_are_not_admins(
+    hass: HomeAssistant, hub_entry: ConfigEntry, hass_admin_user: MockUser
+) -> None:
+    kids = await _plain_user(hass, "Kids")
+    zoe = await _plain_user(hass, "zoe")
+    inactive = await _plain_user(hass, "Gone")
+    inactive.is_active = False
+    result = await _start_web_ui_flow(hass)
+    users = _fields(result["data_schema"])[CONF_USERS]
+    # Only people who aren't admins (those open everything), active, not system users
+    options = config_flow._view_schema(manual=True, device=False).schema[users].config["options"]
+    assert options == []  # The bare schema has none; the form lists the users:
+    offered = result["data_schema"].schema[users].config["options"]
+    assert offered == [{"value": kids.id, "label": "Kids"}, {"value": zoe.id, "label": "zoe"}]
+    assert hass_admin_user.id not in {o["value"] for o in offered}
+
+    entry = await _add_router(hass, **{CONF_USERS: [zoe.id, kids.id, kids.id]})
+    assert entry.options[CONF_USERS] == sorted([kids.id, zoe.id])
+    assert _hub(hass).views[entry.entry_id].users == {kids.id, zoe.id}
+
+    # Shown back; someone made an admin meanwhile is no longer listed (they see it anyway)
+    zoe.groups = [await hass.auth.async_get_group(GROUP_ID_ADMIN)]
+    result = await _start_options(hass, entry, "web_ui")
+    assert _form_value(_fields(result["data_schema"])[CONF_USERS]) == [kids.id]
+
+    # Not shared any more
+    await _set_options(hass, entry, VIEW_INPUT)
+    assert CONF_USERS not in entry.options
+    assert _hub(hass).views[entry.entry_id].users == frozenset()
+
+
+async def test_device_web_ui_can_be_shared(hass: HomeAssistant, hub_entry: ConfigEntry) -> None:
+    kids = await _plain_user(hass, "Kids")
+    _, entry = await _porch(hass)
+    result = await _set_options(hass, entry, DEVICE_OPTIONS_INPUT | {CONF_USERS: [kids.id]})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_USERS] == [kids.id]
+
+
+async def test_sidebar_entries_of_shared_web_uis_show_for_all_users(
+    hass: HomeAssistant, hub_entry: ConfigEntry
+) -> None:
+    kids = await _plain_user(hass, "Kids")
+    shared = await _add_router(hass, **{CONF_SHOW_IN_SIDEBAR: True, CONF_USERS: [kids.id]})
+    private = await _add_router(
+        hass, **{CONF_NAME: "NAS", CONF_URL: "http://192.168.1.5/", CONF_SHOW_IN_SIDEBAR: True}
+    )
+    panels = _panels(hass)
+    assert panels[_view_panel_path(shared.entry_id)].require_admin is False
+    assert panels[_view_panel_path(private.entry_id)].require_admin is True
+    # The list too, as something is shared: it shows each user what they may open
+    assert panels[PANEL_URL_PATH].require_admin is False
+
+    await _set_options(hass, shared, VIEW_INPUT | {CONF_SHOW_IN_SIDEBAR: True})
+    panels = _panels(hass)
+    assert panels[_view_panel_path(shared.entry_id)].require_admin is True
+    assert panels[PANEL_URL_PATH].require_admin is True
+
+
+async def test_card_module_loaded_on_every_page_while_set_up(
+    hass: HomeAssistant, hub_entry: ConfigEntry
+) -> None:
+    module_url = _panels(hass)[PANEL_URL_PATH].config["_panel_custom"]["module_url"]
+    extra = hass.data["frontend_extra_module_url"]
+    assert module_url in extra.urls
+    assert await hass.config_entries.async_unload(hub_entry.entry_id)
+    await hass.async_block_till_done()
+    assert module_url not in extra.urls
+    assert await hass.config_entries.async_setup(hub_entry.entry_id)
+    await hass.async_block_till_done()
+    assert list(extra.urls).count(module_url) == 1
+
+
+def test_card_module_defines_the_card() -> None:
+    source = (Path(config_flow.__file__).parent / "www" / "local-web-ui-panel.js").read_text()
+    for name in ("local-web-ui-panel", "local-web-ui-card", "local-web-ui-card-editor"):
+        assert f'"{name}"' in source or "`${CARD_TYPE}-editor`" in source, name
+    assert "window.customCards" in source

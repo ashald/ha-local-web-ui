@@ -345,14 +345,14 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     if hub is None or (session := hub.sessions.touch(token, view_id)) is None:
         raise web.HTTPNotFound
     user = await hass.auth.async_get_user(session.user_id)
-    if (
-        user is None
-        or not user.is_admin
-        or async_user_not_allowed_do_auth(hass, user, request) is not None
-    ):
+    if user is None or async_user_not_allowed_do_auth(hass, user, request) is not None:
         hub.sessions.revoke_user(session.user_id)
         raise web.HTTPNotFound
     if (view := hub.get_view(view_id)) is None:
+        raise web.HTTPNotFound
+    if not hub.may_open(user, view):
+        # No longer an admin, or no longer shared with this user
+        hub.sessions.end(token)
         raise web.HTTPNotFound
     view = hub.effective_view(view)
 

@@ -48,6 +48,7 @@ async def async_get_config_entry_diagnostics(
             "device_page_link": hub.link_enabled(view.view_id) if view.device_id else None,
             "identity_header": view.identity_header,
             "identity_audience": view.audience if view.identity_header else None,
+            "shared_with_users": len(view.users),
         }
     else:
         result["view"] = None  # Its device has no local web page right now
