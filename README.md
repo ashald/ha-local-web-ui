@@ -29,6 +29,7 @@ You don't need to open ports or change any firmware.
   - a name, URL and icon;
   - a stored login, sent as HTTP Basic or Digest auth so you are never prompted;
   - an API token, sent as a Bearer token, in `X-Api-Key`, or in a header you name;
+  - who is viewing, as a token Home Assistant signs (see [Who is viewing](#who-is-viewing));
   - whether to verify the SSL certificate;
   - its own sidebar entry.
 - **Linked devices.** Each device web UI has a device of its own, "*device* web UI". Home
@@ -74,6 +75,57 @@ Use it only for pages that need a browser feature the emulation doesn't cover (a
 or a `sessionStorage` that survives reloads, `window.parent` access), and **only for pages
 you fully trust**. The form makes you confirm. Site cookies stay server side in this mode
 too, and service workers are refused in both modes.
+
+## Who is viewing
+
+A web UI can be told which Home Assistant user is viewing it, for example so a family site
+keeps each person's own state, or so a single sign-on gateway in front of the site lets the
+person in. Turn on **Tell the site who is viewing** in the web UI's settings. With every
+request, Home Assistant then sends a short-lived token it signs: an OpenID Connect style JWT
+(RS256, valid 5 minutes) in the `Authorization` header as a Bearer token, or in a header you
+name. The browser never sees it, and a page cannot send one of its own.
+
+The token's claims:
+
+| Claim | Value |
+|---|---|
+| `iss` | `<Home Assistant URL>/api/local_web_ui/identity` |
+| `aud` | the site's address (scheme, host and port), or the audience set in the web UI's settings |
+| `sub` | the Home Assistant user id |
+| `name` | the user's name |
+| `preferred_username` | the username the user logs in with |
+| `iat`, `nbf`, `exp` | when it was signed, and 5 minutes later |
+
+Anything else, such as `email`, `groups` or a different `preferred_username`, can be set
+per person in the global settings, keyed by Home Assistant username or user id:
+
+```yaml
+irenika:
+  preferred_username: irena
+  email: irena@example.com
+  groups: [family]
+```
+
+Sites check the token with the keys Home Assistant publishes, without any shared secret:
+
+- discovery: `<Home Assistant URL>/api/local_web_ui/identity/.well-known/openid-configuration`
+- keys (JWKS): `<Home Assistant URL>/api/local_web_ui/identity/.well-known/jwks.json`
+
+*Home Assistant URL* is its internal URL, or the address set under *Home Assistant's address
+for identity checks* in the global settings if sites reach it at another one. The signing key
+is made when first needed and kept in Home Assistant's storage.
+
+**oauth2-proxy** accepts these tokens as they are, so a site behind it opens in Home Assistant
+without a second login:
+
+```
+--skip-jwt-bearer-tokens=true
+--extra-jwt-issuers=https://ha.example.com/api/local_web_ui/identity=https://site.example.com
+```
+
+Its `X-Auth-Request-User`, `-Email`, `-Preferred-Username` and `-Groups` then come from the
+token's `sub`, `email`, `preferred_username` and `groups`, the same headers a browser login
+produces. Without an `email` claim, oauth2-proxy uses `sub` as the email.
 
 ## Install
 

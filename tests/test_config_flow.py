@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
+from homeassistant.auth.models import Credentials
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import (
     SOURCE_IGNORE,
@@ -41,9 +42,13 @@ import voluptuous as vol
 
 from custom_components.local_web_ui import async_migrate_entry, config_flow
 from custom_components.local_web_ui.const import (
+    CONF_AUDIENCE,
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
     CONF_ICON,
+    CONF_IDENTITY,
+    CONF_IDENTITY_CLAIMS,
+    CONF_IDENTITY_URL,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_LINKED_DEVICES,
@@ -66,6 +71,10 @@ from custom_components.local_web_ui.const import (
     DEVICE_LINK_PREFIX,
     DOMAIN,
     HUB_UNIQUE_ID,
+    IDENTITY_BEARER,
+    IDENTITY_CHOICES,
+    IDENTITY_NONE,
+    IDENTITY_PATH,
     KIND_HUB,
     KIND_VIEW,
     MODE_ISOLATED,
@@ -98,6 +107,13 @@ from custom_components.local_web_ui.hub import (
 COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / DOMAIN
 PANEL_FILE = COMPONENT_DIR / "www" / "local-web-ui-panel.js"
 CONF_NAME = "name"
+
+IDENTITY_ERRORS = (
+    "invalid_identity_header",
+    "identity_conflicts_with_authorization",
+    "identity_conflicts_with_token",
+    "invalid_audience",
+)
 
 HUB_OPTIONS: dict[str, bool] = {
     CONF_DISCOVERY: True,
@@ -387,6 +403,8 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_PASSWORD,
         CONF_TOKEN_HEADER,
         CONF_TOKEN,
+        CONF_IDENTITY,
+        CONF_AUDIENCE,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -396,6 +414,7 @@ async def test_web_ui_step_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_TRUSTED_ACK: False,
         CONF_VERIFY_SSL: True,
         CONF_TOKEN_HEADER: TOKEN_NONE,
+        CONF_IDENTITY: IDENTITY_NONE,
         CONF_SHOW_IN_SIDEBAR: False,
     }
     assert isinstance(fields[CONF_NAME], vol.Required)
@@ -757,6 +776,8 @@ async def test_hub_options_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
     assert result["description_placeholders"] == {
         "panel_url": f"/{PANEL_URL_PATH}",
         "own_domain": "",
+        "default_url": "http://10.10.10.10:8123",
+        "issuer": f"http://10.10.10.10:8123{IDENTITY_PATH}",
     }
     fields = _fields(result["data_schema"])
     assert list(fields) == [
@@ -766,12 +787,16 @@ async def test_hub_options_form(hass: HomeAssistant, hub_entry: ConfigEntry) -> 
         CONF_PANEL_TITLE,
         CONF_PANEL_ICON,
         CONF_LOCAL_DOMAINS,
+        CONF_IDENTITY_URL,
+        CONF_IDENTITY_CLAIMS,
     ]
     assert {k: _form_value(m) for k, m in fields.items()} == {
         **HUB_OPTIONS,
         CONF_PANEL_TITLE: vol.UNDEFINED,
         CONF_PANEL_ICON: DEFAULT_PANEL_ICON,
         CONF_LOCAL_DOMAINS: vol.UNDEFINED,
+        CONF_IDENTITY_URL: vol.UNDEFINED,
+        CONF_IDENTITY_CLAIMS: vol.UNDEFINED,
     }
 
 
@@ -824,6 +849,8 @@ async def test_hub_options_form_prefills_current_options(
         CONF_PANEL_TITLE: "Devices",
         CONF_PANEL_ICON: "mdi:lan",
         CONF_LOCAL_DOMAINS: "lan.example.com",
+        CONF_IDENTITY_URL: "https://ha.example.com",
+        CONF_IDENTITY_CLAIMS: {"irena": {"email": "irena@example.com"}},
     }
     hass.config_entries.async_update_entry(hub_entry, options=current)
     await hass.async_block_till_done()
@@ -921,6 +948,8 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_PASSWORD,
         CONF_TOKEN_HEADER,
         CONF_TOKEN,
+        CONF_IDENTITY,
+        CONF_AUDIENCE,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -935,6 +964,8 @@ async def test_manual_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_PASSWORD: vol.UNDEFINED,
         CONF_TOKEN_HEADER: TOKEN_NONE,
         CONF_TOKEN: vol.UNDEFINED,
+        CONF_IDENTITY: IDENTITY_NONE,
+        CONF_AUDIENCE: vol.UNDEFINED,
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: "mdi:router",
     }
@@ -954,6 +985,8 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_PASSWORD,
         CONF_TOKEN_HEADER,
         CONF_TOKEN,
+        CONF_IDENTITY,
+        CONF_AUDIENCE,
         CONF_SHOW_IN_SIDEBAR,
         CONF_ICON,
     ]
@@ -966,6 +999,8 @@ async def test_device_web_ui_options_form(hass: HomeAssistant, hub_entry: Config
         CONF_PASSWORD: vol.UNDEFINED,
         CONF_TOKEN_HEADER: TOKEN_NONE,
         CONF_TOKEN: vol.UNDEFINED,
+        CONF_IDENTITY: IDENTITY_NONE,
+        CONF_AUDIENCE: vol.UNDEFINED,
         CONF_SHOW_IN_SIDEBAR: False,
         CONF_ICON: vol.UNDEFINED,
     }
@@ -1944,9 +1979,15 @@ async def test_routes_and_commands_registered_once(
 
     router = await _add_router(hass)
     routes = our_routes()
-    assert [r for r in routes if r[1].startswith(PROXY_URL_PREFIX)] == [
-        ("*", f"{PROXY_URL_PREFIX}/{{view_id}}/{{token}}/{{path}}")
-    ]
+    assert [
+        r
+        for r in routes
+        if r[1].startswith(PROXY_URL_PREFIX) and not r[1].startswith(IDENTITY_PATH)
+    ] == [("*", f"{PROXY_URL_PREFIX}/{{view_id}}/{{token}}/{{path}}")]
+    assert {r for r in routes if r[1].startswith(IDENTITY_PATH)} >= {
+        ("GET", f"{IDENTITY_PATH}/.well-known/openid-configuration"),
+        ("GET", f"{IDENTITY_PATH}/.well-known/jwks.json"),
+    }
     assert any(r[1].startswith(STATIC_URL_PATH) for r in routes)
     route_count = len(hass.http.app.router.routes())
     module_url = _panels(hass)[PANEL_URL_PATH].config["_panel_custom"]["module_url"]
@@ -2049,6 +2090,7 @@ def test_translations_cover_config_flow(filename: str) -> None:
         "invalid_token_header",
         "token_required",
         "token_conflicts_with_login",
+        *IDENTITY_ERRORS,
     } <= set(config["error"])
 
 
@@ -2065,7 +2107,14 @@ def test_translations_cover_options_flows(filename: str) -> None:
     assert set(options["step"]) == {"hub", "web_ui"}
 
     hub = options["step"]["hub"]
-    hub_fields = {*HUB_OPTIONS, CONF_PANEL_TITLE, CONF_PANEL_ICON, CONF_LOCAL_DOMAINS}
+    hub_fields = {
+        *HUB_OPTIONS,
+        CONF_PANEL_TITLE,
+        CONF_PANEL_ICON,
+        CONF_LOCAL_DOMAINS,
+        CONF_IDENTITY_URL,
+        CONF_IDENTITY_CLAIMS,
+    }
     assert set(hub["data"]) == hub_fields
     assert set(hub["data_description"]) <= hub_fields
     assert "{panel_url}" in hub["description"]
@@ -2082,6 +2131,11 @@ def test_translations_cover_options_flows(filename: str) -> None:
         "invalid_token_header",
         "token_required",
         "token_conflicts_with_login",
+        *IDENTITY_ERRORS,
+        "invalid_identity_url",
+        "invalid_identity_claims",
+        "unknown_identity_user",
+        "reserved_identity_claim",
     }
 
 
@@ -2090,6 +2144,7 @@ def test_translations_cover_selectors(filename: str) -> None:
     selectors = _strings(filename)["selector"]
     assert set(selectors[CONF_MODE]["options"]) == set(MODES)
     assert set(selectors[CONF_VISIT_LINK]["options"]) == set(VISIT_CHOICES)
+    assert set(selectors[CONF_IDENTITY]["options"]) == set(IDENTITY_CHOICES)
 
 
 @pytest.mark.parametrize("filename", ["strings.json", "translations/en.json"])
@@ -2105,3 +2160,141 @@ def test_translations_follow_hassfest_rules(filename: str) -> None:
 
 def test_strings_and_english_translation_match() -> None:
     assert _strings("strings.json") == _strings("translations/en.json")
+
+
+# ---- options: who is viewing (identity tokens) -------------------------------------
+
+
+async def _with_login(hass: HomeAssistant, user_id: str, username: str) -> None:
+    """Make a test user's Home Assistant login (username) this one."""
+    user = await hass.auth.async_get_user(user_id)
+    assert user is not None
+    user.credentials[:] = [
+        *(c for c in user.credentials if c.auth_provider_type != "homeassistant"),
+        Credentials(
+            auth_provider_type="homeassistant", auth_provider_id=None, data={"username": username}
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("changes", "stored"),
+    [
+        ({CONF_IDENTITY: "none"}, {}),
+        ({CONF_IDENTITY: IDENTITY_BEARER}, {CONF_IDENTITY: IDENTITY_BEARER}),
+        ({CONF_IDENTITY: "Authorization"}, {CONF_IDENTITY: IDENTITY_BEARER}),
+        (
+            {CONF_IDENTITY: "X-Identity", CONF_AUDIENCE: " family "},
+            {CONF_IDENTITY: "X-Identity", CONF_AUDIENCE: "family"},
+        ),
+        # An audience without identity is not kept
+        ({CONF_AUDIENCE: "family"}, {}),
+    ],
+)
+async def test_web_ui_identity_options(
+    hass: HomeAssistant, hub_entry: Any, changes: dict[str, Any], stored: dict[str, Any]
+) -> None:
+    entry = await _add_router(hass, **changes)
+    assert {k: v for k, v in entry.options.items() if k in (CONF_IDENTITY, CONF_AUDIENCE)} == stored
+    view = hass.data["local_web_ui"].views[entry.entry_id]
+    if CONF_IDENTITY in stored:
+        expected = "Authorization" if stored[CONF_IDENTITY] == IDENTITY_BEARER else "X-Identity"
+        assert view.identity_header == expected
+        assert view.audience == stored.get(CONF_AUDIENCE, "http://192.168.1.1")
+    else:
+        assert view.identity_header is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({CONF_IDENTITY: "Bad Header"}, "invalid_identity_header"),
+        ({CONF_IDENTITY: "Cookie"}, "invalid_identity_header"),
+        (
+            {CONF_IDENTITY: IDENTITY_BEARER, CONF_USERNAME: "admin"},
+            "identity_conflicts_with_authorization",
+        ),
+        (
+            {CONF_IDENTITY: IDENTITY_BEARER, CONF_TOKEN_HEADER: TOKEN_BEARER, CONF_TOKEN: "t"},
+            "identity_conflicts_with_authorization",
+        ),
+        (
+            {CONF_IDENTITY: "x-api-key", CONF_TOKEN_HEADER: "x-api-key", CONF_TOKEN: "t"},
+            "identity_conflicts_with_token",
+        ),
+        (
+            {CONF_IDENTITY: "X-Auth", CONF_TOKEN_HEADER: "x-auth", CONF_TOKEN: "t"},
+            "identity_conflicts_with_token",
+        ),
+    ],
+)
+async def test_web_ui_identity_errors(
+    hass: HomeAssistant, hub_entry: Any, changes: dict[str, Any], error: str
+) -> None:
+    result, entry = await _add_web_ui(hass, VIEW_INPUT | changes)
+    assert entry is None
+    assert result["errors"] == {CONF_IDENTITY: error}
+
+
+async def test_web_ui_audience_error(hass: HomeAssistant, hub_entry: Any) -> None:
+    result, entry = await _add_web_ui(
+        hass, VIEW_INPUT | {CONF_IDENTITY: IDENTITY_BEARER, CONF_AUDIENCE: "two words"}
+    )
+    assert entry is None
+    assert result["errors"] == {CONF_AUDIENCE: "invalid_audience"}
+
+
+@pytest.mark.parametrize(
+    ("claims", "error"),
+    [
+        ({"irenika": {"email": "irena@example.com"}}, None),
+        ({"irenika": {"groups": ["family"], "picture": "x"}}, None),
+        ("irena", "invalid_identity_claims"),
+        ({"irenika": "irena@example.com"}, "invalid_identity_claims"),
+        ({"nobody": {"email": "x@example.com"}}, "unknown_identity_user"),
+        ({"irenika": {"sub": "other"}}, "reserved_identity_claim"),
+        ({"irenika": {"aud": "other"}}, "reserved_identity_claim"),
+    ],
+)
+async def test_hub_identity_claims_validation(
+    hass: HomeAssistant, hub_entry: Any, hass_admin_user: MockUser, claims: Any, error: str | None
+) -> None:
+    await _with_login(hass, hass_admin_user.id, "irenika")
+    result = await _set_options(hass, hub_entry, {CONF_IDENTITY_CLAIMS: claims})
+    if error is None:
+        assert result["type"] == "create_entry", result
+        assert hub_entry.options[CONF_IDENTITY_CLAIMS] == claims
+    else:
+        assert result["errors"] == {CONF_IDENTITY_CLAIMS: error}
+
+
+@pytest.mark.parametrize(
+    ("url", "stored", "error"),
+    [
+        ("https://ha.example.com/", "https://ha.example.com", None),
+        ("http://10.0.0.2:8123", "http://10.0.0.2:8123", None),
+        ("", None, None),
+        ("ha.example.com", None, "invalid_identity_url"),
+        ("https://ha.example.com/?x=1", None, "invalid_identity_url"),
+    ],
+)
+async def test_hub_identity_url(
+    hass: HomeAssistant, hub_entry: Any, url: str, stored: str | None, error: str | None
+) -> None:
+    result = await _set_options(hass, hub_entry, {CONF_IDENTITY_URL: url})
+    if error is None:
+        assert result["type"] == "create_entry", result
+        assert hub_entry.options.get(CONF_IDENTITY_URL) == stored
+    else:
+        assert result["errors"] == {CONF_IDENTITY_URL: error}
+
+
+def test_option_names_are_stable() -> None:
+    # Stored in entries: renaming it would lose people's settings
+    assert (CONF_IDENTITY, CONF_AUDIENCE, CONF_IDENTITY_URL, CONF_IDENTITY_CLAIMS) == (
+        "identity",
+        "audience",
+        "identity_url",
+        "identity_claims",
+    )
+    assert CONF_URL == "url"

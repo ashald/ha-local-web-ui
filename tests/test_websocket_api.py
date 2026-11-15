@@ -62,6 +62,7 @@ from custom_components.local_web_ui.const import (
     CONF_VISIT_LINK,
     DOMAIN,
     HUB_UNIQUE_ID,
+    IDENTITY_PATH,
     KIND_HUB,
     KIND_VIEW,
     MAX_WEBSOCKETS_PER_SESSION,
@@ -1204,6 +1205,7 @@ async def test_diagnostics_hub_entry(
         "web_uis": 3,
         # The devices whose "Visit" link points here now
         "device_page_links": sorted([home.printer.id, home.kitchen.id]),
+        "identity_issuer": f"http://10.10.10.10:8123{IDENTITY_PATH}",
     }
     dumped = json.dumps(diagnostics)
     assert "hunter2" not in dumped
@@ -1243,7 +1245,14 @@ async def test_diagnostics_manual_web_ui_redacts_credentials_and_query(
     assert view["url"] == redacted_url
     assert view["source"] == "manual"
     assert view["mode"] == MODE_TRUSTED
-    assert set(view) == {"url", "source", "mode", "device_page_link"}
+    assert set(view) == {
+        "url",
+        "source",
+        "mode",
+        "device_page_link",
+        "identity_header",
+        "identity_audience",
+    }
 
 
 async def test_diagnostics_manual_web_ui_has_no_device_page_link(
@@ -1265,6 +1274,8 @@ async def test_diagnostics_device_web_ui(
             "source": "device",
             "mode": MODE_ISOLATED,
             "device_page_link": True,
+            "identity_header": None,
+            "identity_audience": None,
         },
     }
 
@@ -1289,6 +1300,8 @@ async def test_diagnostics_device_web_ui(
         "source": "device",
         "mode": MODE_ISOLATED,
         "device_page_link": False,
+        "identity_header": None,
+        "identity_audience": None,
     }
 
 

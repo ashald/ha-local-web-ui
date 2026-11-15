@@ -7,7 +7,8 @@ where the request goes. Nothing in the request can choose the upstream host.
 Everything served here comes from Home Assistant's own origin, so the proxy is
 strict about what it lets through in either direction:
 - towards the device: no browser credentials (Cookie, Authorization) and no
-  client-supplied identity or forwarding headers;
+  client-supplied identity or forwarding headers; who is viewing only as a token
+  Home Assistant signs, to web UIs that ask for it (identity.py);
 - towards the browser: the device's response headers except a denylist of ones
   that would act on Home Assistant's origin, plus security headers set here on
   every response, streamed or not.
@@ -285,6 +286,7 @@ class _Context:
     view: View
     prefix: str  # /api/local_web_ui/<view_id>/<token>
     cross_origin: bool  # Sent by an isolated (opaque origin) page
+    identity: str | None = None  # Signed token naming the viewer, for views that want it
 
 
 @callback
@@ -368,7 +370,16 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
         and hdrs.ACCESS_CONTROL_REQUEST_METHOD in request.headers
     ):
         return _preflight_response(request)
-    ctx = _Context(hub, session, view, prefix, cross_origin)
+    identity = None
+    if view.identity_header is not None:
+        await hub.identity.async_ensure_key()
+        if (identity := hub.identity.token(user, view.audience)) is None:
+            return _error(
+                503,
+                f"{view.name} asks who is viewing, but Home Assistant does not know its own "
+                "address to sign that with: set it in the Local Web UIs options",
+            )
+    ctx = _Context(hub, session, view, prefix, cross_origin, identity)
     if raw_path.startswith("/" + INTERNAL_PATH_PREFIX):
         return await _handle_internal(request, ctx, raw_path)
 
@@ -435,6 +446,13 @@ def _request_headers(request: web.Request, ctx: _Context, url: URL) -> CIMultiDi
     if ctx.view.token_header is not None:
         name, value = ctx.view.token_header
         headers[name] = value
+    if ctx.view.identity_header is not None and ctx.identity is not None:
+        # Replaces any copy the page sent
+        headers[ctx.view.identity_header] = (
+            f"Bearer {ctx.identity}"
+            if ctx.view.identity_header == hdrs.AUTHORIZATION
+            else ctx.identity
+        )
     # Same header Supervisor ingress uses, so UIs built for ingress can adapt links
     headers["X-Ingress-Path"] = ctx.prefix
     # Validated by Home Assistant's forwarded middleware against trusted_proxies

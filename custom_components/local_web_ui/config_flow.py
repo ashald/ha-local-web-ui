@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
     BooleanSelector,
     IconSelector,
+    ObjectSelector,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -30,9 +31,13 @@ from homeassistant.helpers.selector import (
 import voluptuous as vol
 
 from .const import (
+    CONF_AUDIENCE,
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
     CONF_ICON,
+    CONF_IDENTITY,
+    CONF_IDENTITY_CLAIMS,
+    CONF_IDENTITY_URL,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_LOCAL_DOMAINS,
@@ -57,6 +62,10 @@ from .const import (
     DEFAULT_SHOW_PANEL,
     DOMAIN,
     HUB_UNIQUE_ID,
+    IDENTITY_BEARER,
+    IDENTITY_CHOICES,
+    IDENTITY_NONE,
+    IDENTITY_PATH,
     KIND_HUB,
     KIND_VIEW,
     MODE_ISOLATED,
@@ -67,11 +76,13 @@ from .const import (
     TOKEN_BEARER,
     TOKEN_CHOICES,
     TOKEN_NONE,
+    TOKEN_X_API_KEY,
     VISIT_CHOICES,
     VISIT_DEFAULT,
 )
 from .discovery import parse_http_url
 from .hub import device_unique_id, own_domain, parse_local_domains
+from .identity import base_url, validate_claims
 
 CONF_NAME = "name"
 
@@ -189,10 +200,24 @@ class HubOptionsFlow(OptionsFlow):
         return await self.async_step_hub(user_input)
 
     async def async_step_hub(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            # Left empty: the default name and icon
-            return self.async_create_entry(data={k: v for k, v in user_input.items() if v != ""})
-        options = self.config_entry.options
+            url = (user_input.get(CONF_IDENTITY_URL) or "").strip().rstrip("/")
+            if url:
+                parsed = parse_http_url(url)
+                if parsed is None or parsed.query_string or parsed.fragment:
+                    errors[CONF_IDENTITY_URL] = "invalid_identity_url"
+                else:
+                    user_input[CONF_IDENTITY_URL] = url
+            users = [u for u in await self.hass.auth.async_get_users() if not u.system_generated]
+            if error := validate_claims(user_input.get(CONF_IDENTITY_CLAIMS), users):
+                errors[CONF_IDENTITY_CLAIMS] = error
+            if not errors:
+                # Left empty: the default name, icon and address
+                return self.async_create_entry(
+                    data={k: v for k, v in user_input.items() if v not in ("", None, {})}
+                )
+        options = {**self.config_entry.options, **(user_input or {})}
         schema: dict[Any, Any] = {
             vol.Required(key, default=options.get(key, default)): BooleanSelector()
             for key, default in HUB_DEFAULTS.items()
@@ -214,12 +239,29 @@ class HubOptionsFlow(OptionsFlow):
                 description={"suggested_value": options.get(CONF_LOCAL_DOMAINS)},
             )
         ] = TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT))
+        schema[
+            vol.Optional(
+                CONF_IDENTITY_URL,
+                description={"suggested_value": options.get(CONF_IDENTITY_URL)},
+            )
+        ] = TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
+        schema[
+            vol.Optional(
+                CONF_IDENTITY_CLAIMS,
+                description={"suggested_value": options.get(CONF_IDENTITY_CLAIMS)},
+            )
+        ] = ObjectSelector()
+        default_url = base_url(self.hass, None)
+        issuer = base_url(self.hass, options.get(CONF_IDENTITY_URL))
         return self.async_show_form(
             step_id="hub",
             data_schema=vol.Schema(schema),
+            errors=errors,
             description_placeholders={
                 "panel_url": f"/{PANEL_URL_PATH}",
                 "own_domain": _own_domain_hint(self.hass, options.get(CONF_LOCAL_DOMAINS)),
+                "default_url": default_url or "unknown",
+                "issuer": f"{issuer}{IDENTITY_PATH}" if issuer else "unknown",
             },
         )
 
@@ -336,6 +378,15 @@ def _view_schema(manual: bool, device: bool) -> vol.Schema:
     schema[vol.Optional(CONF_TOKEN)] = TextSelector(
         TextSelectorConfig(type=TextSelectorType.PASSWORD, autocomplete="off")
     )
+    schema[vol.Required(CONF_IDENTITY, default=IDENTITY_NONE)] = SelectSelector(
+        SelectSelectorConfig(
+            options=list(IDENTITY_CHOICES),
+            mode=SelectSelectorMode.DROPDOWN,
+            custom_value=True,
+            translation_key=CONF_IDENTITY,
+        )
+    )
+    schema[vol.Optional(CONF_AUDIENCE)] = TextSelector()
     schema[vol.Required(CONF_SHOW_IN_SIDEBAR, default=False)] = BooleanSelector()
     schema[vol.Optional(CONF_ICON)] = IconSelector()
     return vol.Schema(schema)
@@ -347,10 +398,32 @@ def _token_header(user_input: dict[str, Any]) -> str:
     return how.lower() if how.lower() in TOKEN_CHOICES else how
 
 
+def _identity_header(user_input: dict[str, Any]) -> str:
+    """How the identity token is sent: an IDENTITY_ choice, or a header name of its own."""
+    how = (user_input.get(CONF_IDENTITY) or IDENTITY_NONE).strip()
+    if how.lower() == "authorization":
+        return IDENTITY_BEARER
+    return how.lower() if how.lower() in IDENTITY_CHOICES else how
+
+
 def _validate(
     user_input: dict[str, Any], previous: Mapping[str, Any], manual: bool
 ) -> dict[str, str]:
     errors: dict[str, str] = {}
+    token_how = _token_header(user_input)
+    token_in_authorization = token_how == TOKEN_BEARER or token_how.lower() == "authorization"
+    if (identity := _identity_header(user_input)) != IDENTITY_NONE:
+        if identity == IDENTITY_BEARER:
+            if (user_input.get(CONF_USERNAME) or "").strip() or token_in_authorization:
+                errors[CONF_IDENTITY] = "identity_conflicts_with_authorization"
+        elif not HEADER_NAME.fullmatch(identity) or identity.lower() in RESERVED_TOKEN_HEADERS:
+            errors[CONF_IDENTITY] = "invalid_identity_header"
+        elif identity.lower() == (
+            "x-api-key" if token_how == TOKEN_X_API_KEY else token_how.lower()
+        ):
+            errors[CONF_IDENTITY] = "identity_conflicts_with_token"
+    if any(c.isspace() for c in (user_input.get(CONF_AUDIENCE) or "").strip()):
+        errors[CONF_AUDIENCE] = "invalid_audience"
     if (how := _token_header(user_input)) != TOKEN_NONE:
         if how not in TOKEN_CHOICES and (
             not HEADER_NAME.fullmatch(how) or how.lower() in RESERVED_TOKEN_HEADERS
@@ -401,6 +474,10 @@ def _view_options(
     if (how := _token_header(user_input)) != TOKEN_NONE:
         options[CONF_TOKEN_HEADER] = how
         options[CONF_TOKEN] = user_input.get(CONF_TOKEN) or previous[CONF_TOKEN]
+    if (identity := _identity_header(user_input)) != IDENTITY_NONE:
+        options[CONF_IDENTITY] = identity
+        if audience := (user_input.get(CONF_AUDIENCE) or "").strip():
+            options[CONF_AUDIENCE] = audience
     if user_input.get(CONF_ICON):
         options[CONF_ICON] = user_input[CONF_ICON]
     return options

@@ -20,6 +20,8 @@
           "password": "Password",
           "token_header": "Send a token",
           "token": "Token",
+          "identity": "Tell the site who is viewing",
+          "audience": "Audience",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -32,6 +34,8 @@
           "password": "The password for the username. When editing, leave it empty to keep the stored one.",
           "token_header": "For pages that use an API token or key instead of a login: how it is sent with every request. Choose a listed way or type the name of a header. The browser never sees the token.",
           "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
+          "identity": "Sends the Home Assistant user viewing this web UI to the site with every request, as a short-lived token signed by Home Assistant (an OpenID Connect JWT). The site, or a gateway in front of it such as oauth2-proxy, checks it with the keys Home Assistant publishes; set up the person's details in the Local Web UIs options. Choose a listed way or type the name of a header to send the token in. Send it only to sites you trust: it says who you are.",
+          "audience": "The token's audience (aud), which the site checks. Leave empty for the site's own address (scheme, host and port).",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       },
@@ -46,7 +50,11 @@
       "trusted_not_acknowledged": "Trusted mode needs your confirmation.",
       "invalid_token_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
       "token_required": "Enter the token.",
-      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty."
+      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty.",
+      "invalid_identity_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
+      "identity_conflicts_with_authorization": "The Authorization header already carries the username or the token: send who is viewing in another header.",
+      "identity_conflicts_with_token": "The token is already sent in this header: choose another one.",
+      "invalid_audience": "The audience is one word without spaces, usually the site's address."
     },
     "abort": {
       "already_configured": "This web UI is already set up.",
@@ -57,14 +65,16 @@
     "step": {
       "hub": {
         "title": "Local Web UIs options",
-        "description": "Options for all web UIs. Each web UI has settings of its own: the gear of its entry. The list of web UIs is at [Local Web UIs]({panel_url}).",
+        "description": "Options for all web UIs. Each web UI has settings of its own: the gear of its entry. The list of web UIs is at [Local Web UIs]({panel_url}). Web UIs that are told who is viewing get tokens from the issuer {issuer}.",
         "data": {
           "discovery": "Discover device web UIs",
           "link_device_pages": "Open device \"Visit\" buttons here",
           "show_panel": "Show the list of web UIs in the sidebar",
           "panel_title": "Sidebar name",
           "panel_icon": "Sidebar icon",
-          "local_domains": "Local domain suffixes"
+          "local_domains": "Local domain suffixes",
+          "identity_url": "Home Assistant's address for identity checks",
+          "identity_claims": "People's details for identity tokens"
         },
         "data_description": {
           "discovery": "Offer devices whose integration links to a local web page (their \"Visit\" button), such as ESPHome devices with web_server, WLED or printers. They appear under Discovered, where you add or ignore each.",
@@ -72,7 +82,9 @@
           "show_panel": "The web UIs' own pages keep working when the list is hidden.",
           "panel_title": "Leave empty for \"Local Web UIs\".",
           "panel_icon": "Icon of the list in the sidebar.",
-          "local_domains": "Domains of your home network whose devices can be discovered, besides .local and .home.arpa, separated with spaces or commas (for example lan).{own_domain}"
+          "local_domains": "Domains of your home network whose devices can be discovered, besides .local and .home.arpa, separated with spaces or commas (for example lan).{own_domain}",
+          "identity_url": "Where the sites (or their gateway) reach Home Assistant to fetch the keys that check who is viewing; the issuer is this address followed by /api/local_web_ui/identity. Leave empty for Home Assistant's own address ({default_url}).",
+          "identity_claims": "Optional details added to the tokens of each person, by Home Assistant username (or user id). Tokens always carry the user id (sub), name and username (preferred_username); this can set another username, an email or groups, for example:\nirena:\n  preferred_username: irena\n  email: irena@example.com\n  groups: [family]"
         }
       },
       "web_ui": {
@@ -89,6 +101,8 @@
           "password": "Password",
           "token_header": "Send a token",
           "token": "Token",
+          "identity": "Tell the site who is viewing",
+          "audience": "Audience",
           "show_in_sidebar": "Show in sidebar",
           "icon": "Icon"
         },
@@ -102,6 +116,8 @@
           "password": "The password for the username. When editing, leave it empty to keep the stored one.",
           "token_header": "For pages that use an API token or key instead of a login: how it is sent with every request. Choose a listed way or type the name of a header. The browser never sees the token.",
           "token": "When editing, leave it empty to keep the stored token. Choose \"No token\" to remove it.",
+          "identity": "Sends the Home Assistant user viewing this web UI to the site with every request, as a short-lived token signed by Home Assistant (an OpenID Connect JWT). The site, or a gateway in front of it such as oauth2-proxy, checks it with the keys Home Assistant publishes; set up the person's details in the Local Web UIs options. Choose a listed way or type the name of a header to send the token in. Send it only to sites you trust: it says who you are.",
+          "audience": "The token's audience (aud), which the site checks. Leave empty for the site's own address (scheme, host and port).",
           "show_in_sidebar": "Add a sidebar entry that opens this web UI directly."
         }
       }
@@ -112,7 +128,15 @@
       "trusted_not_acknowledged": "Trusted mode needs your confirmation.",
       "invalid_token_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
       "token_required": "Enter the token.",
-      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty."
+      "token_conflicts_with_login": "The username is already sent in the Authorization header: send the token in another header, or leave the username empty.",
+      "invalid_identity_header": "Enter a header name made of letters, digits and dashes, other than one the proxy sets itself (such as Host, Cookie or Origin).",
+      "identity_conflicts_with_authorization": "The Authorization header already carries the username or the token: send who is viewing in another header.",
+      "identity_conflicts_with_token": "The token is already sent in this header: choose another one.",
+      "invalid_audience": "The audience is one word without spaces, usually the site's address.",
+      "invalid_identity_url": "Enter Home Assistant's address as http:// or https:// with a host, without a query.",
+      "invalid_identity_claims": "Enter one entry per person: their Home Assistant username (or user id), then the claims to add for them, for example:\nirena:\n  email: irena@example.com\n  groups: [family]",
+      "unknown_identity_user": "Each entry must be the username or user id of a Home Assistant user.",
+      "reserved_identity_claim": "iss, sub, aud, exp, nbf, iat and jti are set by Home Assistant itself."
     }
   },
   "selector": {
@@ -134,6 +158,12 @@
         "none": "No token",
         "bearer": "In the Authorization header, as a Bearer token",
         "x-api-key": "In the X-Api-Key header"
+      }
+    },
+    "identity": {
+      "options": {
+        "none": "Don't send",
+        "bearer": "In the Authorization header, as a Bearer token (for example for oauth2-proxy)"
       }
     }
   }

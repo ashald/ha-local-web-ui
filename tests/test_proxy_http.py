@@ -25,7 +25,7 @@ from aiohttp import hdrs, web
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.test_utils import TestClient, TestServer
 from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_USER
-from homeassistant.auth.models import RefreshToken
+from homeassistant.auth.models import Credentials, RefreshToken
 from homeassistant.config_entries import (
     SOURCE_INTEGRATION_DISCOVERY,
     ConfigEntryDisabler,
@@ -34,6 +34,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client, device_registry as dr
 from homeassistant.setup import async_setup_component
+import jwt
 from multidict import CIMultiDict
 import pytest
 from pytest_homeassistant_custom_component.common import CLIENT_ID, MockConfigEntry, MockUser
@@ -47,11 +48,16 @@ from yarl import URL
 from custom_components.local_web_ui import (
     discovery as discovery_module,
     hub as hub_module,
+    identity as identity_module,
     proxy as proxy_module,
 )
 from custom_components.local_web_ui.const import (
+    CONF_AUDIENCE,
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
+    CONF_IDENTITY,
+    CONF_IDENTITY_CLAIMS,
+    CONF_IDENTITY_URL,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_MODE,
@@ -64,6 +70,9 @@ from custom_components.local_web_ui.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
     DOMAIN,
+    IDENTITY_BEARER,
+    IDENTITY_LIFETIME,
+    IDENTITY_PATH,
     KIND_HUB,
     KIND_VIEW,
     MAX_REQUESTS_PER_SITE,
@@ -76,6 +85,7 @@ from custom_components.local_web_ui.const import (
     SESSION_MAX_AGE,
     SESSION_TTL,
     STATIC_URL_PATH,
+    STORAGE_KEY_IDENTITY,
     STORAGE_KEY_JAR,
     TOKEN_BEARER,
     TOKEN_X_API_KEY,
@@ -2422,3 +2432,266 @@ async def test_token_sent_to_its_web_ui_only(
     # Another web UI gets none of it
     other = await env.client.get(await env.prefix(ISO) + "/token-auth")
     assert await other.json() == {hdrs.AUTHORIZATION: "", "X-Api-Key": "", "X-Auth-Token": ""}
+
+
+# ==== who is viewing: identity tokens (identity.py) ====================================
+
+ISSUER = f"http://10.10.10.10:8123{IDENTITY_PATH}"
+
+
+async def _use_identity(env: Env, view_id: str, **options: Any) -> None:
+    entry = env.web_uis[view_id]
+    env.hass.config_entries.async_update_entry(
+        entry, options={**entry.options, CONF_IDENTITY: IDENTITY_BEARER, **options}
+    )
+    await env.hass.async_block_till_done()
+
+
+async def _set_hub(env: Env, **options: Any) -> None:
+    env.hass.config_entries.async_update_entry(
+        env.hub_entry, options={**env.hub_entry.options, **options}
+    )
+    await env.hass.async_block_till_done()
+
+
+async def _keys(env: Env) -> jwt.PyJWKSet:
+    response = await env.client.get(f"{IDENTITY_PATH}/.well-known/jwks.json")
+    assert response.status == 200
+    return jwt.PyJWKSet.from_dict(await response.json())
+
+
+async def _received(env: Env, view_id: str, header: str = hdrs.AUTHORIZATION) -> str:
+    """The token the site got with a page request."""
+    prefix = await env.prefix(view_id)
+    response = await env.client.get(prefix + "/echo")
+    assert response.status == 200
+    value = env.upstream.last.headers.get(header, "")
+    if header == hdrs.AUTHORIZATION:
+        assert value.startswith("Bearer "), value
+        return value.removeprefix("Bearer ")
+    return value
+
+
+async def _verify(env: Env, token: str, audience: str) -> dict[str, Any]:
+    """Verified like a gateway does: keys from the published JWKS, issuer, audience."""
+    keys = await _keys(env)
+    kid = jwt.get_unverified_header(token)["kid"]
+    return jwt.decode(
+        token,
+        keys[kid].key,
+        algorithms=["RS256"],
+        audience=audience,
+        issuer=ISSUER,
+        options={"require": ["exp", "iat", "nbf", "iss", "aud", "sub"]},
+    )
+
+
+async def _with_login(hass: HomeAssistant, user_id: str, username: str) -> None:
+    """Make a test user's Home Assistant login (username) this one."""
+    user = await hass.auth.async_get_user(user_id)
+    assert user is not None
+    user.credentials[:] = [
+        *(c for c in user.credentials if c.auth_provider_type != "homeassistant"),
+        Credentials(
+            auth_provider_type="homeassistant", auth_provider_id=None, data={"username": username}
+        ),
+    ]
+
+
+async def _viewer(env: Env) -> Any:
+    """The admin user the env's websocket (and so its sessions) belongs to."""
+    users = [u for u in await env.hass.auth.async_get_users() if not u.system_generated]
+    assert len(users) == 1
+    return users[0]
+
+
+# ---- discovery and keys --------------------------------------------------------
+
+
+async def test_discovery_and_keys_are_public(env: Env) -> None:
+    response = await env.client.get(f"{IDENTITY_PATH}/.well-known/openid-configuration")
+    assert response.status == 200
+    discovery = await response.json()
+    assert discovery["issuer"] == ISSUER
+    assert discovery["jwks_uri"] == f"{ISSUER}/.well-known/jwks.json"
+    assert discovery["id_token_signing_alg_values_supported"] == ["RS256"]
+    keys = await _keys(env)
+    assert len(keys.keys) == 1
+    key = keys.keys[0]
+    assert key.key_type == "RSA"
+    assert key.public_key_use == "sig"
+    assert key.key_id
+    # Only the public half is published
+    raw = await (await env.client.get(f"{IDENTITY_PATH}/.well-known/jwks.json")).json()
+    assert set(raw["keys"][0]) == {"kty", "n", "e", "kid", "use", "alg"}
+
+
+async def test_issuer_follows_the_configured_address(env: Env) -> None:
+    await _set_hub(env, **{CONF_IDENTITY_URL: "https://ha.example.com"})
+    response = await env.client.get(f"{IDENTITY_PATH}/.well-known/openid-configuration")
+    discovery = await response.json()
+    assert discovery["issuer"] == f"https://ha.example.com{IDENTITY_PATH}"
+    assert discovery["jwks_uri"] == f"https://ha.example.com{IDENTITY_PATH}/.well-known/jwks.json"
+
+
+async def test_key_is_kept_across_restarts(env: Env, hass_storage: dict[str, Any]) -> None:
+    first = (await _keys(env)).keys[0].key_id
+    assert "key" in hass_storage[STORAGE_KEY_IDENTITY]["data"]
+    # A new issuer object (as after a restart) loads the same key
+    fresh = identity_module.IdentityIssuer(env.hass, env.hub)
+    await fresh.async_ensure_key()
+    assert fresh.jwks()["keys"][0]["kid"] == first
+
+
+async def test_one_key_when_first_requests_come_together(env: Env) -> None:
+    responses = await asyncio.gather(
+        *(env.client.get(f"{IDENTITY_PATH}/.well-known/jwks.json") for _ in range(5))
+    )
+    kids = {(await r.json())["keys"][0]["kid"] for r in responses}
+    assert len(kids) == 1
+    fresh = identity_module.IdentityIssuer(env.hass, env.hub)
+    await fresh.async_ensure_key()
+    assert fresh.jwks()["keys"][0]["kid"] in kids
+
+
+async def test_nothing_published_without_entries(env: Env) -> None:
+    await env.unload_all()
+    for path in ("openid-configuration", "jwks.json"):
+        response = await env.client.get(f"{IDENTITY_PATH}/.well-known/{path}")
+        assert response.status == 404
+
+
+async def test_discovery_paths_do_not_reach_the_proxy(env: Env) -> None:
+    """The issuer lives under the proxy's prefix; its paths must win over the proxy route."""
+    response = await env.client.get(f"{IDENTITY_PATH}/.well-known/jwks.json")
+    assert response.status == 200
+    assert "Content-Security-Policy" not in response.headers  # Not a proxy response
+
+
+# ---- tokens ---------------------------------------------------------------------
+
+
+async def test_token_names_the_viewer(env: Env) -> None:
+    await _use_identity(env, ISO)
+    user = await _viewer(env)
+    before = int(time.time())
+    token = await _received(env, ISO)
+    claims = await _verify(env, token, env.upstream.origin)
+    assert claims["sub"] == user.id
+    assert claims["name"] == user.name
+    # Its Home Assistant login, if it has one
+    assert claims.get("preferred_username") == identity_module.login_username(user)
+    assert claims["iss"] == ISSUER
+    assert claims["aud"] == env.upstream.origin
+    assert before <= claims["iat"] <= int(time.time())
+    assert claims["nbf"] == claims["iat"]
+    assert claims["exp"] == claims["iat"] + IDENTITY_LIFETIME
+
+
+async def test_token_carries_login_username_and_configured_claims(env: Env) -> None:
+    user = await _viewer(env)
+    await _with_login(env.hass, user.id, "irenika")
+    await _set_hub(
+        env,
+        **{
+            CONF_IDENTITY_CLAIMS: {
+                "irenika": {
+                    "preferred_username": "irena",
+                    "email": "irena@example.com",
+                    "email_verified": True,
+                    "groups": ["family"],
+                    "sub": "spoofed",  # Reserved: ignored
+                },
+                "someone-else": {"email": "x@example.com"},
+            }
+        },
+    )
+    await _use_identity(env, ISO)
+    claims = await _verify(env, await _received(env, ISO), env.upstream.origin)
+    assert claims["sub"] == user.id
+    assert claims["preferred_username"] == "irena"
+    assert claims["email"] == "irena@example.com"
+    assert claims["email_verified"] is True
+    assert claims["groups"] == ["family"]
+
+
+async def test_claims_by_user_id(env: Env) -> None:
+    user = await _viewer(env)
+    await _with_login(env.hass, user.id, "irenika")
+    await _set_hub(env, **{CONF_IDENTITY_CLAIMS: {user.id: {"email": "by-id@example.com"}}})
+    await _use_identity(env, ISO)
+    claims = await _verify(env, await _received(env, ISO), env.upstream.origin)
+    assert claims["preferred_username"] == "irenika"
+    assert claims["email"] == "by-id@example.com"
+
+
+async def test_audience_and_header_can_be_chosen(env: Env) -> None:
+    await _use_identity(
+        env, ISO, **{CONF_IDENTITY: "X-Identity-Token", CONF_AUDIENCE: "family-sites"}
+    )
+    token = await _received(env, ISO, "X-Identity-Token")
+    assert env.upstream.last.headers.get(hdrs.AUTHORIZATION) is None
+    claims = await _verify(env, token, "family-sites")
+    assert claims["aud"] == "family-sites"
+
+
+async def test_page_cannot_send_an_identity_of_its_own(env: Env) -> None:
+    await _use_identity(env, ISO, **{CONF_IDENTITY: "X-Identity-Token"})
+    prefix = await env.prefix(ISO)
+    forged = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9."
+    await env.client.get(prefix + "/echo", headers={"X-Identity-Token": forged})
+    assert env.upstream.last.headers.getall("X-Identity-Token") != [forged]
+    await _verify(env, env.upstream.last.headers["X-Identity-Token"], env.upstream.origin)
+    # Nor in Authorization (always dropped) for web UIs that don't ask
+    other = await env.prefix(TOKEN)
+    await env.client.get(other + "/echo", headers={hdrs.AUTHORIZATION: f"Bearer {forged}"})
+    assert env.upstream.last.headers[hdrs.AUTHORIZATION] == "Bearer token12345"
+
+
+async def test_only_web_uis_that_ask_get_a_token(env: Env) -> None:
+    await _use_identity(env, ISO)
+    await env.client.get(await env.prefix(TOKEN) + "/echo")
+    assert env.upstream.last.headers[hdrs.AUTHORIZATION] == "Bearer token12345"
+    for view_id in ("trustedview", "authview"):
+        await env.client.get(await env.prefix(view_id) + "/echo")
+        assert not env.upstream.last.headers.get(hdrs.AUTHORIZATION, "").startswith("Bearer ey")
+
+
+async def test_token_is_reused_then_renewed(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _use_identity(env, ISO)
+    first = await _received(env, ISO)
+    assert await _received(env, ISO) == first
+    # Close to its expiry, the next request gets a new one
+    real = time.time
+    monkeypatch.setattr(identity_module.time, "time", lambda: real() + IDENTITY_LIFETIME - 30)
+    second = await _received(env, ISO)
+    assert second != first
+    # Changing the person's details applies at once
+    monkeypatch.setattr(identity_module.time, "time", real)
+    user = await _viewer(env)
+    await _set_hub(env, **{CONF_IDENTITY_CLAIMS: {user.id: {"email": "new@example.com"}}})
+    claims = await _verify(env, await _received(env, ISO), env.upstream.origin)
+    assert claims["email"] == "new@example.com"
+
+
+async def test_unknown_own_address_refuses_instead_of_sending_nothing(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _use_identity(env, ISO)
+    monkeypatch.setattr(identity_module, "base_url", lambda hass, configured: None)
+    prefix = await env.prefix(ISO)
+    count = len(env.upstream.requests)
+    response = await env.client.get(prefix + "/echo")
+    assert response.status == 503
+    assert len(env.upstream.requests) == count
+
+
+async def test_removing_the_last_entry_forgets_the_key(
+    env: Env, hass_storage: dict[str, Any]
+) -> None:
+    await _keys(env)
+    assert STORAGE_KEY_IDENTITY in hass_storage
+    for entry in list(env.hass.config_entries.async_entries("local_web_ui")):
+        await env.hass.config_entries.async_remove(entry.entry_id)
+    await env.hass.async_block_till_done()
+    assert STORAGE_KEY_IDENTITY not in hass_storage

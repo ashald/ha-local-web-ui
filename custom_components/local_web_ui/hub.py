@@ -35,9 +35,11 @@ from homeassistant.loader import async_get_loaded_integration
 from yarl import URL
 
 from .const import (
+    CONF_AUDIENCE,
     CONF_DEVICE_ID,
     CONF_DISCOVERY,
     CONF_ICON,
+    CONF_IDENTITY,
     CONF_KIND,
     CONF_LINK_DEVICE_PAGES,
     CONF_LOCAL_DOMAINS,
@@ -57,6 +59,8 @@ from .const import (
     DEVICE_LINK_PREFIX,
     DISCOVERED_PREFIX,
     DOMAIN,
+    IDENTITY_BEARER,
+    IDENTITY_NONE,
     KIND_HUB,
     MAX_COOKIE_BYTES,
     MAX_COOKIES_PER_SITE,
@@ -80,6 +84,7 @@ from .const import (
     VISIT_HERE,
 )
 from .discovery import LanOnlyResolver, is_local_ui_url, parse_http_url
+from .identity import IdentityIssuer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,6 +111,9 @@ class View:
     password: str | None = None
     # (header name, value) of a stored token sent in a header other than Authorization
     token_header: tuple[str, str] | None = None
+    # Header that carries the viewer's identity token (Authorization: as a Bearer token)
+    identity_header: str | None = None
+    audience: str = ""  # The identity token's aud
 
     @property
     def url(self) -> str:
@@ -476,19 +484,20 @@ class LocalWebUiHub:
         self._writing = 0
         # Called whenever views may have changed, so their sidebar panels follow
         self.on_views_changed: Callable[[], None] | None = None
+        self.identity = IdentityIssuer(hass, self)
 
     # ---- options ---------------------------------------------------------------
 
-    def _hub_option(self, key: str, default: Any) -> Any:
+    def hub_option(self, key: str, default: Any) -> Any:
         return default if self.hub_entry is None else self.hub_entry.options.get(key, default)
 
     @property
     def discovery_enabled(self) -> bool:
-        return self.hub_entry is not None and self._hub_option(CONF_DISCOVERY, DEFAULT_DISCOVERY)
+        return self.hub_entry is not None and self.hub_option(CONF_DISCOVERY, DEFAULT_DISCOVERY)
 
     @property
     def link_default(self) -> bool:
-        return self._hub_option(CONF_LINK_DEVICE_PAGES, DEFAULT_LINK_DEVICE_PAGES)
+        return self.hub_option(CONF_LINK_DEVICE_PAGES, DEFAULT_LINK_DEVICE_PAGES)
 
     def visit_link(self, view_id: str) -> str:
         entry = self.view_entries.get(view_id)
@@ -504,7 +513,7 @@ class LocalWebUiHub:
         """Name suffixes discovery treats as local: the defaults and the configured ones."""
         suffixes = set(DEFAULT_LOCAL_SUFFIXES)
         suffixes.update(
-            f".{d}" for d in parse_local_domains(self._hub_option(CONF_LOCAL_DOMAINS, ""))
+            f".{d}" for d in parse_local_domains(self.hub_option(CONF_LOCAL_DOMAINS, ""))
         )
         return tuple(sorted(suffixes))
 
@@ -642,6 +651,7 @@ class LocalWebUiHub:
         """Bring views, device links, web UI devices and discovery up to date."""
         previous = self._views
         self._views = self._build_views()
+        self.identity.async_forget_tokens()  # Claims or addresses may have changed
         for view_id, old in previous.items():
             # A web UI moved to another site must not hand it the old site's data
             view = self._views.get(view_id)
@@ -695,6 +705,9 @@ class LocalWebUiHub:
                     authorization = f"Bearer {token}"
                 elif how != TOKEN_NONE:
                     token_header = ("X-Api-Key" if how == TOKEN_X_API_KEY else how, token)
+            identity_header = None
+            if (identity := options.get(CONF_IDENTITY, IDENTITY_NONE)) != IDENTITY_NONE:
+                identity_header = "Authorization" if identity == IDENTITY_BEARER else identity
             views[entry.entry_id] = View(
                 view_id=entry.entry_id,
                 name=entry.title,
@@ -712,6 +725,8 @@ class LocalWebUiHub:
                 username=username,
                 password=password,
                 token_header=token_header,
+                identity_header=identity_header,
+                audience=(options.get(CONF_AUDIENCE) or "").strip() or str(origin),
             )
         return views
 
@@ -1284,6 +1299,7 @@ class LocalWebUiHub:
         self._offered.clear()
         await self._store.async_remove()
         await self._jar_store.async_remove()
+        await self.identity.async_remove()
 
 
 def main_device(registry: dr.DeviceRegistry, device_id: str) -> dr.DeviceEntry | None:

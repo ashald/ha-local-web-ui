@@ -131,6 +131,16 @@ becomes the hub.
   Bearer token, in `X-Api-Key`, or in a header the user names (never one the proxy sets
   itself, such as `Host`, `Cookie`, `Origin` or `X-Forwarded-*`); it replaces a value the
   page sent in that header.
+- Who is viewing (`identity.py`), for views that ask: a JWT signed by HA (RS256, 5 minutes,
+  reused until 90 s are left) naming the session's user (`sub` = user id, `name`,
+  `preferred_username` = HA login, plus per-user claims from the hub options; `iss`, `sub`,
+  `aud`, `exp`, `nbf`, `iat`, `jti` can't be set there). `aud` = the view's origin unless set.
+  Sent as `Authorization: Bearer` or raw in a header the user names, replacing whatever the
+  page sent. Discovery and JWKS are public HA views under `/api/local_web_ui/identity/`
+  (plain routes, which aiohttp resolves before the proxy's dynamic route with the same
+  prefix). The RSA key is made on first use and stored in `.storage/local_web_ui.identity`;
+  `kid` = its RFC 7638 thumbprint. If HA does not know its own URL, the request fails with
+  503 rather than reaching the site without the identity it asked for.
 - Client-sent `Forwarded`/`X-Forwarded-*`/`X-Real-IP` are dropped and replaced with HA's
   own view of the request. `X-Ingress-Path` is set to the prefix, as Supervisor ingress
   does.

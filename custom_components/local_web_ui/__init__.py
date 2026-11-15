@@ -52,6 +52,7 @@ from .const import (
     VISIT_HERE,
 )
 from .hub import LocalWebUiHub, async_restore_device_links, device_unique_id, own_domain
+from .identity import async_register_identity_views
 from .proxy import async_register_proxy
 from .websocket import async_register_commands
 
@@ -77,6 +78,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     await hub.async_load()
     hass.data[DOMAIN] = hub
     async_register_proxy(hass)
+    async_register_identity_views(hass)
     async_register_commands(hass)
     # Versioned by content, so browsers (and HA's service worker) may cache it
     digest = await hass.async_add_executor_job(

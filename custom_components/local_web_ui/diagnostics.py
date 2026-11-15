@@ -8,9 +8,17 @@ from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import LocalWebUiConfigEntry
-from .const import CONF_KIND, CONF_PASSWORD, CONF_TOKEN, CONF_URL, CONF_USERNAME, KIND_HUB
+from .const import (
+    CONF_IDENTITY_CLAIMS,
+    CONF_KIND,
+    CONF_PASSWORD,
+    CONF_TOKEN,
+    CONF_URL,
+    CONF_USERNAME,
+    KIND_HUB,
+)
 
-TO_REDACT = {CONF_PASSWORD, CONF_TOKEN, CONF_USERNAME}
+TO_REDACT = {CONF_PASSWORD, CONF_TOKEN, CONF_USERNAME, CONF_IDENTITY_CLAIMS}
 
 
 def _redact_query(url: str | None) -> str | None:
@@ -31,12 +39,15 @@ async def async_get_config_entry_diagnostics(
     if entry.data.get(CONF_KIND) == KIND_HUB:
         result["web_uis"] = len(hub.views)
         result["device_page_links"] = sorted(hub.originals)
+        result["identity_issuer"] = hub.identity.issuer
     elif (view := hub.get_view(entry.entry_id)) is not None:
         result["view"] = {
             "url": _redact_query(view.url),
             "source": view.source,
             "mode": view.mode,
             "device_page_link": hub.link_enabled(view.view_id) if view.device_id else None,
+            "identity_header": view.identity_header,
+            "identity_audience": view.audience if view.identity_header else None,
         }
     else:
         result["view"] = None  # Its device has no local web page right now

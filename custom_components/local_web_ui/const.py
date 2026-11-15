@@ -13,6 +13,12 @@ PANEL_COMPONENT: Final = "local-web-ui-panel"
 # Device pages link here: homeassistant://local-web-ui/<view_id>
 DEVICE_LINK_PREFIX: Final = f"homeassistant://{PANEL_URL_PATH}/"
 
+# Issuer of identity tokens: discovery and keys under <Home Assistant URL><this>
+IDENTITY_PATH: Final = f"{PROXY_URL_PREFIX}/identity"
+# Identity tokens live this long, and are signed anew when less than the margin is left
+IDENTITY_LIFETIME: Final = 300
+IDENTITY_REUSE_MARGIN: Final = 90
+
 # Paths under a view that the proxy answers itself instead of forwarding
 INTERNAL_PATH_PREFIX: Final = "__lwu/"
 
@@ -38,6 +44,12 @@ TOKEN_NONE: Final = "none"
 TOKEN_BEARER: Final = "bearer"
 TOKEN_X_API_KEY: Final = "x-api-key"
 TOKEN_CHOICES: Final = (TOKEN_NONE, TOKEN_BEARER, TOKEN_X_API_KEY)
+# Who is viewing, as a signed OpenID token (identity.py): how it is sent, and to whom
+CONF_IDENTITY: Final = "identity"
+CONF_AUDIENCE: Final = "audience"
+IDENTITY_NONE: Final = "none"
+IDENTITY_BEARER: Final = "bearer"
+IDENTITY_CHOICES: Final = (IDENTITY_NONE, IDENTITY_BEARER)
 CONF_SHOW_IN_SIDEBAR: Final = "show_in_sidebar"
 CONF_ICON: Final = "icon"
 CONF_DEVICE_ID: Final = "device_id"
@@ -56,6 +68,10 @@ VISIT_CHOICES: Final = (VISIT_DEFAULT, VISIT_HERE, VISIT_DEVICE)
 CONF_PANEL_TITLE: Final = "panel_title"
 CONF_PANEL_ICON: Final = "panel_icon"
 CONF_LOCAL_DOMAINS: Final = "local_domains"
+# Home Assistant's address as identity verifiers reach it (default: its internal URL)
+CONF_IDENTITY_URL: Final = "identity_url"
+# Extra claims per user: {user id or login username: {claim: value}}
+CONF_IDENTITY_CLAIMS: Final = "identity_claims"
 DEFAULT_PANEL_ICON: Final = "mdi:web-box"
 DEFAULT_DISCOVERY: Final = True
 DEFAULT_LINK_DEVICE_PAGES: Final = True
@@ -80,6 +96,7 @@ MAX_WEBSOCKETS_PER_SESSION: Final = 8
 STORAGE_VERSION: Final = 1
 STORAGE_KEY: Final = DOMAIN
 STORAGE_KEY_JAR: Final = f"{DOMAIN}.jar"
+STORAGE_KEY_IDENTITY: Final = f"{DOMAIN}.identity"
 # Per (user, view) caps for what a site can make Home Assistant store
 MAX_SHIM_STORAGE_BYTES: Final = 1024 * 1024
 MAX_SHIM_STORAGE_KEYS: Final = 1000
